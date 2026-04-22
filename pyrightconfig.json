@@ -2,5 +2,8 @@
   "venvPath": "/home/wxd/miniconda3/envs",
   "venv": "S4Code",
   "typeCheckingMode": "basic",
-  "reportMissingImports": true
+  "reportMissingImports": true,
+  "extraPaths": [
+    "../EasyAgent"
+  ]
 }

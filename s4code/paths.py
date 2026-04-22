@@ -24,6 +24,7 @@ class S4Paths:
     task_db_path: Path
     agent_storage_dir: Path
     logs_dir: Path
+    skills_dir: Path
 
     def ensure(self) -> "S4Paths":
         for path in (
@@ -32,6 +33,7 @@ class S4Paths:
             self.cache_dir,
             self.agent_storage_dir,
             self.logs_dir,
+            self.skills_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
         self.global_config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,9 +55,15 @@ def get_s4_paths() -> S4Paths:
         task_db_path=data_home / "tasks.db",
         agent_storage_dir=data_home / "agents",
         logs_dir=data_home / "logs",
+        skills_dir=data_home / "skills",
     )
 
 
 def get_project_config_path(project_root: str | Path) -> Path:
     root = Path(project_root).expanduser().resolve()
     return root / ".s4code" / "config.yaml"
+
+
+def get_project_skills_path(project_root: str | Path) -> Path:
+    root = Path(project_root).expanduser().resolve()
+    return root / ".s4code" / "skills"

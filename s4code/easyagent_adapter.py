@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from re import S
 from typing import Any, Optional
 
 from ._easyagent_bootstrap import ensure_easyagent_environment
@@ -37,9 +38,9 @@ from Tool.builtin import (
     register_todo_write_tool,
     register_web_fetch_tool,
 )
-
+from skill import SkillManager, SkillRegistry
 from .config import S4Settings
-from .paths import S4Paths
+from .paths import S4Paths, get_project_skills_path
 from .project import ProjectContext
 from .runtime_hooks import S4RuntimeNoticeHook
 
@@ -234,6 +235,12 @@ def build_agent_bundle(
     hook_manager.add_hook(runtime_notice_hook)
     context_manager = _build_context_manager(settings, llm)
     codeintel_manager: Optional[CodeIntelManager] = None
+    skill_register:SkillRegistry = SkillRegistry()
+    skill_register.discover_from_directory(str(paths.skills_dir))
+
+    local_skill_dir = get_project_skills_path(project.project_root)
+    if local_skill_dir.exists() and local_skill_dir.is_dir():
+        skill_register.discover_from_directory(str(local_skill_dir))
 
     if settings.product.enable_codeintel:
         try:
@@ -287,7 +294,8 @@ def build_agent_bundle(
                 "summary": settings.llm.reasoning_summary,
             },
         )
-
+    for skill in skill_register.list_available_names():
+        agent.with_skill(skill_register.create(skill))
     if agent.agent_runtime is None:
         agent.enable_multi_agent_system(
             workspace_root=str(project.project_root),
