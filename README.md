@@ -30,3 +30,4 @@ The detailed stage implementation note is in [docs/phase1_s4code_foundation.md](
 The YAML profiles + context stage note is in [docs/phase2_yaml_profiles_context.md](docs/phase2_yaml_profiles_context.md).
 The pending interaction stage note is in [docs/phase3_pending_interactions.md](docs/phase3_pending_interactions.md).
 YAML configuration reference is in [docs/configuration_yaml.md](docs/configuration_yaml.md).
+The palette/session/clipboard stage note is in [docs/phase4_palette_sessions_clipboard.md](docs/phase4_palette_sessions_clipboard.md).

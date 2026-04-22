@@ -81,11 +81,7 @@ def doctor(
     cwd: Path = typer.Option(Path("."), "--cwd", help="Working directory / repository root."),
 ) -> None:
     engine = _build_engine(cwd=cwd.resolve())
-    payload = {
-        "project": engine.project.to_status_dict(),
-        "status": json.loads(engine.format_status()),
-    }
-    console.print(json.dumps(payload, ensure_ascii=False, indent=2))
+    console.print(engine.format_doctor())
 
 
 @session_app.command("list")

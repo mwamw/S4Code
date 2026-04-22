@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-from easyagent.hooks import BaseHook
+from ._easyagent_bootstrap import ensure_easyagent_environment
+
+ensure_easyagent_environment()
+
+from core.hooks import BaseHook
 
 
 class S4RuntimeNoticeHook(BaseHook):

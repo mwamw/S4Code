@@ -23,6 +23,10 @@ def _config(engine, invocation):
     return CommandResult.info(engine.format_config())
 
 
+def _doctor(engine, invocation):
+    return CommandResult.info(engine.format_doctor())
+
+
 def _permissions(engine, invocation):
     if not invocation.arg_text:
         return CommandResult.info(
@@ -46,7 +50,26 @@ def _resume(engine, invocation):
 
 
 def _session(engine, invocation):
-    return CommandResult.info(engine.format_current_session())
+    if not invocation.args:
+        return CommandResult.info(engine.format_current_session())
+    action = invocation.args[0].lower()
+    remainder = invocation.arg_text[len(invocation.args[0]) :].strip()
+    if action in {"show", "current"}:
+        return CommandResult.info(engine.format_current_session())
+    if action in {"list", "ls"}:
+        return CommandResult.info(engine.format_sessions())
+    if action in {"load", "resume"}:
+        if not remainder:
+            return CommandResult.info(engine.format_sessions())
+        message = engine.resume_session(remainder)
+        return CommandResult(message=message, refresh_requested=True)
+    if action == "rename":
+        if not remainder:
+            return CommandResult.info("Usage: /session rename <title>")
+        return CommandResult.info(engine.rename_session(remainder))
+    if action == "fork":
+        return CommandResult.info(engine.fork_session(remainder or None))
+    return CommandResult.info("Usage: /session [show|list|load <id>|rename <title>|fork [title]]")
 
 
 def _pending(engine, invocation):
@@ -63,6 +86,18 @@ def _compact(engine, invocation):
 
 def _cost(engine, invocation):
     return CommandResult.info(engine.format_cost())
+
+
+def _trace(engine, invocation):
+    return CommandResult.info(engine.format_trace())
+
+
+def _restore(engine, invocation):
+    return CommandResult.info(engine.format_restore_report())
+
+
+def _tools(engine, invocation):
+    return CommandResult.info(engine.format_tools())
 
 
 def _context(engine, invocation):
@@ -142,6 +177,13 @@ def _sidebar(engine, invocation):
     return CommandResult.info("Usage: /sidebar [show|hide]")
 
 
+def _copy(engine, invocation):
+    target = (invocation.arg_text or "transcript").strip().lower()
+    if target not in {"transcript", "last"}:
+        return CommandResult.info("Usage: /copy [transcript|last]")
+    return CommandResult(metadata={"ui_action": "copy_to_clipboard", "copy_target": target})
+
+
 def _exit(engine, invocation):
     return CommandResult(message="Exiting S4Code.", exit_requested=True)
 
@@ -161,6 +203,7 @@ def register_builtin_commands(registry) -> None:
         )
     )
     registry.register(S4Command("config", CommandKind.LOCAL, "Show the resolved S4Code config.", _config))
+    registry.register(S4Command("doctor", CommandKind.LOCAL, "Show an end-to-end product diagnostics payload.", _doctor))
     registry.register(
         S4Command(
             "permissions",
@@ -173,12 +216,32 @@ def register_builtin_commands(registry) -> None:
     )
     registry.register(S4Command("plan", CommandKind.LOCAL, "Enter or exit plan mode.", _plan, usage="[on|off]"))
     registry.register(S4Command("resume", CommandKind.LOCAL, "Resume a saved session or list sessions.", _resume, usage="[session_id]"))
-    registry.register(S4Command("session", CommandKind.LOCAL, "Show the current session details.", _session))
+    registry.register(
+        S4Command(
+            "session",
+            CommandKind.LOCAL,
+            "Show, list, load, rename, or fork sessions.",
+            _session,
+            usage="[show|list|load <session_id>|rename <title>|fork [title]]",
+        )
+    )
     registry.register(S4Command("pending", CommandKind.LOCAL, "Show the current pending confirmation/question.", _pending))
+    registry.register(
+        S4Command(
+            "copy",
+            CommandKind.LOCAL,
+            "Copy the full transcript or the latest card to the clipboard.",
+            _copy,
+            usage="[transcript|last]",
+        )
+    )
     registry.register(S4Command("clear", CommandKind.LOCAL, "Clear conversation history.", _clear))
     registry.register(S4Command("compact", CommandKind.LOCAL, "Compact conversation history.", _compact))
     registry.register(S4Command("context", CommandKind.LOCAL, "Show current context window usage and compaction state.", _context))
     registry.register(S4Command("cost", CommandKind.LOCAL, "Show observability and token usage summary.", _cost))
+    registry.register(S4Command("trace", CommandKind.LOCAL, "Show recent turn-level trace summaries.", _trace))
+    registry.register(S4Command("restore", CommandKind.LOCAL, "Show the latest session restore report.", _restore))
+    registry.register(S4Command("tools", CommandKind.LOCAL, "List the currently registered tool surface.", _tools))
     registry.register(S4Command("files", CommandKind.LOCAL, "List project files.", _files, usage="[path]"))
     registry.register(S4Command("diff", CommandKind.LOCAL, "Show git diff for the current repository.", _diff, usage="[target]"))
     registry.register(S4Command("review", CommandKind.WORKFLOW, "Run a code review workflow against the current diff.", _review, usage="[target]"))

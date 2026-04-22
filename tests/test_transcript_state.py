@@ -21,6 +21,7 @@ def test_transcript_state_keeps_round_order() -> None:
 
     pairs = [(card.kind, card.title) for card in state.cards]
     assert pairs == [
+        ("round", "Cycle 1"),
         ("thinking", "Model Thinking"),
         ("assistant", "Model Response"),
         ("tool", "Tool · FileRead"),
@@ -28,8 +29,34 @@ def test_transcript_state_keeps_round_order() -> None:
         ("thinking", "Model Thinking"),
         ("assistant", "Model Response"),
     ]
-    assert state.cards[1].body == "I will read the parser."
+    assert state.cards[2].body == "I will read the parser."
     assert state.cards[-1].body == "The bug is in empty input handling."
+    assert state.cards[0].body.startswith("Completed in ")
+    assert state.cards[4].body.startswith("Completed in ")
+
+
+def test_transcript_state_updates_round_elapsed_until_completion() -> None:
+    current_time = 100.0
+
+    def _clock() -> float:
+        return current_time
+
+    state = S4TranscriptState(clock=_clock)
+    state.consume_event({"type": "round_start", "round": 1})
+
+    assert state.cards[0].body == "Elapsed: 0.0s"
+    assert state.has_live_round() is True
+
+    current_time = 101.4
+    assert state.refresh_round_timers() is True
+    assert state.cards[0].body == "Elapsed: 1.4s"
+
+    current_time = 103.0
+    state.consume_event({"type": "round_start", "round": 2})
+
+    assert state.cards[0].body == "Completed in 3.0s"
+    assert state.cards[1].title == "Cycle 2"
+    assert state.cards[1].body == "Elapsed: 0.0s"
 
 
 def test_transcript_state_summarizes_tool_result() -> None:
@@ -40,6 +67,48 @@ def test_transcript_state_summarizes_tool_result() -> None:
     tool_card = state.cards[0]
     assert tool_card.status == "done"
     assert "... 2 more line(s) hidden" in tool_card.body
+
+
+def test_transcript_state_preserves_file_diff_metadata() -> None:
+    state = S4TranscriptState()
+    state.consume_event(
+        {
+            "type": "tool_call",
+            "tool_name": "FileEdit",
+            "tool_id": "tool-1",
+            "tool_args": {"file_path": "src/app.py"},
+        }
+    )
+    state.consume_event(
+        {
+            "type": "tool_result",
+            "tool_name": "FileEdit",
+            "tool_id": "tool-1",
+            "content": "已更新文件: /tmp/src/app.py (替换 1 处匹配)",
+            "status": "success",
+            "structured_data": {
+                "file_path": "/tmp/src/app.py",
+                "diff": {
+                    "file_path": "/tmp/src/app.py",
+                    "relative_path": "src/app.py",
+                    "created": False,
+                    "unified": (
+                        "diff --git a/src/app.py b/src/app.py\n"
+                        "--- a/src/app.py\n"
+                        "+++ b/src/app.py\n"
+                        "@@ -1 +1 @@\n"
+                        "-print('old')\n"
+                        "+print('new')"
+                    ),
+                },
+            },
+        }
+    )
+
+    tool_card = state.cards[0]
+    assert tool_card.status == "done"
+    assert tool_card.metadata["diff"]["relative_path"] == "src/app.py"
+    assert "+print('new')" in tool_card.metadata["diff"]["unified"]
 
 
 def test_transcript_state_tracks_compaction_stage() -> None:

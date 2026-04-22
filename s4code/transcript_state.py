@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 @dataclass(slots=True)
@@ -19,17 +20,20 @@ class TranscriptCard:
 @dataclass(slots=True)
 class _RoundState:
     number: int
+    round_card_id: str
+    started_at: float
     thinking_card_id: Optional[str] = None
     content_card_id: Optional[str] = None
 
 
 class S4TranscriptState:
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Optional[Callable[[], float]] = None) -> None:
         self.cards: list[TranscriptCard] = []
         self._next_card_id = 0
         self._current_round: Optional[_RoundState] = None
         self._tool_card_ids: dict[str, str] = {}
         self._compaction_card_id: Optional[str] = None
+        self._clock = clock or time.monotonic
 
     def clear(self) -> None:
         self.cards.clear()
@@ -77,9 +81,22 @@ class S4TranscriptState:
         return self._current_round
 
     def start_round(self, number: int) -> None:
-        if number > 1:
-            self.append_card("round", f"Cycle {number}", "", metadata={"round": number})
-        self._current_round = _RoundState(number=number)
+        self._finalize_current_round()
+        started_at = self._clock()
+        card = self.append_card(
+            "round",
+            f"Cycle {number}",
+            self._format_active_round_body(started_at, now=started_at),
+            metadata={
+                "round": number,
+                "started_at": started_at,
+            },
+        )
+        self._current_round = _RoundState(
+            number=number,
+            round_card_id=card.card_id,
+            started_at=started_at,
+        )
 
     def _ensure_thinking_card(self) -> TranscriptCard:
         round_state = self._ensure_round()
@@ -139,13 +156,21 @@ class S4TranscriptState:
             tool_id = str(event.get("tool_id") or "")
             existing = self._find_tool_card(tool_id) if tool_id else None
             body = self._format_tool_result_body(event.get("content"))
+            metadata = {
+                "tool_id": tool_id,
+                "tool_name": tool_name,
+                **self._extract_tool_result_metadata(event),
+            }
+            status = self._resolve_tool_card_status(event)
             if existing is None:
-                self.append_card("tool", f"Tool · {tool_name}", body, status="done")
+                self.append_card("tool", f"Tool · {tool_name}", body, status=status, metadata=metadata)
             else:
                 existing.body = body
-                existing.status = "done"
+                existing.status = status
+                existing.metadata.update(metadata)
             return
         if event_type == "compaction_start":
+            self._finalize_current_round()
             card = self.append_card(
                 "warning",
                 "Context Compaction",
@@ -176,8 +201,10 @@ class S4TranscriptState:
                 thinking_card = self.find_card(self._current_round.thinking_card_id)
             if thinking_card is not None:
                 thinking_card.status = None
+            self._finalize_current_round()
             return
         if event_type == "interruption":
+            self._finalize_current_round()
             payload = dict(event.get("payload") or {})
             metadata = dict(payload.get("metadata") or {})
             interaction_type = str(metadata.get("interaction_type") or "")
@@ -207,7 +234,24 @@ class S4TranscriptState:
             self.append_card("system", "System", str(event.get("content") or ""))
             return
         if event_type == "error":
+            self._finalize_current_round()
             self.append_card("error", "Error", str(event.get("error") or "Unknown error"))
+
+    def has_live_round(self) -> bool:
+        return self._current_round is not None
+
+    def refresh_round_timers(self) -> bool:
+        round_state = self._current_round
+        if round_state is None:
+            return False
+        card = self.find_card(round_state.round_card_id)
+        if card is None:
+            return False
+        body = self._format_active_round_body(round_state.started_at, now=self._clock())
+        if body == card.body:
+            return False
+        card.body = body
+        return True
 
     def _format_tool_call_body(self, tool_args: Any) -> str:
         if not isinstance(tool_args, dict):
@@ -256,6 +300,47 @@ class S4TranscriptState:
         if hidden_lines > 0:
             return f"{summary}\n... {hidden_lines} more line(s) hidden"
         return summary
+
+    def _extract_tool_result_metadata(self, event: dict[str, Any]) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        structured_data = event.get("structured_data")
+        diff_payload = self._extract_tool_diff(structured_data)
+        if diff_payload is not None:
+            metadata["diff"] = diff_payload
+        result_metadata = event.get("result_metadata")
+        if isinstance(result_metadata, dict) and result_metadata:
+            metadata["result_metadata"] = dict(result_metadata)
+        error_type = str(event.get("error_type") or "").strip()
+        if error_type:
+            metadata["error_type"] = error_type
+        result_status = str(event.get("status") or "").strip()
+        if result_status:
+            metadata["result_status"] = result_status
+        return metadata
+
+    def _extract_tool_diff(self, structured_data: Any) -> Optional[dict[str, Any]]:
+        if not isinstance(structured_data, dict):
+            return None
+        diff_payload = structured_data.get("diff")
+        if not isinstance(diff_payload, dict):
+            return None
+        unified = str(diff_payload.get("unified") or "").strip()
+        if not unified:
+            return None
+        return {
+            "unified": unified,
+            "file_path": str(diff_payload.get("file_path") or structured_data.get("file_path") or "").strip(),
+            "relative_path": str(diff_payload.get("relative_path") or "").strip(),
+            "created": bool(diff_payload.get("created")),
+        }
+
+    def _resolve_tool_card_status(self, event: dict[str, Any]) -> str:
+        status = str(event.get("status") or "").strip()
+        if status == "error":
+            return "error"
+        if status == "needs_confirmation":
+            return "pending"
+        return "done"
 
     def _format_interruption_body(
         self,
@@ -327,6 +412,39 @@ class S4TranscriptState:
             lines.append(self._format_tool_call_body(tool_args))
         lines.append("Use /confirm [note] to continue, or /deny [reason] to cancel the tool.")
         return "\n".join(line for line in lines if line).strip()
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(float(seconds), 0.0)
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        minutes, remainder = divmod(seconds, 60.0)
+        if minutes < 60:
+            return f"{int(minutes)}m {remainder:04.1f}s"
+        hours, minutes = divmod(int(minutes), 60)
+        return f"{hours}h {minutes:02d}m {remainder:04.1f}s"
+
+    def _format_active_round_body(self, started_at: float, *, now: float) -> str:
+        return f"Elapsed: {self._format_duration(now - started_at)}"
+
+    def _format_completed_round_body(self, started_at: float, finished_at: float) -> str:
+        return f"Completed in {self._format_duration(finished_at - started_at)}"
+
+    def _finalize_current_round(self) -> None:
+        round_state = self._current_round
+        if round_state is None:
+            return
+        finished_at = self._clock()
+        card = self.find_card(round_state.round_card_id)
+        if card is not None:
+            card.body = self._format_completed_round_body(round_state.started_at, finished_at)
+            card.metadata.update(
+                {
+                    "finished_at": finished_at,
+                    "duration_seconds": max(finished_at - round_state.started_at, 0.0),
+                }
+            )
+        self._current_round = None
 
     def _summarize_scalar(self, value: Any, *, max_chars: int) -> str:
         text = str(value).replace("\n", " ").strip()

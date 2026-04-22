@@ -7,7 +7,11 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import uuid4
 
-from easyagent.session import SessionStore
+from ._easyagent_bootstrap import ensure_easyagent_environment
+
+ensure_easyagent_environment()
+
+from db import SessionStore
 
 from .paths import S4Paths
 from .project import ProjectContext
@@ -23,6 +27,8 @@ class S4SessionSummary:
     provider: Optional[str]
     project_root: Optional[str]
     permission_mode: Optional[str]
+    branch: Optional[str] = None
+    forked_from_session_id: Optional[str] = None
 
 
 class S4SessionManager:
@@ -41,6 +47,7 @@ class S4SessionManager:
         title: str,
         settings_payload: dict[str, Any],
         session_overrides: dict[str, Any],
+        forked_from_session_id: Optional[str] = None,
     ) -> dict[str, Any]:
         llm_payload = dict(settings_payload.get("llm") or {})
         product_payload = dict(settings_payload.get("product") or {})
@@ -55,6 +62,7 @@ class S4SessionManager:
             "provider": llm_payload.get("provider"),
             "permission_mode": product_payload.get("permission_mode"),
             "session_overrides": session_overrides,
+            "forked_from_session_id": forked_from_session_id,
         }
 
     def list_sessions(self, *, limit: int = 30) -> list[S4SessionSummary]:
@@ -74,6 +82,8 @@ class S4SessionManager:
                     provider=metadata.get("provider"),
                     project_root=metadata.get("project_root"),
                     permission_mode=metadata.get("permission_mode"),
+                    branch=metadata.get("branch"),
+                    forked_from_session_id=metadata.get("forked_from_session_id"),
                 )
             )
         return result

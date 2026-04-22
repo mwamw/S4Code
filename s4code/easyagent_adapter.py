@@ -6,30 +6,36 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from easyagent import (
-    BasicAgent,
-    Config,
-    EasyLLM,
-    ExecutionContext,
-    PermissionContext,
-    PermissionMode,
-    ToolRegistry,
-    build_default_hook_manager,
-)
-from easyagent.codeintel import CodeIntelManager, LSPCodeIntelProvider
-from easyagent.context import ContextManager, LLMHistoryCompactor, RuleBasedHistoryCompactor
-from easyagent.session import SessionStore
-from easyagent.tasks import SQLiteTaskStore, TaskService
-from easyagent.tools import (
+from ._easyagent_bootstrap import ensure_easyagent_environment
+
+ensure_easyagent_environment()
+
+from agent import BasicAgent
+from codeintel import CodeIntelManager, LSPCodeIntelProvider
+from context import ContextManager, LLMHistoryCompactor, RuleBasedHistoryCompactor
+from core.Config import Config
+from core.guardrails import build_default_hook_manager
+from core.llm import EasyLLM
+from core.permissions import PermissionContext, PermissionMode
+from db import SessionStore
+from runtime import ExecutionContext
+from task import SQLiteTaskStore, TaskService
+from Tool import ToolRegistry
+from Tool.builtin import (
     register_ask_user_question_tool,
+    register_config_tool,
     register_codeintel_tools,
     register_enter_plan_mode_tool,
     register_exit_plan_mode_tool,
     register_file_edit_tool,
     register_file_write_tool,
     register_filesystem_tools,
+    register_notebook_edit_tool,
     register_mcp_tools,
+    register_search_tool,
     register_shell_tools,
+    register_todo_write_tool,
+    register_web_fetch_tool,
 )
 
 from .config import S4Settings
@@ -68,6 +74,7 @@ class S4AgentBundle:
     context_manager: Optional[ContextManager] = None
     runtime_notice_hook: Optional[S4RuntimeNoticeHook] = None
     startup_issues: list[str] = field(default_factory=list)
+    restore_report: Optional[dict[str, Any]] = None
 
 
 def _build_llm(settings: S4Settings) -> EasyLLM:
@@ -131,6 +138,8 @@ def _register_base_tools(
     *,
     project: ProjectContext,
     settings: S4Settings,
+    config: Config,
+    task_service: TaskService,
     codeintel_manager: Optional[CodeIntelManager],
     startup_issues: list[str],
 ) -> None:
@@ -154,10 +163,28 @@ def _register_base_tools(
         allowed_roots=allowed_roots,
         cwd=workspace_root,
     )
+    register_notebook_edit_tool(
+        registry,
+        workspace_root=workspace_root,
+        allowed_roots=allowed_roots,
+        cwd=workspace_root,
+    )
     register_shell_tools(
         registry,
         workspace_root=workspace_root,
     )
+    register_web_fetch_tool(registry)
+    try:
+        register_search_tool(registry)
+    except Exception as exc:
+        startup_issues.append(f"Search tool registration failed: {exc}")
+    register_todo_write_tool(
+        registry,
+        service=task_service,
+        scope_key=f"s4code:{project.project_name}",
+        owner="S4Code",
+    )
+    register_config_tool(registry, config=config)
     register_ask_user_question_tool(registry)
     register_enter_plan_mode_tool(registry)
     register_exit_plan_mode_tool(registry)
@@ -201,6 +228,7 @@ def build_agent_bundle(
     task_service = TaskService(SQLiteTaskStore(str(paths.task_db_path)))
     session_store = session_store or SessionStore(str(paths.session_db_path))
     permission_context = _build_permission_context(settings)
+    config = _build_agent_config(settings, project)
     hook_manager = build_default_hook_manager()
     runtime_notice_hook = S4RuntimeNoticeHook()
     hook_manager.add_hook(runtime_notice_hook)
@@ -217,10 +245,11 @@ def build_agent_bundle(
         registry,
         project=project,
         settings=settings,
+        config=config,
+        task_service=task_service,
         codeintel_manager=codeintel_manager,
         startup_issues=startup_issues,
     )
-    config = _build_agent_config(settings, project)
 
     if restore_session_id:
         agent = BasicAgent.load_session(
@@ -265,6 +294,10 @@ def build_agent_bundle(
             storage_dir=str(paths.agent_storage_dir),
             max_background_tasks=settings.product.max_background_tasks,
         )
+    restore_report = None
+    restore_report_getter = getattr(agent, "get_last_restore_report", None)
+    if callable(restore_report_getter):
+        restore_report = restore_report_getter()
 
     return S4AgentBundle(
         settings=settings,
@@ -279,4 +312,5 @@ def build_agent_bundle(
         context_manager=context_manager,
         runtime_notice_hook=runtime_notice_hook,
         startup_issues=startup_issues,
+        restore_report=restore_report,
     )

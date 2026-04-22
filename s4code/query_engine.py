@@ -15,6 +15,16 @@ from .project import ProjectContext
 from .session import S4SessionManager
 
 
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(dict(merged[key]), value)
+        else:
+            merged[key] = value
+    return merged
+
+
 class S4QueryEngine:
     def __init__(
         self,
@@ -25,16 +35,24 @@ class S4QueryEngine:
     ) -> None:
         self.paths = get_s4_paths().ensure()
         self.session_manager = S4SessionManager(self.paths)
-        self.session_overrides = dict(session_overrides or {})
+        self.command_registry = S4CommandRegistry()
+        self._base_session_overrides = dict(session_overrides or {})
+        self.session_overrides = dict(self._base_session_overrides)
         self.project = ProjectContext.detect(cwd)
+        self.bundle: S4AgentBundle
+        self.session_id = session_id or self.session_manager.new_session_id(self.project)
+        self.title = f"{self.project.project_name} session"
+        self.forked_from_session_id: Optional[str] = None
+        self._restored_session = session_id is not None
+
+        if session_id is not None:
+            self._apply_session_record(self._require_session_record(session_id))
+
         self.settings = resolve_settings(
             self.paths,
             project_root=self.project.project_root,
             session_overrides=self.session_overrides,
         )
-        self.bundle: S4AgentBundle
-        self.session_id = session_id or self.session_manager.new_session_id(self.project)
-        self.title = f"{self.project.project_name} session"
         self.bundle = build_agent_bundle(
             settings=self.settings,
             project=self.project,
@@ -42,8 +60,9 @@ class S4QueryEngine:
             session_store=self.session_manager.store,
             restore_session_id=session_id,
         )
-        self.command_registry = S4CommandRegistry()
-        self.sidebar_visible = False
+        self.sidebar_visible = bool(self.settings.ui.right_panel_open)
+        if session_id is None and self.settings.product.session_auto_save:
+            self.save_session(tolerate_failure=True)
 
     @property
     def agent(self):
@@ -53,31 +72,62 @@ class S4QueryEngine:
     def registry(self):
         return self.bundle.registry
 
+    @property
+    def was_restored(self) -> bool:
+        return self._restored_session
+
+    def _require_session_record(self, session_id: str) -> dict[str, Any]:
+        record = self.session_manager.get_record(session_id)
+        if record is None:
+            raise ValueError(f"Session not found: {session_id}")
+        return record
+
+    def _apply_session_record(self, record: dict[str, Any]) -> None:
+        metadata = dict(record.get("metadata") or {})
+        project_root = metadata.get("project_root") or str(self.project.project_root)
+        self.project = ProjectContext.detect(project_root)
+        stored_overrides = dict(metadata.get("session_overrides") or {})
+        self.session_overrides = _deep_merge_dicts(stored_overrides, self._base_session_overrides)
+        restored_title = str(metadata.get("title") or "").strip()
+        if restored_title:
+            self.title = restored_title
+        self.forked_from_session_id = metadata.get("forked_from_session_id")
+
     def ensure_autosave(self) -> None:
         if self.settings.product.session_auto_save:
-            self.save_session()
+            self.save_session(tolerate_failure=True)
 
-    def save_session(self) -> None:
-        metadata = self.session_manager.build_metadata(
+    def _note_session_persistence_failure(self, exc: Exception) -> None:
+        message = f"Session persistence unavailable: {type(exc).__name__}: {exc}"
+        if message not in self.bundle.startup_issues:
+            self.bundle.startup_issues.append(message)
+
+    def save_session(self, *, tolerate_failure: bool = False) -> None:
+        metadata = self._build_session_metadata()
+        try:
+            self.agent.save_session(
+                self.session_id,
+                store=self.session_manager.store,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            if not tolerate_failure:
+                raise
+            self.settings.product.session_auto_save = False
+            self._note_session_persistence_failure(exc)
+
+    def _build_session_metadata(self) -> dict[str, Any]:
+        return self.session_manager.build_metadata(
             project=self.project,
             title=self.title,
             settings_payload=self.settings.model_dump(mode="python"),
             session_overrides=self.session_overrides,
-        )
-        self.agent.save_session(
-            self.session_id,
-            store=self.session_manager.store,
-            metadata=metadata,
+            forked_from_session_id=self.forked_from_session_id,
         )
 
     def resume_session(self, session_id: str) -> str:
-        record = self.session_manager.get_record(session_id)
-        if record is None:
-            raise ValueError(f"Session not found: {session_id}")
-        metadata = dict(record.get("metadata") or {})
-        project_root = metadata.get("project_root") or str(self.project.project_root)
-        self.project = ProjectContext.detect(project_root)
-        self.session_overrides = dict(metadata.get("session_overrides") or {})
+        self._restored_session = True
+        self._apply_session_record(self._require_session_record(session_id))
         self.settings = resolve_settings(
             self.paths,
             project_root=self.project.project_root,
@@ -91,8 +141,29 @@ class S4QueryEngine:
             restore_session_id=session_id,
         )
         self.session_id = session_id
-        self.title = str(metadata.get("title") or self.title)
+        self.sidebar_visible = bool(self.settings.ui.right_panel_open)
+        summary = self.summarize_restore_report()
+        if summary:
+            return f"Resumed session {session_id}\n{summary}"
         return f"Resumed session {session_id}"
+
+    def rename_session(self, title: str) -> str:
+        new_title = str(title or "").strip()
+        if not new_title:
+            raise ValueError("Session title must be non-empty.")
+        self.title = new_title
+        self.save_session()
+        return f"Session renamed to {new_title}"
+
+    def fork_session(self, title: Optional[str] = None) -> str:
+        self.save_session()
+        previous_session_id = self.session_id
+        previous_title = self.title
+        self.session_id = self.session_manager.new_session_id(self.project)
+        self.title = str(title or "").strip() or f"{previous_title} (fork)"
+        self.forked_from_session_id = previous_session_id
+        self.save_session()
+        return f"Forked session {previous_session_id} -> {self.session_id}"
 
     def _refresh_context_compactor_llm(self) -> None:
         manager = self.bundle.context_manager
@@ -231,6 +302,7 @@ class S4QueryEngine:
         agent_mode = self.agent.get_execution_mode().value
         agent_count = len(self.agent.agent_runtime.list_handles(limit=1000)) if self.agent.agent_runtime is not None else 0
         task_count = len(self.bundle.task_service.list_tasks(limit=1000))
+        restore_report = self.get_restore_report()
         status = {
             "sessionId": self.session_id,
             "title": self.title,
@@ -243,10 +315,21 @@ class S4QueryEngine:
             "permissionMode": getattr(getattr(self.agent, "permission_context", None), "mode", None).value,
             "agents": agent_count,
             "tasks": task_count,
+            "toolCount": len(self.registry.get_tool_names()),
             "codeintelEnabled": self.settings.product.enable_codeintel,
             "mcpServers": list(self.registry.list_runtime_surfaces("mcp_manager").keys()),
             "context": self.agent.get_context_usage(),
             "startupIssues": list(self.bundle.startup_issues),
+            "restore": (
+                {
+                    "status": restore_report.get("status"),
+                    "issueCount": len(list(restore_report.get("issues") or [])),
+                    "missingTools": list(restore_report.get("missingTools") or []),
+                    "missingSkills": list(restore_report.get("missingSkills") or []),
+                }
+                if isinstance(restore_report, dict)
+                else None
+            ),
         }
         return json.dumps(status, ensure_ascii=False, indent=2)
 
@@ -256,6 +339,12 @@ class S4QueryEngine:
         handles = self.agent.agent_runtime.list_handles(limit=5) if self.agent.agent_runtime is not None else []
         tasks = self.bundle.task_service.list_tasks(limit=5)
         context_usage = self.agent.get_context_usage()
+        restore_report = self.get_restore_report()
+        restore_status = "-"
+        restore_issue_count = 0
+        if isinstance(restore_report, dict):
+            restore_status = str(restore_report.get("status") or "-")
+            restore_issue_count = len(list(restore_report.get("issues") or []))
         lines = [
             f"Project: {self.project.project_name}",
             f"Branch: {self.project.branch or '-'}",
@@ -265,6 +354,8 @@ class S4QueryEngine:
             f"Mode: {agent_mode}",
             f"Permissions: {permission_mode}",
             f"Session: {self.session_id}",
+            f"Tools: {len(self.registry.get_tool_names())}",
+            f"Restore: {restore_status} ({restore_issue_count} issue(s))",
             "",
             "Context:",
             (
@@ -302,10 +393,43 @@ class S4QueryEngine:
                 "sessionId": self.session_id,
                 "title": self.title,
                 "projectRoot": str(self.project.project_root),
+                "forkedFromSessionId": self.forked_from_session_id,
             },
             ensure_ascii=False,
             indent=2,
         )
+
+    def get_model_choices(self) -> list[dict[str, Any]]:
+        choices: list[dict[str, Any]] = []
+        for name, profile in self.settings.model_profiles.items():
+            choices.append(
+                {
+                    "name": name,
+                    "provider": profile.provider,
+                    "model": profile.model,
+                    "active": name == self.settings.active_model_profile,
+                }
+            )
+        return choices
+
+    def get_session_choices(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        choices: list[dict[str, Any]] = []
+        for item in self.session_manager.list_sessions(limit=limit):
+            choices.append(
+                {
+                    "session_id": item.session_id,
+                    "title": item.title,
+                    "model": item.model,
+                    "provider": item.provider,
+                    "project_root": item.project_root,
+                    "permission_mode": item.permission_mode,
+                    "branch": item.branch,
+                    "forked_from_session_id": item.forked_from_session_id,
+                    "updated_at": item.updated_at.isoformat() if item.updated_at is not None else None,
+                    "current": item.session_id == self.session_id,
+                }
+            )
+        return choices
 
     def format_sessions(self, *, limit: int = 20) -> str:
         sessions = self.session_manager.list_sessions(limit=limit)
@@ -313,14 +437,37 @@ class S4QueryEngine:
             return "No S4Code sessions found."
         lines = []
         for item in sessions:
+            marker = "*" if item.session_id == self.session_id else "-"
+            updated = item.updated_at.isoformat(timespec="seconds") if item.updated_at is not None else "-"
             lines.append(
-                f"{item.session_id} | {item.title} | {item.model or '-'} | "
-                f"{item.permission_mode or '-'} | {item.project_root or '-'}"
+                f"{marker} {item.session_id} | {item.title} | {item.model or '-'} | "
+                f"{item.permission_mode or '-'} | {updated} | {item.project_root or '-'}"
             )
         return "\n".join(lines)
 
     def format_config(self) -> str:
         return dump_settings_yaml(self.settings)
+
+    def format_tools(self) -> str:
+        specs = sorted(self.registry.list_tool_specs(), key=lambda item: item.name.lower())
+        if not specs:
+            return "No tools registered."
+        lines: list[str] = []
+        for spec in specs:
+            flags: list[str] = []
+            if spec.read_only:
+                flags.append("read-only")
+            if spec.requires_confirmation:
+                flags.append("confirm")
+            if spec.destructive:
+                flags.append("destructive")
+            if spec.visibility_scope != "resident":
+                flags.append(spec.visibility_scope)
+            if spec.side_effect_level != "none":
+                flags.append(f"side={spec.side_effect_level}")
+            suffix = f" [{', '.join(flags)}]" if flags else ""
+            lines.append(f"{spec.name}{suffix}: {spec.description}")
+        return "\n".join(lines)
 
     def format_models(self) -> str:
         lines = [
@@ -339,6 +486,61 @@ class S4QueryEngine:
 
     def format_context(self) -> str:
         return json.dumps(self.agent.get_context_usage(), ensure_ascii=False, indent=2)
+
+    def get_restore_report(self) -> Optional[dict[str, Any]]:
+        report = self.bundle.restore_report
+        if report is None:
+            getter = getattr(self.agent, "get_last_restore_report", None)
+            if callable(getter):
+                report = getter()
+                self.bundle.restore_report = report
+        if report is None:
+            return None
+        if hasattr(report, "to_dict"):
+            return dict(report.to_dict())
+        return dict(report)
+
+    def summarize_restore_report(self, *, detailed: bool = False) -> str:
+        report = self.get_restore_report()
+        if report is None:
+            return ""
+        lines = [
+            f"Restore status: {report.get('status') or 'restored'}",
+            f"Execution context restored: {bool(report.get('executionContextRestored'))}",
+        ]
+        missing_tools = list(report.get("missingTools") or [])
+        missing_skills = list(report.get("missingSkills") or [])
+        issues = list(report.get("issues") or [])
+        if missing_tools:
+            lines.append(f"Missing tools: {', '.join(str(item) for item in missing_tools)}")
+        if missing_skills:
+            lines.append(f"Missing skills: {', '.join(str(item) for item in missing_skills)}")
+        if issues:
+            lines.append(f"Issues: {len(issues)}")
+        components = dict(report.get("components") or {})
+        degraded_components = [
+            f"{name}={payload.get('status') or 'unknown'}"
+            for name, payload in components.items()
+            if str(payload.get("status") or "restored") != "restored"
+        ]
+        if degraded_components:
+            lines.append(f"Components: {', '.join(degraded_components)}")
+        if detailed and issues:
+            for issue in issues[:5]:
+                severity = str(issue.get("severity") or "warning").upper()
+                component = str(issue.get("component") or "restore")
+                message = str(issue.get("message") or "").strip()
+                lines.append(f"- {severity} {component}: {message}")
+            hidden = len(issues) - 5
+            if hidden > 0:
+                lines.append(f"... {hidden} more restore issue(s)")
+        return "\n".join(lines)
+
+    def format_restore_report(self) -> str:
+        report = self.get_restore_report()
+        if report is None:
+            return "No restore report for the current session."
+        return json.dumps(report, ensure_ascii=False, indent=2)
 
     def get_pending_interaction(self) -> Optional[dict[str, Any]]:
         payload = self.agent.get_last_tool_interrupt()
@@ -511,9 +713,24 @@ class S4QueryEngine:
     def format_cost(self) -> str:
         payload = {
             "observability": self.agent.get_observability_summary(),
+            "recentEvents": self.agent.get_recent_observability_events(limit=10),
             "traceSummary": self.agent.get_trace_summary(limit_turns=5),
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def format_trace(self, *, limit_turns: int = 5) -> str:
+        return json.dumps(
+            self.agent.get_trace_summary(limit_turns=limit_turns),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def format_recent_events(self, *, limit: int = 20, event_type: Optional[str] = None) -> str:
+        return json.dumps(
+            self.agent.get_recent_observability_events(limit=limit, event_type=event_type),
+            ensure_ascii=False,
+            indent=2,
+        )
 
     def format_files(self, relative_path: str = ".", *, limit: int = 200) -> str:
         files = self.project.list_files(relative_path, limit=limit)
@@ -565,6 +782,61 @@ class S4QueryEngine:
         if not hooks:
             return "No hooks installed."
         return "\n".join(f"{hook.name}" for hook in hooks)
+
+    def format_doctor(self) -> str:
+        payload = {
+            "project": self.project.to_status_dict(),
+            "status": json.loads(self.format_status()),
+            "restoreReport": self.get_restore_report(),
+            "startupIssues": list(self.bundle.startup_issues),
+            "tools": [
+                {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "readOnly": spec.read_only,
+                    "requiresConfirmation": spec.requires_confirmation,
+                    "destructive": spec.destructive,
+                    "visibility": spec.visibility_scope,
+                    "sideEffectLevel": spec.side_effect_level,
+                }
+                for spec in self.registry.list_tool_specs()
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def get_startup_notices(self) -> list[dict[str, str]]:
+        notices: list[dict[str, str]] = []
+        if self.bundle.startup_issues:
+            notices.append(
+                {
+                    "kind": "warning",
+                    "title": "Startup Issues",
+                    "body": "\n".join(f"- {issue}" for issue in self.bundle.startup_issues),
+                }
+            )
+        restore_summary = self.summarize_restore_report(detailed=True)
+        restore_report = self.get_restore_report()
+        if restore_summary and (
+            self.was_restored
+            or (
+                isinstance(restore_report, dict)
+                and (
+                    str(restore_report.get("status") or "restored") != "restored"
+                    or bool(restore_report.get("issues"))
+                )
+            )
+        ):
+            kind = "warning"
+            if isinstance(restore_report, dict) and str(restore_report.get("status") or "restored") == "restored":
+                kind = "system"
+            notices.append(
+                {
+                    "kind": kind,
+                    "title": "Session Restored",
+                    "body": restore_summary,
+                }
+            )
+        return notices
 
     def build_review_prompt(self, target: Optional[str] = None) -> str:
         scope = target or "the current uncommitted diff"

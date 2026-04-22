@@ -4,6 +4,9 @@ from s4code.commands import register_builtin_commands
 
 
 class _DummyEngine:
+    def format_doctor(self) -> str:
+        return "doctor"
+
     def format_models(self) -> str:
         return "models"
 
@@ -15,6 +18,33 @@ class _DummyEngine:
 
     def format_pending_interaction(self) -> str:
         return "pending"
+
+    def format_sessions(self) -> str:
+        return "sessions"
+
+    def resume_session(self, session_id: str) -> str:
+        return f"resumed:{session_id}"
+
+    def format_current_session(self) -> str:
+        return "current-session"
+
+    def format_tools(self) -> str:
+        return "tools"
+
+    def format_restore_report(self) -> str:
+        return "restore"
+
+    def format_trace(self) -> str:
+        return "trace"
+
+    def format_hooks(self) -> str:
+        return "hooks"
+
+    def rename_session(self, title: str) -> str:
+        return f"renamed:{title}"
+
+    def fork_session(self, title: str | None = None) -> str:
+        return f"forked:{title or 'default'}"
 
 
 def test_parse_command() -> None:
@@ -90,6 +120,26 @@ def test_builtin_model_and_context_commands() -> None:
     assert result is not None
     assert result.message == "context"
 
+    result = registry.execute(engine, "/doctor")
+    assert result is not None
+    assert result.message == "doctor"
+
+    result = registry.execute(engine, "/tools")
+    assert result is not None
+    assert result.message == "tools"
+
+    result = registry.execute(engine, "/restore")
+    assert result is not None
+    assert result.message == "restore"
+
+    result = registry.execute(engine, "/trace")
+    assert result is not None
+    assert result.message == "trace"
+
+    result = registry.execute(engine, "/hooks")
+    assert result is not None
+    assert result.message == "hooks"
+
 
 def test_builtin_pending_and_resolution_commands() -> None:
     registry = S4CommandRegistry()
@@ -113,3 +163,34 @@ def test_builtin_pending_and_resolution_commands() -> None:
     assert result is not None
     assert result.metadata["engine_action"] == "answer_pending"
     assert result.metadata["answer"] == "choose option A"
+
+
+def test_builtin_session_subcommands_and_copy_command() -> None:
+    registry = S4CommandRegistry()
+    register_builtin_commands(registry)
+    engine = _DummyEngine()
+
+    result = registry.execute(engine, "/session")
+    assert result is not None
+    assert result.message == "current-session"
+
+    result = registry.execute(engine, "/session list")
+    assert result is not None
+    assert result.message == "sessions"
+
+    result = registry.execute(engine, "/session load sess-123")
+    assert result is not None
+    assert result.message == "resumed:sess-123"
+
+    result = registry.execute(engine, "/session rename Bugfix Investigation")
+    assert result is not None
+    assert result.message == "renamed:Bugfix Investigation"
+
+    result = registry.execute(engine, "/session fork Parallel Review")
+    assert result is not None
+    assert result.message == "forked:Parallel Review"
+
+    result = registry.execute(engine, "/copy transcript")
+    assert result is not None
+    assert result.metadata["ui_action"] == "copy_to_clipboard"
+    assert result.metadata["copy_target"] == "transcript"
