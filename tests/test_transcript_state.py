@@ -40,3 +40,54 @@ def test_transcript_state_summarizes_tool_result() -> None:
     tool_card = state.cards[0]
     assert tool_card.status == "done"
     assert "... 2 more line(s) hidden" in tool_card.body
+
+
+def test_transcript_state_tracks_compaction_stage() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "compaction_start", "content": "Compacting history..."})
+    assert state.cards[0].title == "Context Compaction"
+    assert state.cards[0].status == "running"
+
+    state.consume_event({"type": "compaction_result", "content": "History compaction finished: 100 -> 40."})
+    assert len(state.cards) == 1
+    assert state.cards[0].status == "done"
+    assert "100 -> 40" in state.cards[0].body
+
+
+def test_transcript_state_formats_pending_interaction_and_resolution() -> None:
+    state = S4TranscriptState()
+    state.consume_event(
+        {
+            "type": "interruption",
+            "content": "需要用户回答 1 个结构化问题后才能继续执行。",
+            "payload": {
+                "message": "需要用户回答 1 个结构化问题后才能继续执行。",
+                "metadata": {
+                    "interaction_type": "ask_user_question",
+                    "questions": [
+                        {
+                            "header": "Language",
+                            "question": "Choose one",
+                            "options": [
+                                {"label": "Python", "description": "Use Python tooling"},
+                                {"label": "Go", "description": "Use Go tooling"},
+                            ],
+                        }
+                    ],
+                },
+            },
+        }
+    )
+    assert state.cards[0].title == "Ask User Question"
+    assert state.cards[0].status == "pending"
+    assert "1. Language" in state.cards[0].body
+    assert "Use /answer <text>" in state.cards[0].body
+    assert "Python: Use Python tooling" in state.cards[0].body
+
+    state.consume_event(
+        {
+            "type": "interaction_resolved",
+            "content": "User answered the pending interaction. Resuming execution.",
+        }
+    )
+    assert state.cards[1].title == "Interaction Resolved"

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
 from .command_registry import S4CommandRegistry
-from .config import S4Settings, resolve_settings
+from .config import S4Settings, dump_settings_yaml, resolve_settings
 from .easyagent_adapter import S4AgentBundle, build_agent_bundle
 from .paths import S4Paths, get_s4_paths
 from .project import ProjectContext
@@ -93,12 +94,46 @@ class S4QueryEngine:
         self.title = str(metadata.get("title") or self.title)
         return f"Resumed session {session_id}"
 
-    def update_model(self, model: str) -> str:
-        self.agent.change_model(model=model)
-        self.settings.llm.model = model
-        self.session_overrides.setdefault("llm", {})["model"] = model
+    def _refresh_context_compactor_llm(self) -> None:
+        manager = self.bundle.context_manager
+        if manager is None:
+            return
+        compactor = getattr(manager, "history_compactor", None)
+        if compactor is not None and hasattr(compactor, "llm"):
+            compactor.llm = self.agent.llm
+
+    def update_model(self, target: str) -> str:
+        raw_target = str(target or "").strip()
+        if not raw_target:
+            return self.format_models()
+        if raw_target in self.settings.model_profiles:
+            profile = self.settings.model_profiles[raw_target]
+            self.agent.change_model(
+                model=profile.model,
+                provider=profile.provider,
+                base_url=profile.base_url,
+                api_key=profile.api_key,
+                temperature=profile.temperature,
+                max_tokens=profile.max_tokens,
+                timeout=profile.timeout,
+            )
+            self.settings.active_model_profile = raw_target
+            self.settings.llm = profile.model_copy(deep=True)
+            self.session_overrides["active_model_profile"] = raw_target
+            self.session_overrides.pop("llm", None)
+            self._refresh_context_compactor_llm()
+            self.ensure_autosave()
+            return (
+                f"Active model profile set to {raw_target} "
+                f"({profile.provider} / {profile.model})."
+            )
+
+        self.agent.change_model(model=raw_target)
+        self.settings.llm.model = raw_target
+        self.session_overrides.setdefault("llm", {})["model"] = raw_target
+        self._refresh_context_compactor_llm()
         self.ensure_autosave()
-        return f"Model set to {model}"
+        return f"Model override set to {raw_target} on profile {self.settings.active_model_profile}."
 
     def update_permission_mode(self, mode: str) -> str:
         self.agent.set_permission_mode(mode)
@@ -123,8 +158,17 @@ class S4QueryEngine:
 
     def compact_history(self) -> str:
         changed = self.agent.compact_history()
+        usage = self.agent.get_context_usage()
+        compaction = dict(usage.get("compaction") or {})
         self.ensure_autosave()
-        return "Conversation compacted." if changed else "Compaction not needed."
+        if changed:
+            return (
+                "Conversation compacted.\n"
+                f"before={compaction.get('tokens_before', '?')} "
+                f"after={compaction.get('tokens_after', '?')} "
+                f"budget={compaction.get('max_tokens', '?')}"
+            )
+        return "Compaction not needed."
 
     def run_prompt(self, prompt: str, *, max_iter: int = 20) -> str:
         self._maybe_update_title(prompt)
@@ -134,9 +178,40 @@ class S4QueryEngine:
 
     async def stream_prompt(self, prompt: str, *, max_iter: int = 20) -> AsyncGenerator[dict[str, Any], None]:
         self._maybe_update_title(prompt)
-        async for event in self.agent.astream_invoke_with_tool(prompt, max_iter=max_iter):
-            yield dict(event)
-        self.ensure_autosave()
+        queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+        sentinel = object()
+        runtime_hook = self.bundle.runtime_notice_hook
+
+        def _emit(event: dict[str, Any]) -> None:
+            queue.put_nowait(dict(event))
+
+        async def _produce() -> None:
+            try:
+                async for event in self.agent.astream_invoke_with_tool(prompt, max_iter=max_iter):
+                    if runtime_hook is not None and runtime_hook.has_pending_compactions:
+                        runtime_hook.flush_compaction_result(self.agent)
+                    await queue.put(dict(event))
+                if runtime_hook is not None and runtime_hook.has_pending_compactions:
+                    runtime_hook.flush_compaction_result(self.agent)
+            except Exception as exc:
+                await queue.put({"type": "error", "error": f"{type(exc).__name__}: {exc}"})
+            finally:
+                await queue.put(sentinel)
+
+        if runtime_hook is not None:
+            runtime_hook.bind_emitter(_emit)
+        producer = asyncio.create_task(_produce())
+        try:
+            while True:
+                event = await queue.get()
+                if event is sentinel:
+                    break
+                yield dict(event)
+        finally:
+            if runtime_hook is not None:
+                runtime_hook.bind_emitter(None)
+            await producer
+            self.ensure_autosave()
 
     def _maybe_update_title(self, prompt: str) -> None:
         if self.title.endswith(" session"):
@@ -161,6 +236,7 @@ class S4QueryEngine:
             "title": self.title,
             "projectRoot": str(self.project.project_root),
             "branch": self.project.branch,
+            "activeModelProfile": self.settings.active_model_profile,
             "model": getattr(self.agent.llm, "model", None),
             "provider": getattr(self.agent.llm, "provider_name", None),
             "executionMode": agent_mode,
@@ -169,6 +245,7 @@ class S4QueryEngine:
             "tasks": task_count,
             "codeintelEnabled": self.settings.product.enable_codeintel,
             "mcpServers": list(self.registry.list_runtime_surfaces("mcp_manager").keys()),
+            "context": self.agent.get_context_usage(),
             "startupIssues": list(self.bundle.startup_issues),
         }
         return json.dumps(status, ensure_ascii=False, indent=2)
@@ -178,14 +255,23 @@ class S4QueryEngine:
         agent_mode = self.agent.get_execution_mode().value
         handles = self.agent.agent_runtime.list_handles(limit=5) if self.agent.agent_runtime is not None else []
         tasks = self.bundle.task_service.list_tasks(limit=5)
+        context_usage = self.agent.get_context_usage()
         lines = [
             f"Project: {self.project.project_name}",
             f"Branch: {self.project.branch or '-'}",
+            f"Profile: {self.settings.active_model_profile}",
             f"Model: {getattr(self.agent.llm, 'model', '-')}",
             f"Provider: {getattr(self.agent.llm, 'provider_name', '-')}",
             f"Mode: {agent_mode}",
             f"Permissions: {permission_mode}",
             f"Session: {self.session_id}",
+            "",
+            "Context:",
+            (
+                f"- used={context_usage.get('used_tokens', '?')} "
+                f"remaining={context_usage.get('remaining_tokens', '?')} "
+                f"max={context_usage.get('max_tokens', '?')}"
+            ),
             "",
             "Recent Tasks:",
         ]
@@ -234,7 +320,193 @@ class S4QueryEngine:
         return "\n".join(lines)
 
     def format_config(self) -> str:
-        return json.dumps(self.settings.model_dump(mode="python"), ensure_ascii=False, indent=2)
+        return dump_settings_yaml(self.settings)
+
+    def format_models(self) -> str:
+        lines = [
+            f"Active profile: {self.settings.active_model_profile}",
+            f"Current provider: {self.settings.llm.provider}",
+            f"Current model: {self.settings.llm.model}",
+            "",
+            "Profiles:",
+        ]
+        for name, profile in self.settings.model_profiles.items():
+            marker = "*" if name == self.settings.active_model_profile else "-"
+            lines.append(f"{marker} {name}: {profile.provider} / {profile.model}")
+        lines.append("")
+        lines.append("Usage: /model <profile-name|literal-model>")
+        return "\n".join(lines)
+
+    def format_context(self) -> str:
+        return json.dumps(self.agent.get_context_usage(), ensure_ascii=False, indent=2)
+
+    def get_pending_interaction(self) -> Optional[dict[str, Any]]:
+        payload = self.agent.get_last_tool_interrupt()
+        if payload is None:
+            return None
+        return dict(payload)
+
+    def format_pending_interaction(self) -> str:
+        payload = self.get_pending_interaction()
+        if payload is None:
+            return "No pending interaction."
+        return self._format_pending_payload(payload)
+
+    def _format_pending_payload(self, payload: dict[str, Any]) -> str:
+        metadata = dict(payload.get("metadata") or {})
+        interaction_type = str(metadata.get("interaction_type") or "confirmation")
+        lines = [
+            f"status: {payload.get('status')}",
+            f"type: {interaction_type}",
+        ]
+        tool_name = str(payload.get("tool_name") or "").strip()
+        if tool_name:
+            lines.append(f"tool: {tool_name}")
+        message = str(payload.get("message") or "").strip()
+        if message:
+            lines.append(f"message: {message}")
+
+        if interaction_type == "ask_user_question":
+            questions = list(metadata.get("questions") or [])
+            if questions:
+                lines.append("")
+                lines.append("questions:")
+                for index, item in enumerate(questions, start=1):
+                    header = str(item.get("header") or f"Question {index}").strip()
+                    question = str(item.get("question") or "").strip()
+                    lines.append(f"  {index}. {header}")
+                    if question:
+                        lines.append(f"     {question}")
+                    for option in list(item.get("options") or []):
+                        label = str(option.get("label") or "").strip()
+                        description = str(option.get("description") or "").strip()
+                        bullet = f"     - {label}" if label else "     - option"
+                        if description:
+                            bullet += f": {description}"
+                        lines.append(bullet)
+            lines.append("")
+            lines.append("reply with: /answer <text>")
+            lines.append("or cancel with: /deny [reason]")
+            return "\n".join(lines)
+
+        if metadata.get("reason"):
+            lines.append(f"reason: {metadata.get('reason')}")
+        allowed_actions = list(metadata.get("allowedActions") or [])
+        if allowed_actions:
+            lines.append("allowed_actions:")
+            lines.extend(f"  - {item}" for item in allowed_actions)
+        allowed_prompts = list(metadata.get("allowedPrompts") or [])
+        if allowed_prompts:
+            lines.append("allowed_prompts:")
+            for item in allowed_prompts:
+                tool = str(item.get("tool") or "tool").strip()
+                prompt = str(item.get("prompt") or "").strip()
+                if prompt:
+                    lines.append(f"  - {tool}: {prompt}")
+                else:
+                    lines.append(f"  - {tool}")
+        tool_args = payload.get("tool_args") or {}
+        if isinstance(tool_args, dict) and tool_args:
+            lines.append("tool_args:")
+            lines.append(json.dumps(tool_args, ensure_ascii=False, indent=2))
+        lines.append("")
+        lines.append("confirm with: /confirm [note]")
+        lines.append("deny with: /deny [reason]")
+        return "\n".join(lines)
+
+    def _resolve_interaction_result_text(
+        self,
+        payload: dict[str, Any],
+        *,
+        action: str,
+        answer: str = "",
+    ) -> tuple[str, Any]:
+        metadata = dict(payload.get("metadata") or {})
+        interaction_type = str(metadata.get("interaction_type") or "")
+        tool_name = str(payload.get("tool_name") or "")
+        tool_args = dict(payload.get("tool_args") or {})
+        if interaction_type == "ask_user_question":
+            if action == "deny":
+                return "The user declined to answer the structured question.", None
+            answer_text = answer.strip()
+            if not answer_text:
+                raise ValueError("A pending AskUserQuestion interaction requires /answer <text>.")
+            return (
+                "User provided the following answer for the structured question:\n"
+                f"{answer_text}",
+                None,
+            )
+        if interaction_type == "enter_plan_mode":
+            if action == "deny":
+                return "The user declined the request to enter plan mode.", None
+            allowed_actions = list(metadata.get("allowedActions") or [])
+            self.agent.enter_plan_mode(allowed_actions=allowed_actions)
+            return (
+                f"S4Code entered plan mode. allowed_actions={allowed_actions or []}",
+                None,
+            )
+        if interaction_type == "exit_plan_mode":
+            if action == "deny":
+                return "The user declined the request to exit plan mode.", None
+            permission_mode = self.settings.product.permission_mode
+            self.agent.exit_plan_mode(permission_mode=permission_mode)
+            return (
+                f"S4Code exited plan mode and restored permission mode to {permission_mode}.",
+                None,
+            )
+        if action == "deny":
+            denied_reason = answer.strip() or "No reason provided."
+            return (
+                f"The user denied execution of tool '{tool_name}'. Reason: {denied_reason}",
+                None,
+            )
+        result = self.registry.execute_confirmed_tool_result(
+            tool_name,
+            tool_args,
+            permission_context=self.agent.permission_context,
+            permission_engine=self.agent.permission_engine,
+        )
+        return result.to_display_string(), getattr(result, "ephemeral_context", None)
+
+    async def stream_resolve_pending_interaction(
+        self,
+        *,
+        action: str,
+        answer: str = "",
+        max_iter: int = 20,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        payload = self.get_pending_interaction()
+        if payload is None:
+            yield {"type": "system_notice", "content": "No pending interaction."}
+            return
+        content, ephemeral_context = self._resolve_interaction_result_text(
+            payload,
+            action=action,
+            answer=answer,
+        )
+        self.agent.resolve_last_tool_interrupt(
+            content=content,
+            ephemeral_context=ephemeral_context,
+            commit_pending_step=True,
+        )
+        notice = {
+            "approve": "User confirmed the pending interaction. Resuming execution.",
+            "deny": "User denied the pending interaction. Resuming execution with the denial result.",
+            "answer": "User answered the pending interaction. Resuming execution.",
+        }[action]
+        yield {
+            "type": "interaction_resolved",
+            "content": notice,
+            "payload": payload,
+        }
+        async for event in self.agent.astream_invoke_with_tool(
+            "[resume pending interaction]",
+            max_iter=max_iter,
+            resume_from_history=True,
+            trace_query="[resume_pending_tool_interrupt]",
+        ):
+            yield dict(event)
+        self.ensure_autosave()
 
     def format_cost(self) -> str:
         payload = {

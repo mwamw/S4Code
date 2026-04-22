@@ -50,6 +50,7 @@ class S4SessionManager:
             "project_root": str(project.project_root),
             "project_name": project.project_name,
             "branch": project.branch,
+            "active_model_profile": settings_payload.get("active_model_profile"),
             "model": llm_payload.get("model"),
             "provider": llm_payload.get("provider"),
             "permission_mode": product_payload.get("permission_mode"),
@@ -79,4 +80,3 @@ class S4SessionManager:
 
     def get_record(self, session_id: str) -> Optional[dict[str, Any]]:
         return self.store.get_session(session_id)
-

@@ -15,7 +15,7 @@ def _status(engine, invocation):
 
 def _model(engine, invocation):
     if not invocation.arg_text:
-        return CommandResult.info(f"Current model: {engine.agent.llm.model}")
+        return CommandResult.info(engine.format_models())
     return CommandResult.info(engine.update_model(invocation.arg_text))
 
 
@@ -49,6 +49,10 @@ def _session(engine, invocation):
     return CommandResult.info(engine.format_current_session())
 
 
+def _pending(engine, invocation):
+    return CommandResult.info(engine.format_pending_interaction())
+
+
 def _clear(engine, invocation):
     return CommandResult.info(engine.clear_history())
 
@@ -59,6 +63,10 @@ def _compact(engine, invocation):
 
 def _cost(engine, invocation):
     return CommandResult.info(engine.format_cost())
+
+
+def _context(engine, invocation):
+    return CommandResult.info(engine.format_context())
 
 
 def _files(engine, invocation):
@@ -100,6 +108,29 @@ def _hooks(engine, invocation):
     return CommandResult.info(engine.format_hooks())
 
 
+def _confirm(engine, invocation):
+    return CommandResult(
+        message="Confirming the pending interaction and resuming execution...",
+        metadata={"engine_action": "confirm_pending", "answer": invocation.arg_text},
+    )
+
+
+def _deny(engine, invocation):
+    return CommandResult(
+        message="Denying the pending interaction and resuming execution...",
+        metadata={"engine_action": "deny_pending", "answer": invocation.arg_text},
+    )
+
+
+def _answer(engine, invocation):
+    if not invocation.arg_text:
+        return CommandResult.info("Usage: /answer <text>")
+    return CommandResult(
+        message="Submitting the answer and resuming execution...",
+        metadata={"engine_action": "answer_pending", "answer": invocation.arg_text},
+    )
+
+
 def _sidebar(engine, invocation):
     if not invocation.arg_text:
         return CommandResult.info(engine.toggle_sidebar())
@@ -120,7 +151,15 @@ def register_builtin_commands(registry) -> None:
         S4Command("help", CommandKind.LOCAL, "Show available slash commands.", _help, aliases=("h",), usage="[command]")
     )
     registry.register(S4Command("status", CommandKind.LOCAL, "Show the current product/runtime status.", _status))
-    registry.register(S4Command("model", CommandKind.LOCAL, "Show or change the current model.", _model, usage="[model]"))
+    registry.register(
+        S4Command(
+            "model",
+            CommandKind.LOCAL,
+            "Show model profiles or switch to a profile/literal model.",
+            _model,
+            usage="[profile-name|literal-model]",
+        )
+    )
     registry.register(S4Command("config", CommandKind.LOCAL, "Show the resolved S4Code config.", _config))
     registry.register(
         S4Command(
@@ -135,8 +174,10 @@ def register_builtin_commands(registry) -> None:
     registry.register(S4Command("plan", CommandKind.LOCAL, "Enter or exit plan mode.", _plan, usage="[on|off]"))
     registry.register(S4Command("resume", CommandKind.LOCAL, "Resume a saved session or list sessions.", _resume, usage="[session_id]"))
     registry.register(S4Command("session", CommandKind.LOCAL, "Show the current session details.", _session))
+    registry.register(S4Command("pending", CommandKind.LOCAL, "Show the current pending confirmation/question.", _pending))
     registry.register(S4Command("clear", CommandKind.LOCAL, "Clear conversation history.", _clear))
     registry.register(S4Command("compact", CommandKind.LOCAL, "Compact conversation history.", _compact))
+    registry.register(S4Command("context", CommandKind.LOCAL, "Show current context window usage and compaction state.", _context))
     registry.register(S4Command("cost", CommandKind.LOCAL, "Show observability and token usage summary.", _cost))
     registry.register(S4Command("files", CommandKind.LOCAL, "List project files.", _files, usage="[path]"))
     registry.register(S4Command("diff", CommandKind.LOCAL, "Show git diff for the current repository.", _diff, usage="[target]"))
@@ -146,5 +187,33 @@ def register_builtin_commands(registry) -> None:
     registry.register(S4Command("agents", CommandKind.LOCAL, "List runtime agents.", _agents))
     registry.register(S4Command("mcp", CommandKind.LOCAL, "Show configured MCP servers.", _mcp))
     registry.register(S4Command("hooks", CommandKind.LOCAL, "List installed hooks/guardrails.", _hooks))
+    registry.register(
+        S4Command(
+            "confirm",
+            CommandKind.LOCAL,
+            "Approve the current pending confirmation and continue execution.",
+            _confirm,
+            aliases=("approve",),
+            usage="[note]",
+        )
+    )
+    registry.register(
+        S4Command(
+            "deny",
+            CommandKind.LOCAL,
+            "Deny the current pending confirmation/question and continue execution.",
+            _deny,
+            usage="[reason]",
+        )
+    )
+    registry.register(
+        S4Command(
+            "answer",
+            CommandKind.LOCAL,
+            "Answer the current AskUserQuestion interaction and continue execution.",
+            _answer,
+            usage="<text>",
+        )
+    )
     registry.register(S4Command("sidebar", CommandKind.LOCAL, "Show or hide the right-side info panel.", _sidebar, usage="[show|hide]"))
     registry.register(S4Command("exit", CommandKind.LOCAL, "Exit the current S4Code session.", _exit, aliases=("quit", "q")))

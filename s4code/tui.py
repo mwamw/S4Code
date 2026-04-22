@@ -120,6 +120,15 @@ class S4TextualApp(App[None]):
 
     def on_mount(self) -> None:
         self._transcript_state.append_card("system", "System", "S4Code ready. Type /help for commands.")
+        pending = self.engine.get_pending_interaction()
+        if pending is not None:
+            self._transcript_state.consume_event(
+                {
+                    "type": "interruption",
+                    "content": pending.get("message") or "A pending interaction was restored with this session.",
+                    "payload": pending,
+                }
+            )
         self._render_transcript()
         self._refresh_command_palette("")
         self._apply_sidebar_visibility()
@@ -187,6 +196,13 @@ class S4TextualApp(App[None]):
                     self._transcript_state.append_card("system", "System", result.message)
                     self._render_transcript()
                     self._apply_sidebar_visibility()
+                engine_action = str(result.metadata.get("engine_action") or "")
+                if engine_action == "confirm_pending":
+                    await self._run_pending_resolution("approve", str(result.metadata.get("answer") or ""))
+                elif engine_action == "deny_pending":
+                    await self._run_pending_resolution("deny", str(result.metadata.get("answer") or ""))
+                elif engine_action == "answer_pending":
+                    await self._run_pending_resolution("answer", str(result.metadata.get("answer") or ""))
                 if result.should_query and result.query:
                     await self._run_query(result.query)
                 if result.exit_requested:
@@ -201,6 +217,13 @@ class S4TextualApp(App[None]):
 
     async def _run_query(self, prompt: str) -> None:
         async for event in self.engine.stream_prompt(prompt):
+            self._render_event(event)
+
+    async def _run_pending_resolution(self, action: str, answer: str = "") -> None:
+        async for event in self.engine.stream_resolve_pending_interaction(
+            action=action,
+            answer=answer,
+        ):
             self._render_event(event)
 
     def _render_event(self, event: dict[str, object]) -> None:

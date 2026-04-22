@@ -17,10 +17,14 @@ from easyagent import (
     build_default_hook_manager,
 )
 from easyagent.codeintel import CodeIntelManager, LSPCodeIntelProvider
+from easyagent.context import ContextManager, LLMHistoryCompactor, RuleBasedHistoryCompactor
 from easyagent.session import SessionStore
 from easyagent.tasks import SQLiteTaskStore, TaskService
 from easyagent.tools import (
+    register_ask_user_question_tool,
     register_codeintel_tools,
+    register_enter_plan_mode_tool,
+    register_exit_plan_mode_tool,
     register_file_edit_tool,
     register_file_write_tool,
     register_filesystem_tools,
@@ -31,6 +35,7 @@ from easyagent.tools import (
 from .config import S4Settings
 from .paths import S4Paths
 from .project import ProjectContext
+from .runtime_hooks import S4RuntimeNoticeHook
 
 
 S4_AGENT_SYSTEM_PROMPT = """You are S4Code, a serious code agent running inside a local CLI.
@@ -60,6 +65,8 @@ class S4AgentBundle:
     task_service: TaskService
     session_store: SessionStore
     codeintel_manager: Optional[CodeIntelManager] = None
+    context_manager: Optional[ContextManager] = None
+    runtime_notice_hook: Optional[S4RuntimeNoticeHook] = None
     startup_issues: list[str] = field(default_factory=list)
 
 
@@ -97,6 +104,28 @@ def _build_permission_context(settings: S4Settings) -> PermissionContext:
     return context
 
 
+def _build_context_manager(settings: S4Settings, llm: EasyLLM) -> Optional[ContextManager]:
+    if not settings.context.enabled:
+        return None
+    manager = ContextManager(max_tokens=settings.context.max_tokens)
+    if settings.context.history_compactor == "llm":
+        manager.set_history_compactor(
+            LLMHistoryCompactor(
+                llm=llm,
+                token_counter=manager.counter,
+                recent_turns=settings.context.recent_turns,
+            )
+        )
+    else:
+        manager.set_history_compactor(
+            RuleBasedHistoryCompactor(
+                token_counter=manager.counter,
+                recent_turns=settings.context.recent_turns,
+            )
+        )
+    return manager
+
+
 def _register_base_tools(
     registry: ToolRegistry,
     *,
@@ -129,6 +158,9 @@ def _register_base_tools(
         registry,
         workspace_root=workspace_root,
     )
+    register_ask_user_question_tool(registry)
+    register_enter_plan_mode_tool(registry)
+    register_exit_plan_mode_tool(registry)
     if codeintel_manager is not None:
         register_codeintel_tools(
             registry,
@@ -170,6 +202,9 @@ def build_agent_bundle(
     session_store = session_store or SessionStore(str(paths.session_db_path))
     permission_context = _build_permission_context(settings)
     hook_manager = build_default_hook_manager()
+    runtime_notice_hook = S4RuntimeNoticeHook()
+    hook_manager.add_hook(runtime_notice_hook)
+    context_manager = _build_context_manager(settings, llm)
     codeintel_manager: Optional[CodeIntelManager] = None
 
     if settings.product.enable_codeintel:
@@ -193,6 +228,7 @@ def build_agent_bundle(
             llm=llm,
             store=session_store,
             tool_registry=registry,
+            context_manager=context_manager,
             hook_manager=hook_manager,
             permission_context=permission_context,
             task_service=task_service,
@@ -205,6 +241,8 @@ def build_agent_bundle(
             enable_tool=True,
             tool_registry=registry,
             config=config,
+            context_manager=context_manager,
+            history_via_context_manager=context_manager is not None,
             permission_context=permission_context,
             hook_manager=hook_manager,
             task_service=task_service,
@@ -238,6 +276,7 @@ def build_agent_bundle(
         task_service=task_service,
         session_store=session_store,
         codeintel_manager=codeintel_manager,
+        context_manager=context_manager,
+        runtime_notice_hook=runtime_notice_hook,
         startup_issues=startup_issues,
     )
-

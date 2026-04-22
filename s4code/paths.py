@@ -48,7 +48,7 @@ def get_s4_paths() -> S4Paths:
         config_dir=config_home,
         data_dir=data_home,
         cache_dir=cache_home,
-        global_config_path=config_home / "config.json",
+        global_config_path=config_home / "config.yaml",
         session_db_path=data_home / "sessions.db",
         task_db_path=data_home / "tasks.db",
         agent_storage_dir=data_home / "agents",
@@ -58,5 +58,4 @@ def get_s4_paths() -> S4Paths:
 
 def get_project_config_path(project_root: str | Path) -> Path:
     root = Path(project_root).expanduser().resolve()
-    return root / ".s4code" / "config.json"
-
+    return root / ".s4code" / "config.yaml"

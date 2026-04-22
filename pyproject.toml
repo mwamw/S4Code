@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
   "easyagent>=0.1.0",
   "pydantic>=2.7.0",
+  "PyYAML>=6.0.1",
   "rich>=13.7.0",
   "textual>=0.61.0",
   "typer>=0.12.3",

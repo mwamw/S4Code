@@ -1,9 +1,20 @@
 from s4code.command_registry import S4CommandRegistry
 from s4code.command_types import CommandKind, CommandResult, S4Command, parse_command
+from s4code.commands import register_builtin_commands
 
 
 class _DummyEngine:
-    pass
+    def format_models(self) -> str:
+        return "models"
+
+    def update_model(self, target: str) -> str:
+        return f"switch:{target}"
+
+    def format_context(self) -> str:
+        return "context"
+
+    def format_pending_interaction(self) -> str:
+        return "pending"
 
 
 def test_parse_command() -> None:
@@ -60,3 +71,45 @@ def test_registry_match_commands_keeps_full_result_set() -> None:
     matches = registry.match_commands("ho")
     assert len(matches) == 8
     assert matches[0].name == "hold"
+
+
+def test_builtin_model_and_context_commands() -> None:
+    registry = S4CommandRegistry()
+    register_builtin_commands(registry)
+    engine = _DummyEngine()
+
+    result = registry.execute(engine, "/model")
+    assert result is not None
+    assert result.message == "models"
+
+    result = registry.execute(engine, "/model local-qwen")
+    assert result is not None
+    assert result.message == "switch:local-qwen"
+
+    result = registry.execute(engine, "/context")
+    assert result is not None
+    assert result.message == "context"
+
+
+def test_builtin_pending_and_resolution_commands() -> None:
+    registry = S4CommandRegistry()
+    register_builtin_commands(registry)
+    engine = _DummyEngine()
+
+    result = registry.execute(engine, "/pending")
+    assert result is not None
+    assert result.message == "pending"
+
+    result = registry.execute(engine, "/confirm")
+    assert result is not None
+    assert result.metadata["engine_action"] == "confirm_pending"
+
+    result = registry.execute(engine, "/deny too risky")
+    assert result is not None
+    assert result.metadata["engine_action"] == "deny_pending"
+    assert result.metadata["answer"] == "too risky"
+
+    result = registry.execute(engine, "/answer choose option A")
+    assert result is not None
+    assert result.metadata["engine_action"] == "answer_pending"
+    assert result.metadata["answer"] == "choose option A"

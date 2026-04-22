@@ -1,0 +1,26 @@
+  active_model_profile: local-qwen
+
+  model_profiles:
+    local-qwen:
+      provider: anthropic_native
+      base_url: http://127.0.0.1:5124
+      api_key: "122"
+      model: qwen3.5-9b
+      temperature: 0.5
+      timeout: 120
+
+  context:
+    enabled: true
+    max_tokens: 48000
+    history_compactor: llm
+    recent_turns: 6
+
+  product:
+    permission_mode: accept_edits
+    enable_codeintel: true
+    enable_mcp: true
+
+  ui:
+    theme: s4
+    show_thinking: true
+    right_panel_open: false
