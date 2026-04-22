@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "s4code"
+version = "0.1.0"
+description = "A local-first code agent CLI built on EasyAgent."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "easyagent>=0.1.0",
+  "pydantic>=2.7.0",
+  "rich>=13.7.0",
+  "textual>=0.61.0",
+  "typer>=0.12.3",
+]
+
+[project.scripts]
+s4code = "s4code.cli:app"
+s4 = "s4code.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["s4code"]
