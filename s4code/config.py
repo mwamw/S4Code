@@ -13,9 +13,9 @@ from .paths import S4Paths, get_project_config_path
 
 class LLMSettings(BaseModel):
     provider: str = "openai"
-    base_url: str = "http://127.0.0.1:5124/v1"
+    base_url: str = "http://[IP_ADDRESS]/v1"
     api_key: str = "122"
-    model: str = "qwen3.5-9b"
+    model: str = "model"
     temperature: float = 0.2
     max_tokens: Optional[int] = None
     timeout: int = 120
