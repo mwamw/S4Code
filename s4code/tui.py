@@ -11,6 +11,7 @@ from rich.box import ROUNDED
 from rich.console import Group
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
 from textual import on
@@ -21,6 +22,7 @@ from textual.widgets import Footer, Header, Input, Static
 
 from .commands import register_builtin_commands
 from .query_engine import S4QueryEngine
+from .theme import load_tui_theme
 from .transcript_state import S4TranscriptState, TranscriptCard
 
 
@@ -118,6 +120,7 @@ class S4TextualApp(App[None]):
         Binding("ctrl+l", "clear_log", "Clear Transcript"),
         Binding("ctrl+shift+c", "copy_transcript", "Copy Transcript"),
         Binding("ctrl+alt+c", "copy_last_card", "Copy Last Card"),
+        Binding("escape", "interrupt", "Interrupt", show=False, priority=True),
         Binding("down", "command_palette_next", show=False),
         Binding("up", "command_palette_prev", show=False),
         Binding("tab", "command_palette_complete", show=False),
@@ -133,6 +136,13 @@ class S4TextualApp(App[None]):
         self._command_selection_index = 0
         self._palette_state_key = ""
         self._query_task: asyncio.Task[None] | None = None
+        self._transcript_render_task: asyncio.Task[None] | None = None
+        self._interrupt_rendered = False
+        self._pending_transcript_force_scroll = False
+        self._panel_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
+        self._theme_revision = 0
+        self._last_sidebar_content = ""
+        self._theme = load_tui_theme(getattr(self.engine.settings.ui, "theme", "s4"))
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -146,30 +156,81 @@ class S4TextualApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
-        self._transcript_state.append_card("system", "System", "S4Code ready. Type /help for commands.")
-        for notice in self.engine.get_startup_notices():
-            self._transcript_state.append_card(
-                str(notice.get("kind") or "system"),
-                str(notice.get("title") or "Notice"),
-                str(notice.get("body") or "").strip(),
-            )
-        pending = self.engine.get_pending_interaction()
-        if pending is not None:
-            self._transcript_state.consume_event(
-                {
-                    "type": "interruption",
-                    "content": pending.get("message") or "A pending interaction was restored with this session.",
-                    "payload": pending,
-                }
-            )
+        self._apply_theme_styles()
+        self._hydrate_transcript_from_engine()
         self._render_transcript()
         self._refresh_command_palette("")
         self._apply_sidebar_visibility()
         self._refresh_sidebar()
         self.set_interval(0.2, self._refresh_live_rounds)
 
+    def on_unmount(self) -> None:
+        if self._transcript_render_task is not None:
+            self._transcript_render_task.cancel()
+            self._transcript_render_task = None
+        try:
+            self.engine.close()
+        except Exception:
+            pass
+
+    def _theme_value(self, path: str, default: str) -> str:
+        current: Any = self._theme
+        for part in path.split("."):
+            if not isinstance(current, dict) or part not in current:
+                return default
+            current = current[part]
+        return str(current or default)
+
+    def _theme_card(self, kind: str) -> dict[str, str]:
+        cards = self._theme.get("cards") if isinstance(self._theme, dict) else {}
+        if not isinstance(cards, dict):
+            cards = {}
+        payload = cards.get(kind) if isinstance(cards.get(kind), dict) else cards.get("default")
+        if not isinstance(payload, dict):
+            payload = {}
+        return {
+            "border": str(payload.get("border") or self._theme_value("cards.default.border", "#64748b")),
+            "title": str(payload.get("title") or self._theme_value("cards.default.title", "#e2e8f0")),
+            "text": str(payload.get("text") or self._theme_value("layout.muted", "#94a3b8")),
+        }
+
+    def _apply_theme_styles(self) -> None:
+        def _safe_apply(callback) -> None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+        background = self._theme_value("layout.background", "transparent")
+        _safe_apply(lambda: setattr(self.screen.styles, "background", background))
+        _safe_apply(lambda: setattr(self.query_one(Header).styles, "color", self._theme_value("layout.header_text", "#e2e8f0")))
+        _safe_apply(lambda: setattr(self.query_one(Footer).styles, "color", self._theme_value("layout.footer_text", "#94a3b8")))
+        _safe_apply(lambda: setattr(self.query_one("#transcript", VerticalScroll).styles, "border", ("round", self._theme_value("layout.transcript_border", "#38bdf8"))))
+        _safe_apply(lambda: setattr(self.query_one("#transcript", VerticalScroll).styles, "scrollbar_visibility", "hidden"))
+        _safe_apply(lambda: setattr(self.query_one("#transcript", VerticalScroll).styles, "scrollbar_size_vertical", 0))
+        _safe_apply(lambda: setattr(self.query_one("#transcript", VerticalScroll).styles, "scrollbar_size_horizontal", 0))
+        _safe_apply(lambda: setattr(self.query_one("#sidebar", Static).styles, "border", ("round", self._theme_value("layout.sidebar_border", "#475569"))))
+        _safe_apply(lambda: setattr(self.query_one("#sidebar", Static).styles, "color", self._theme_value("layout.sidebar_text", "#cbd5e1")))
+        _safe_apply(lambda: setattr(self.query_one("#command-palette", Static).styles, "border", ("round", self._theme_value("layout.palette_border", "#334155"))))
+        _safe_apply(lambda: setattr(self.query_one("#prompt-input", Input).styles, "border", ("round", self._theme_value("layout.input_border", "#22d3ee"))))
+        _safe_apply(lambda: setattr(self.query_one("#prompt-input", Input).styles, "color", self._theme_value("layout.input_text", "#e2e8f0")))
+
+    def _reload_theme(self) -> None:
+        self._theme = load_tui_theme(getattr(self.engine.settings.ui, "theme", "s4"))
+        self._theme_revision += 1
+        self._panel_cache.clear()
+        self._apply_theme_styles()
+        self._refresh_sidebar(force=True)
+        try:
+            current_input = self.query_one("#prompt-input", Input).value
+        except Exception:
+            current_input = ""
+        self._refresh_command_palette(current_input)
+        self._render_transcript()
+
     def action_clear_log(self) -> None:
         self._transcript_state.clear()
+        self._panel_cache.clear()
         self._render_transcript()
 
     def action_copy_transcript(self) -> None:
@@ -229,9 +290,36 @@ class S4TextualApp(App[None]):
         event.input.value = ""
         self._refresh_command_palette("")
         self._busy = True
+        self._interrupt_rendered = False
         self._transcript_state.append_card("user", "You", text)
-        self._render_transcript()
+        self._render_transcript(force_scroll=True)
         self._query_task = asyncio.create_task(self._process_submission(text))
+
+    def action_interrupt(self) -> None:
+        if self._busy and self._query_task is not None and not self._query_task.done():
+            self._mark_query_interrupted()
+            try:
+                self.engine.request_stop("User pressed Esc in the S4Code TUI.")
+            except Exception:
+                pass
+            self._query_task.cancel()
+            return
+        input_widget = self.query_one("#prompt-input", Input)
+        if input_widget.value.startswith("/"):
+            input_widget.value = ""
+            self._refresh_command_palette("")
+
+    def _mark_query_interrupted(self) -> None:
+        if self._interrupt_rendered:
+            return
+        self._interrupt_rendered = True
+        self._transcript_state.consume_event(
+            {
+                "type": "cancelled",
+                "content": "Agent execution interrupted by Esc.",
+            }
+        )
+        self._render_transcript()
 
     async def _process_submission(self, text: str) -> None:
         try:
@@ -242,8 +330,13 @@ class S4TextualApp(App[None]):
                 ui_action = str(result.metadata.get("ui_action") or "")
                 if ui_action == "copy_to_clipboard":
                     self._handle_copy_action(str(result.metadata.get("copy_target") or "transcript"))
+                elif ui_action == "reload_theme":
+                    self._reload_theme()
                 if result.message:
-                    self._transcript_state.append_card("system", "System", result.message)
+                    if result.refresh_requested:
+                        self._hydrate_transcript_from_engine(notice=result.message)
+                    else:
+                        self._transcript_state.append_card("system", "System", result.message)
                     self._render_transcript()
                     self._apply_sidebar_visibility()
                 engine_action = str(result.metadata.get("engine_action") or "")
@@ -258,16 +351,26 @@ class S4TextualApp(App[None]):
                 if result.exit_requested:
                     self.exit()
             self._refresh_sidebar()
+        except asyncio.CancelledError:
+            self._mark_query_interrupted()
+            self._append_invoke_separator()
         except Exception as exc:
             self._transcript_state.append_card("error", "Error", f"{type(exc).__name__}: {exc}")
             self._render_transcript()
         finally:
+            if self._interrupt_rendered:
+                try:
+                    self.engine.clear_stop_request()
+                except Exception:
+                    pass
             self._busy = False
             self._query_task = None
+            self._interrupt_rendered = False
 
     async def _run_query(self, prompt: str) -> None:
         async for event in self.engine.stream_prompt(prompt):
             self._render_event(event)
+        self._append_invoke_separator()
 
     async def _run_pending_resolution(self, action: str, answer: str = "") -> None:
         async for event in self.engine.stream_resolve_pending_interaction(
@@ -275,50 +378,168 @@ class S4TextualApp(App[None]):
             answer=answer,
         ):
             self._render_event(event)
+        self._append_invoke_separator()
+
+    def _hydrate_transcript_from_engine(self, *, notice: Optional[str] = None) -> None:
+        self._transcript_state.clear()
+        self._transcript_state.append_card("system", "System", "S4Code ready. Type /help for commands.")
+        history_cards = self.engine.get_transcript_history_cards()
+        if history_cards:
+            self._transcript_state.append_card(
+                "system",
+                "Restored Transcript",
+                f"Loaded {len(history_cards)} history message(s) from session {self.engine.session_id}.",
+            )
+            for item in history_cards:
+                self._transcript_state.append_card(
+                    str(item.get("kind") or "system"),
+                    str(item.get("title") or "History"),
+                    str(item.get("body") or ""),
+                    status=item.get("status"),
+                    metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else None,
+                )
+        for startup_notice in self.engine.get_startup_notices():
+            self._transcript_state.append_card(
+                str(startup_notice.get("kind") or "system"),
+                str(startup_notice.get("title") or "Notice"),
+                str(startup_notice.get("body") or "").strip(),
+            )
+        if notice:
+            self._transcript_state.append_card("system", "System", notice)
+        pending = self.engine.get_pending_interaction()
+        if pending is not None:
+            self._transcript_state.consume_event(
+                {
+                    "type": "interruption",
+                    "content": pending.get("message") or "A pending interaction was restored with this session.",
+                    "payload": pending,
+                }
+            )
+
+    def _append_invoke_separator(self) -> None:
+        self._transcript_state.append_card("separator", "", "")
+        self._render_transcript()
 
     def _render_event(self, event: dict[str, object]) -> None:
         self._transcript_state.consume_event(dict(event))
-        if str(event.get("type") or "") == "final":
+        event_type = str(event.get("type") or "")
+        if event_type == "final":
             self._refresh_sidebar()
+        if event_type in {
+            "thinking_delta",
+            "text_delta",
+            "tool_call",
+            "tool_result",
+            "round_metrics",
+            "runtime_snapshot",
+        }:
+            self._request_transcript_render()
+            return
         self._render_transcript()
 
-    def _render_transcript(self) -> None:
-        panels = [self._build_panel(card) for card in self._transcript_state.cards]
+    def _request_transcript_render(self, *, force_scroll: bool = False, delay: float = 0.03) -> None:
+        self._pending_transcript_force_scroll = self._pending_transcript_force_scroll or force_scroll
+        if self._transcript_render_task is not None and not self._transcript_render_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._render_transcript(force_scroll=self._pending_transcript_force_scroll)
+            return
+        self._transcript_render_task = loop.create_task(self._deferred_transcript_render(delay))
+
+    async def _deferred_transcript_render(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(max(float(delay), 0.0))
+            try:
+                self._flush_transcript_render(force_scroll=self._pending_transcript_force_scroll)
+            except Exception:
+                return
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._transcript_render_task = None
+
+    def _render_transcript(self, *, force_scroll: bool = False) -> None:
+        if self._transcript_render_task is not None and not self._transcript_render_task.done():
+            self._transcript_render_task.cancel()
+            self._transcript_render_task = None
+        self._flush_transcript_render(force_scroll=force_scroll)
+
+    def _flush_transcript_render(self, *, force_scroll: bool = False) -> None:
+        requested_force_scroll = force_scroll or self._pending_transcript_force_scroll
+        self._pending_transcript_force_scroll = False
+        scroller = self.query_one("#transcript", VerticalScroll)
+        should_follow = requested_force_scroll or self._should_follow_transcript(scroller)
+        previous_scroll_y = getattr(scroller, "scroll_y", 0)
+        panels = [self._build_cached_panel(card) for card in self._transcript_state.cards]
+        self._prune_panel_cache()
         content = self.query_one("#transcript-content", Static)
         if panels:
             content.update(Group(*panels))
         else:
             content.update(Text(""))
         try:
-            self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
+            if should_follow:
+                scroller.scroll_end(animate=False)
+            else:
+                scroller.scroll_to(y=previous_scroll_y, animate=False)
         except Exception:
             pass
 
+    @staticmethod
+    def _should_follow_transcript(scroller: VerticalScroll) -> bool:
+        try:
+            max_scroll_y = float(getattr(scroller, "max_scroll_y", 0) or 0)
+            scroll_y = float(getattr(scroller, "scroll_y", 0) or 0)
+        except Exception:
+            return True
+        return max_scroll_y <= 0 or (max_scroll_y - scroll_y) <= 2
+
+    def _build_cached_panel(self, card: TranscriptCard):
+        cache_key = (
+            self._theme_revision,
+            int(getattr(card, "revision", 0)),
+            card.kind,
+            card.title,
+            card.status or "",
+        )
+        cached = self._panel_cache.get(card.card_id)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        panel = self._build_panel(card)
+        self._panel_cache[card.card_id] = (cache_key, panel)
+        return panel
+
+    def _prune_panel_cache(self) -> None:
+        active_ids = {card.card_id for card in self._transcript_state.cards}
+        stale_ids = [card_id for card_id in self._panel_cache if card_id not in active_ids]
+        for card_id in stale_ids:
+            self._panel_cache.pop(card_id, None)
+
     def _refresh_live_rounds(self) -> None:
         if self._busy and self._transcript_state.refresh_round_timers():
-            self._render_transcript()
+            self._request_transcript_render()
+        if self._busy or self.engine.has_live_runtime_activity():
+            self._refresh_sidebar()
 
     def _build_panel(self, card: TranscriptCard) -> Panel:
-        palette = {
-            "system": ("#fb923c", "#ffedd5"),
-            "user": ("#10b981", "#dcfce7"),
-            "assistant": ("#60a5fa", "#dbeafe"),
-            "thinking": ("#a78bfa", "#ede9fe"),
-            "tool": ("#f59e0b", "#fef3c7"),
-            "warning": ("#facc15", "#fef9c3"),
-            "error": ("#f87171", "#fee2e2"),
-            "round": ("#475569", "#94a3b8"),
-        }
-        border_style, _title_style = palette.get(card.kind, ("#64748b", "#e2e8f0"))
+        if card.kind == "separator":
+            return Rule(style=self._theme_value("layout.separator", "#475569"), characters="─")
+        card_theme = self._theme_card(card.kind)
+        border_style = card_theme["border"]
         title = card.title
         if card.status:
             title = f"{title} [{card.status.upper()}]"
+        checkpoint_subtitle = self._checkpoint_subtitle(card)
         if card.kind == "round":
             return Panel(
-                Text(card.body or card.title, style="#94a3b8"),
+                Text(card.body or card.title, style=card_theme["text"]),
                 title=card.title,
                 border_style=border_style,
                 title_align="left",
+                subtitle=checkpoint_subtitle,
+                subtitle_align="right",
                 box=ROUNDED,
                 padding=(0, 1),
             )
@@ -327,9 +548,31 @@ class S4TextualApp(App[None]):
             title=title,
             border_style=border_style,
             title_align="left",
+            subtitle=checkpoint_subtitle,
+            subtitle_align="right",
             box=ROUNDED,
             padding=(0, 1),
         )
+
+    def _checkpoint_subtitle(self, card: TranscriptCard) -> Text | None:
+        checkpoints = card.metadata.get("checkpoints")
+        if not isinstance(checkpoints, list) or not checkpoints:
+            return None
+        labels: list[str] = []
+        for item in checkpoints[-2:]:
+            if not isinstance(item, dict):
+                continue
+            checkpoint_id = str(item.get("checkpoint_id") or "").strip()
+            label = str(item.get("label") or "").strip()
+            if checkpoint_id and label:
+                labels.append(f"{checkpoint_id} · {label}")
+            elif checkpoint_id:
+                labels.append(checkpoint_id)
+        if not labels:
+            return None
+        if len(checkpoints) > 2:
+            labels.insert(0, f"+{len(checkpoints) - 2}")
+        return Text("  ".join(labels), style=self._theme_value("layout.checkpoint", "bold #fbbf24"))
 
     def _render_body(self, card: TranscriptCard):
         content = str(card.body or "").strip()
@@ -341,7 +584,7 @@ class S4TextualApp(App[None]):
         if card.kind == "assistant":
             return Markdown(content)
         if card.kind == "thinking":
-            return Text(content, style="#c4b5fd")
+            return Text(content, style=self._theme_card("thinking")["text"])
         if content.startswith("{") and content.endswith("}"):
             try:
                 return Syntax(content, "json", theme="monokai", word_wrap=True)
@@ -388,7 +631,7 @@ class S4TextualApp(App[None]):
         renderables: list[Any] = []
         summary = str(card.body or "").strip()
         if summary:
-            renderables.append(Text(summary, style="#e2e8f0"))
+            renderables.append(Text(summary, style=self._theme_value("diff.summary", "#e2e8f0")))
         header = self._render_diff_prelude(parsed.prelude, diff_payload)
         if header is not None:
             renderables.append(header)
@@ -399,7 +642,7 @@ class S4TextualApp(App[None]):
                     self._render_diff_hunk(hunk, lexer),
                     title=hunk.header,
                     title_align="left",
-                    border_style="#334155",
+                    border_style=self._theme_value("diff.hunk_border", "#334155"),
                     box=ROUNDED,
                     padding=(0, 1),
                 )
@@ -418,7 +661,7 @@ class S4TextualApp(App[None]):
         file_path = str(diff_payload.get("file_path") or "").strip()
         label = relative_path or file_path
         if label:
-            body.append(label, style="bold #bfdbfe")
+            body.append(label, style=self._theme_value("diff.file_label", "bold #bfdbfe"))
             if lines:
                 body.append("\n")
         for index, line in enumerate(lines):
@@ -429,22 +672,21 @@ class S4TextualApp(App[None]):
             body,
             title="Changed File",
             title_align="left",
-            border_style="#475569",
+            border_style=self._theme_value("diff.prelude_border", "#475569"),
             box=ROUNDED,
             padding=(0, 1),
         )
 
-    @staticmethod
-    def _render_diff_prelude_line(line: str) -> Text:
+    def _render_diff_prelude_line(self, line: str) -> Text:
         if line.startswith("diff --git"):
-            return Text(line, style="bold #93c5fd")
+            return Text(line, style=self._theme_value("diff.git_header", "bold #93c5fd"))
         if line.startswith("new file mode"):
-            return Text(line, style="#86efac")
+            return Text(line, style=self._theme_value("diff.new_file", "#86efac"))
         if line.startswith("--- "):
-            return Text(line, style="#fca5a5")
+            return Text(line, style=self._theme_value("diff.deleted_file", "#fca5a5"))
         if line.startswith("+++ "):
-            return Text(line, style="#86efac")
-        return Text(line, style="#94a3b8")
+            return Text(line, style=self._theme_value("diff.new_file", "#86efac"))
+        return Text(line, style=self._theme_value("diff.prelude", "#94a3b8"))
 
     def _guess_diff_lexer(self, diff_payload: dict[str, Any]) -> str:
         file_path = str(diff_payload.get("file_path") or diff_payload.get("relative_path") or "").strip()
@@ -490,27 +732,27 @@ class S4TextualApp(App[None]):
                 prefix="+",
                 body=line[1:],
                 highlighter=highlighter,
-                prefix_style="bold #4ade80 on #052e16",
-                body_background="#052e16",
+                prefix_style=self._theme_value("diff.add_prefix", "bold #4ade80 on #052e16"),
+                body_background=self._theme_value("diff.add_background", "#052e16"),
             )
         if line.startswith("-"):
             return self._render_code_diff_line(
                 prefix="-",
                 body=line[1:],
                 highlighter=highlighter,
-                prefix_style="bold #f87171 on #3f1111",
-                body_background="#3f1111",
+                prefix_style=self._theme_value("diff.delete_prefix", "bold #f87171 on #3f1111"),
+                body_background=self._theme_value("diff.delete_background", "#3f1111"),
             )
         if line.startswith(" "):
             return self._render_code_diff_line(
                 prefix=" ",
                 body=line[1:],
                 highlighter=highlighter,
-                prefix_style="#64748b",
+                prefix_style=self._theme_value("diff.context_prefix", "#64748b"),
             )
         if line.startswith("\\"):
-            return Text(line, style="italic #94a3b8")
-        return Text(line, style="#cbd5e1")
+            return Text(line, style=self._theme_value("diff.escape", "italic #94a3b8"))
+        return Text(line, style=self._theme_value("diff.plain", "#cbd5e1"))
 
     @staticmethod
     def _render_code_diff_line(
@@ -538,16 +780,11 @@ class S4TextualApp(App[None]):
             self._palette_entries = []
             self._command_selection_index = 0
             self._palette_state_key = ""
-            palette.update(
-                Panel(
-                    Text("Type / to browse commands. Use ↑ ↓ to select, Tab to insert, and Enter to accept.", style="#94a3b8"),
-                    title="Command Palette",
-                    border_style="#334155",
-                    box=ROUNDED,
-                )
-            )
+            palette.update(Text(""))
+            palette.display = False
             return
 
+        palette.display = True
         entries, state_key = self._build_palette_entries(text)
         if state_key != self._palette_state_key:
             self._command_selection_index = 0
@@ -557,9 +794,9 @@ class S4TextualApp(App[None]):
             self._command_selection_index = 0
             palette.update(
                 Panel(
-                    Text("No command or option matches the current input.", style="#facc15"),
+                    Text("No command or option matches the current input.", style=self._theme_value("palette.empty", "#facc15")),
                     title="Command Palette",
-                    border_style="#facc15",
+                    border_style=self._theme_value("palette.empty", "#facc15"),
                     box=ROUNDED,
                 )
             )
@@ -586,23 +823,23 @@ class S4TextualApp(App[None]):
         visible_entries = self._palette_entries[window_start : window_start + visible_count]
         lines: list[Text] = []
         if window_start > 0:
-            lines.append(Text(f"... {window_start} earlier item(s)", style="#475569"))
+            lines.append(Text(f"... {window_start} earlier item(s)", style=self._theme_value("palette.hidden_count", "#475569")))
         for offset, entry in enumerate(visible_entries):
             index = window_start + offset
             selected = index == self._command_selection_index
             line = Text(no_wrap=True, overflow="ellipsis")
             if selected:
-                prefix_style = "bold #082f49 on #67e8f9"
-                label_style = "bold #082f49 on #67e8f9"
-                spacer_style = "on #67e8f9"
-                desc_style = "#0f172a on #a5f3fc"
-                alias_style = "#164e63 on #cffafe"
+                prefix_style = self._theme_value("palette.selected_prefix", "bold #082f49 on #67e8f9")
+                label_style = self._theme_value("palette.selected_label", "bold #082f49 on #67e8f9")
+                spacer_style = self._theme_value("palette.selected_spacer", "on #67e8f9")
+                desc_style = self._theme_value("palette.selected_description", "#0f172a on #a5f3fc")
+                alias_style = self._theme_value("palette.selected_alias", "#164e63 on #cffafe")
             else:
-                prefix_style = "#475569"
-                label_style = "#cbd5e1"
-                spacer_style = "#cbd5e1"
-                desc_style = "#94a3b8"
-                alias_style = "#64748b"
+                prefix_style = self._theme_value("palette.prefix", "#475569")
+                label_style = self._theme_value("palette.label", "#cbd5e1")
+                spacer_style = self._theme_value("palette.spacer", "#cbd5e1")
+                desc_style = self._theme_value("palette.description", "#94a3b8")
+                alias_style = self._theme_value("palette.alias", "#64748b")
             line.append("▶ " if selected else "  ", style=prefix_style)
             line.append(entry.label, style=label_style)
             line.append("  ", style=spacer_style)
@@ -612,12 +849,12 @@ class S4TextualApp(App[None]):
             lines.append(line)
         remaining = len(self._palette_entries) - (window_start + len(visible_entries))
         if remaining > 0:
-            lines.append(Text(f"... {remaining} more item(s)", style="#475569"))
+            lines.append(Text(f"... {remaining} more item(s)", style=self._theme_value("palette.hidden_count", "#475569")))
         palette.update(
             Panel(
                 Group(*lines),
                 title=f"Command Palette ({self._command_selection_index + 1}/{len(self._palette_entries)})",
-                border_style="#22d3ee",
+                border_style=self._theme_value("palette.border", "#22d3ee"),
                 box=ROUNDED,
             )
         )
@@ -652,15 +889,212 @@ class S4TextualApp(App[None]):
                 )
             return (entries, f"model:{fragment}")
 
+        if invocation.name in {"theme", "themes"}:
+            fragment = invocation.arg_text.strip().lower()
+            entries = [
+                PaletteEntry("/theme list", "List available TUI themes.", "/theme list", "/theme list", mode="execute"),
+            ]
+            for item in self.engine.get_theme_choices():
+                name = str(item.get("name") or "")
+                kind = str(item.get("kind") or "theme")
+                if fragment and fragment not in name.lower() and fragment not in kind.lower():
+                    continue
+                marker = "* " if item.get("active") else ""
+                entries.append(
+                    PaletteEntry(
+                        label=f"{marker}{name}",
+                        description=f"{kind} theme",
+                        insert_text=f"/theme {name}",
+                        execute_text=f"/theme {name}",
+                        mode="execute",
+                    )
+                )
+            return (entries, f"theme:{fragment}")
+
         if invocation.name == "resume":
             fragment = invocation.arg_text.strip().lower()
             return (self._build_session_palette_entries(fragment, prefix="/resume "), f"resume:{fragment}")
+
+        if invocation.name in {"permissions", "perm"}:
+            if not invocation.args:
+                entries = [
+                    PaletteEntry("/permissions show", "Show current permission mode and rules.", "/permissions show", "/permissions show", mode="execute"),
+                    PaletteEntry("/permissions history", "Show permission mode/rule change history.", "/permissions history", "/permissions history", mode="execute"),
+                    PaletteEntry("/permissions mode", "Switch permission mode.", "/permissions mode ", "/permissions mode ", mode="insert"),
+                    PaletteEntry("/permissions allow", "Add an allow rule.", "/permissions allow ", "/permissions allow ", mode="insert"),
+                    PaletteEntry("/permissions deny", "Add a deny rule.", "/permissions deny ", "/permissions deny ", mode="insert"),
+                    PaletteEntry("/permissions ask", "Add an ask/confirm rule.", "/permissions ask ", "/permissions ask ", mode="insert"),
+                    PaletteEntry("/permissions clear session", "Clear session-scoped permission rules.", "/permissions clear session", "/permissions clear session", mode="execute"),
+                    PaletteEntry("/permissions clear all", "Clear all permission rule sources.", "/permissions clear all", "/permissions clear all", mode="execute"),
+                ]
+                return (entries, "permissions:root")
+            subcommand = invocation.args[0].lower()
+            if subcommand == "mode":
+                fragment = invocation.arg_text[len(invocation.args[0]) :].strip().lower()
+                modes = ("default", "accept_edits", "dont_ask", "bypass", "plan")
+                entries = [
+                    PaletteEntry(
+                        label=mode,
+                        description=f"Set permission mode to {mode}.",
+                        insert_text=f"/permissions mode {mode}",
+                        execute_text=f"/permissions mode {mode}",
+                        mode="execute",
+                    )
+                    for mode in modes
+                    if not fragment or fragment in mode
+                ]
+                return (entries, f"permissions-mode:{fragment}")
+            if subcommand in {"allow", "deny", "ask"}:
+                fragment = invocation.arg_text[len(invocation.args[0]) :].strip().lower()
+                entries = [
+                    PaletteEntry(
+                        label=f"/permissions {subcommand} *",
+                        description="Match all tools. Add path=, host=, command=, mcp=, or risk= to narrow scope.",
+                        insert_text=f"/permissions {subcommand} * ",
+                        execute_text=f"/permissions {subcommand} * ",
+                        mode="insert",
+                    ),
+                    PaletteEntry(
+                        label=f"/permissions {subcommand} FileEdit path=",
+                        description="Match file edits under a path prefix.",
+                        insert_text=f"/permissions {subcommand} FileEdit path=",
+                        execute_text=f"/permissions {subcommand} FileEdit path=",
+                        mode="insert",
+                    ),
+                    PaletteEntry(
+                        label=f"/permissions {subcommand} WebFetch host=",
+                        description="Match WebFetch by hostname/domain.",
+                        insert_text=f"/permissions {subcommand} WebFetch host=",
+                        execute_text=f"/permissions {subcommand} WebFetch host=",
+                        mode="insert",
+                    ),
+                    PaletteEntry(
+                        label=f"/permissions {subcommand} Bash command=",
+                        description="Match shell commands by command prefix.",
+                        insert_text=f"/permissions {subcommand} Bash command=",
+                        execute_text=f"/permissions {subcommand} Bash command=",
+                        mode="insert",
+                    ),
+                ]
+                if fragment:
+                    entries = [
+                        entry for entry in entries
+                        if fragment in entry.label.lower() or fragment in entry.description.lower()
+                    ]
+                return (entries, f"permissions-rule:{subcommand}:{fragment}")
+
+        if invocation.name == "skills":
+            if not invocation.args:
+                entries = [
+                    PaletteEntry(
+                        "/skills list",
+                        "List discovered skills.",
+                        "/skills list",
+                        "/skills list",
+                        mode="execute",
+                    ),
+                    PaletteEntry(
+                        "/skills clear",
+                        "Clear the next-turn skill queue.",
+                        "/skills clear",
+                        "/skills clear",
+                        mode="execute",
+                    ),
+                ]
+                entries.extend(self._build_skill_palette_entries("", prefix="/skills use "))
+                return (entries, "skills:root")
+            subcommand = invocation.args[0].lower()
+            remainder = invocation.arg_text[len(invocation.args[0]) :].strip().lower()
+            if subcommand in {"use", "enable", "select"}:
+                return (
+                    self._build_skill_palette_entries(remainder, prefix="/skills use "),
+                    f"skills-use:{remainder}",
+                )
+
+        if invocation.name == "worktree":
+            if not invocation.args:
+                payload = self.engine.get_worktree_status_payload()
+                active = payload.get("active") or {}
+                description = "Show the current worktree runtime status."
+                if active:
+                    description = (
+                        f"Active: {active.get('branch') or '-'} · {active.get('path') or '-'}"
+                    )
+                entries = [
+                    PaletteEntry("/worktree show", description, "/worktree show", "/worktree show", mode="execute"),
+                    PaletteEntry("/worktree enter", "Create and enter a managed worktree.", "/worktree enter ", "/worktree enter ", mode="insert"),
+                    PaletteEntry("/worktree exit keep", "Leave the active worktree and keep it on disk.", "/worktree exit keep", "/worktree exit keep", mode="execute"),
+                    PaletteEntry("/worktree exit remove discard", "Leave and delete the active worktree, discarding changes.", "/worktree exit remove discard", "/worktree exit remove discard", mode="execute"),
+                ]
+                return (entries, "worktree:root")
+            subcommand = invocation.args[0].lower()
+            if subcommand in {"exit", "close"}:
+                entries = [
+                    PaletteEntry("/worktree exit keep", "Leave the active worktree and keep it on disk.", "/worktree exit keep", "/worktree exit keep", mode="execute"),
+                    PaletteEntry("/worktree exit remove", "Leave the active worktree and remove it if clean.", "/worktree exit remove", "/worktree exit remove", mode="execute"),
+                    PaletteEntry("/worktree exit remove discard", "Leave and delete the active worktree, discarding changes.", "/worktree exit remove discard", "/worktree exit remove discard", mode="execute"),
+                ]
+                return (entries, f"worktree-exit:{subcommand}")
+
+        if invocation.name == "agent":
+            if not invocation.args:
+                entries = [
+                    PaletteEntry("/agent list", "List runtime agent handles.", "/agent list", "/agent list", mode="execute"),
+                ]
+                entries.extend(self._build_agent_palette_entries("", prefix="/agent show "))
+                return (entries, "agent:root")
+            subcommand = invocation.args[0].lower()
+            remainder = invocation.arg_text[len(invocation.args[0]) :].strip().lower()
+            if subcommand in {"show", "get"}:
+                return (
+                    self._build_agent_palette_entries(remainder, prefix=f"/agent {subcommand} "),
+                    f"agent-show:{remainder}",
+                )
+            if subcommand == "wait":
+                return (
+                    self._build_agent_palette_entries(remainder, prefix="/agent wait "),
+                    f"agent-wait:{remainder}",
+                )
+            if subcommand == "stop":
+                return (
+                    self._build_agent_palette_entries(remainder, prefix="/agent stop "),
+                    f"agent-stop:{remainder}",
+                )
+
+        if invocation.name == "task":
+            if not invocation.args:
+                entries = [
+                    PaletteEntry("/tasks", "List structured tasks.", "/tasks", "/tasks", mode="execute"),
+                ]
+                entries.extend(self._build_task_palette_entries("", prefix="/task show "))
+                return (entries, "task:root")
+            subcommand = invocation.args[0].lower()
+            remainder = invocation.arg_text[len(invocation.args[0]) :].strip().lower()
+            if subcommand in {"show", "get"}:
+                return (
+                    self._build_task_palette_entries(remainder, prefix=f"/task {subcommand} "),
+                    f"task-show:{remainder}",
+                )
+            if subcommand == "output":
+                return (
+                    self._build_task_palette_entries(remainder, prefix="/task output "),
+                    f"task-output:{remainder}",
+                )
+            if subcommand == "stop":
+                return (
+                    self._build_task_palette_entries(remainder, prefix="/task stop "),
+                    f"task-stop:{remainder}",
+                )
 
         if invocation.name == "session":
             if not invocation.args:
                 entries = [
                     PaletteEntry("/session show", "Show the current session details.", "/session show", "/session show"),
                     PaletteEntry("/session list", "List saved S4Code sessions.", "/session list", "/session list"),
+                    PaletteEntry("/session timeline", "Show checkpoint and trace timeline.", "/session timeline", "/session timeline", mode="execute"),
+                    PaletteEntry("/session checkpoints", "List restorable checkpoints.", "/session checkpoints", "/session checkpoints", mode="execute"),
+                    PaletteEntry("/session tree", "Show fork/restore session tree.", "/session tree", "/session tree", mode="execute"),
+                    PaletteEntry("/session rewind", "Restore history to a checkpoint.", "/session rewind ", "/session rewind ", mode="insert"),
                     PaletteEntry("/session load", "Load a saved session.", "/session load ", "/session load ", mode="insert"),
                     PaletteEntry("/session rename", "Rename the current session.", "/session rename ", "/session rename ", mode="insert"),
                     PaletteEntry("/session fork", "Fork the current session into a new branch session.", "/session fork ", "/session fork ", mode="insert"),
@@ -673,6 +1107,31 @@ class S4TextualApp(App[None]):
                     self._build_session_palette_entries(remainder, prefix=f"/session {subcommand} "),
                     f"session-load:{remainder}",
                 )
+            if subcommand == "rewind":
+                return (
+                    self._build_checkpoint_palette_entries(remainder, prefix="/session rewind "),
+                    f"session-rewind:{remainder}",
+                )
+
+        if invocation.name == "rewind":
+            fragment = invocation.arg_text.strip().lower()
+            return (
+                self._build_checkpoint_palette_entries(fragment, prefix="/rewind "),
+                f"rewind:{fragment}",
+            )
+
+        if invocation.name in {"checkpoint", "checkpoints"}:
+            fragment = invocation.arg_text.strip().lower()
+            entries = [
+                PaletteEntry("/checkpoint list", "List restorable checkpoints.", "/checkpoint list", "/checkpoint list", mode="execute"),
+                PaletteEntry("/checkpoint", "Create a checkpoint with an optional label.", "/checkpoint ", "/checkpoint ", mode="insert"),
+            ]
+            if fragment:
+                entries = [
+                    entry for entry in entries
+                    if fragment in entry.label.lower() or fragment in entry.description.lower()
+                ]
+            return (entries, f"checkpoint:{fragment}")
 
         command_fragment = invocation.name
         if " " not in text[1:]:
@@ -712,6 +1171,108 @@ class S4TextualApp(App[None]):
                     description=f"{title} · {provider}/{model} · {project_root}",
                     insert_text=f"{prefix}{session_id}",
                     execute_text=f"{prefix}{session_id}",
+                    mode="execute",
+                )
+            )
+        return entries
+
+    def _build_skill_palette_entries(self, fragment: str, *, prefix: str) -> list[PaletteEntry]:
+        entries: list[PaletteEntry] = []
+        for item in self.engine.get_skill_choices():
+            name = str(item["name"])
+            listing = str(item.get("listing_description") or item.get("description") or name)
+            source = str(item.get("source_path") or item.get("source_type") or "-")
+            search_blob = " ".join(
+                [
+                    name,
+                    listing,
+                    str(item.get("when_to_use") or ""),
+                    source,
+                ]
+            ).lower()
+            if fragment and fragment not in search_blob:
+                continue
+            marker = "* " if item.get("pending") else ""
+            entries.append(
+                PaletteEntry(
+                    label=f"{marker}{name}",
+                    description=f"{item.get('exposure_mode')}/{item.get('execution_mode')} · {listing} · {source}",
+                    insert_text=f"{prefix}{name}",
+                    execute_text=f"{prefix}{name}",
+                    mode="execute",
+                )
+            )
+        return entries
+
+    def _build_agent_palette_entries(self, fragment: str, *, prefix: str) -> list[PaletteEntry]:
+        entries: list[PaletteEntry] = []
+        for item in self.engine.get_agent_choices():
+            agent_id = str(item.get("agent_id") or "")
+            status = str(item.get("status") or "-")
+            name = str(item.get("name") or "-")
+            task_id = str(item.get("task_id") or "-")
+            output_file = str(item.get("output_file") or "-")
+            search_blob = " ".join([agent_id, status, name, task_id, output_file]).lower()
+            if fragment and fragment not in search_blob:
+                continue
+            entries.append(
+                PaletteEntry(
+                    label=agent_id,
+                    description=f"{status} · {name} · task={task_id} · output={output_file}",
+                    insert_text=f"{prefix}{agent_id}",
+                    execute_text=f"{prefix}{agent_id}",
+                    mode="execute",
+                )
+            )
+        return entries
+
+    def _build_task_palette_entries(self, fragment: str, *, prefix: str) -> list[PaletteEntry]:
+        entries: list[PaletteEntry] = []
+        for item in self.engine.get_task_choices():
+            task_id = str(item.get("task_id") or "")
+            status = str(item.get("status") or "-")
+            title = str(item.get("title") or task_id)
+            kind = str(item.get("kind") or "-")
+            search_blob = " ".join([task_id, status, title, kind]).lower()
+            if fragment and fragment not in search_blob:
+                continue
+            entries.append(
+                PaletteEntry(
+                    label=task_id,
+                    description=f"{status} · {kind} · {title}",
+                    insert_text=f"{prefix}{task_id}",
+                    execute_text=f"{prefix}{task_id}",
+                    mode="execute",
+                )
+            )
+        return entries
+
+    def _build_checkpoint_palette_entries(self, fragment: str, *, prefix: str) -> list[PaletteEntry]:
+        entries: list[PaletteEntry] = []
+        for item in self.engine.get_checkpoint_choices():
+            checkpoint_id = str(item.get("checkpoint_id") or "")
+            label = str(item.get("label") or checkpoint_id)
+            reason = str(item.get("reason") or "-")
+            created_at = str(item.get("created_at") or "-")
+            search_blob = " ".join([checkpoint_id, label, reason, created_at]).lower()
+            if fragment and fragment not in search_blob:
+                continue
+            entries.append(
+                PaletteEntry(
+                    label=checkpoint_id,
+                    description=f"{label} · {reason} · {created_at}",
+                    insert_text=f"{prefix}{checkpoint_id}",
+                    execute_text=f"{prefix}{checkpoint_id}",
+                    mode="execute",
+                )
+            )
+        if not entries and not fragment:
+            entries.append(
+                PaletteEntry(
+                    label="last",
+                    description="Rewind to the latest checkpoint.",
+                    insert_text=f"{prefix}last",
+                    execute_text=f"{prefix}last",
                     mode="execute",
                 )
             )
@@ -810,8 +1371,12 @@ class S4TextualApp(App[None]):
             )
         self._render_transcript()
 
-    def _refresh_sidebar(self) -> None:
-        self.query_one("#sidebar", Static).update(self.engine.format_sidebar())
+    def _refresh_sidebar(self, *, force: bool = False) -> None:
+        content = self.engine.format_sidebar()
+        if not force and content == self._last_sidebar_content:
+            return
+        self._last_sidebar_content = content
+        self.query_one("#sidebar", Static).update(content)
 
     def _apply_sidebar_visibility(self) -> None:
         self.query_one("#sidebar", Static).display = bool(getattr(self.engine, "sidebar_visible", False))

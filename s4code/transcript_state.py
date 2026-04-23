@@ -15,6 +15,7 @@ class TranscriptCard:
     body: str
     status: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    revision: int = 0
 
 
 @dataclass(slots=True)
@@ -22,6 +23,7 @@ class _RoundState:
     number: int
     round_card_id: str
     started_at: float
+    tool_started_at: dict[str, float] = field(default_factory=dict)
     thinking_card_id: Optional[str] = None
     content_card_id: Optional[str] = None
 
@@ -33,13 +35,22 @@ class S4TranscriptState:
         self._current_round: Optional[_RoundState] = None
         self._tool_card_ids: dict[str, str] = {}
         self._compaction_card_id: Optional[str] = None
+        self._runtime_card_id: Optional[str] = None
+        self._pending_checkpoints: list[dict[str, Any]] = []
         self._clock = clock or time.monotonic
+
+    @staticmethod
+    def _touch(card: Optional[TranscriptCard]) -> None:
+        if card is not None:
+            card.revision += 1
 
     def clear(self) -> None:
         self.cards.clear()
         self._tool_card_ids.clear()
         self._current_round = None
         self._compaction_card_id = None
+        self._runtime_card_id = None
+        self._pending_checkpoints.clear()
 
     def append_card(
         self,
@@ -60,6 +71,7 @@ class S4TranscriptState:
             metadata=dict(metadata or {}),
         )
         self.cards.append(card)
+        self._attach_pending_checkpoints(card)
         return card
 
     def find_card(self, card_id: str) -> Optional[TranscriptCard]:
@@ -80,16 +92,76 @@ class S4TranscriptState:
         assert self._current_round is not None
         return self._current_round
 
+    @staticmethod
+    def _new_round_metrics() -> dict[str, Any]:
+        return {
+            "tool_calls": 0,
+            "running_tools": 0,
+            "tool_errors": 0,
+            "tool_pending": 0,
+            "local_tool_seconds": 0.0,
+            "llm_duration_ms": 0.0,
+            "tool_duration_ms": 0.0,
+            "llm_requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_usd": None,
+            "files_changed": [],
+            "tools_used": [],
+        }
+
+    def _find_round_card_by_number(self, number: int) -> Optional[TranscriptCard]:
+        for card in self.cards:
+            if card.kind == "round" and int(card.metadata.get("round") or 0) == int(number):
+                return card
+        return None
+
+    def _round_metrics_for_card(self, card: TranscriptCard) -> dict[str, Any]:
+        metrics = card.metadata.get("metrics")
+        if isinstance(metrics, dict):
+            return metrics
+        metrics = self._new_round_metrics()
+        card.metadata["metrics"] = metrics
+        return metrics
+
+    def _current_round_card(self) -> Optional[TranscriptCard]:
+        if self._current_round is None:
+            return None
+        return self.find_card(self._current_round.round_card_id)
+
+    def _refresh_live_round_body(self) -> None:
+        round_state = self._current_round
+        if round_state is None:
+            return
+        card = self.find_card(round_state.round_card_id)
+        if card is None:
+            return
+        body = self._format_active_round_body(
+            round_state.started_at,
+            now=self._clock(),
+            metrics=self._round_metrics_for_card(card),
+        )
+        if body != card.body:
+            card.body = body
+            self._touch(card)
+
     def start_round(self, number: int) -> None:
         self._finalize_current_round()
         started_at = self._clock()
         card = self.append_card(
             "round",
             f"Cycle {number}",
-            self._format_active_round_body(started_at, now=started_at),
+            self._format_active_round_body(
+                started_at,
+                now=started_at,
+                metrics=self._new_round_metrics(),
+            ),
             metadata={
                 "round": number,
                 "started_at": started_at,
+                "metrics": self._new_round_metrics(),
+                "outcome": "running",
             },
         )
         self._current_round = _RoundState(
@@ -130,6 +202,7 @@ class S4TranscriptState:
             card = self._ensure_thinking_card()
             card.body += delta
             card.status = "streaming"
+            self._touch(card)
             return
         if event_type == "text_delta":
             delta = str(event.get("delta") or "")
@@ -138,10 +211,22 @@ class S4TranscriptState:
             card = self._ensure_content_card()
             card.body += delta
             card.status = "streaming"
+            self._touch(card)
             return
         if event_type == "tool_call":
+            round_state = self._ensure_round()
             tool_name = str(event.get("tool_name") or "Tool")
             tool_id = str(event.get("tool_id") or f"tool-{len(self._tool_card_ids) + 1}")
+            round_state.tool_started_at[tool_id] = self._clock()
+            round_card = self.find_card(round_state.round_card_id)
+            if round_card is not None:
+                metrics = self._round_metrics_for_card(round_card)
+                metrics["tool_calls"] = int(metrics.get("tool_calls") or 0) + 1
+                metrics["running_tools"] = int(metrics.get("running_tools") or 0) + 1
+                tools_used = {str(item) for item in list(metrics.get("tools_used") or []) if item}
+                tools_used.add(tool_name)
+                metrics["tools_used"] = sorted(tools_used)
+                self._refresh_live_round_body()
             card = self.append_card(
                 "tool",
                 f"Tool · {tool_name}",
@@ -168,6 +253,89 @@ class S4TranscriptState:
                 existing.body = body
                 existing.status = status
                 existing.metadata.update(metadata)
+                self._touch(existing)
+            round_state = self._current_round
+            if round_state is not None:
+                round_card = self.find_card(round_state.round_card_id)
+                if round_card is not None:
+                    metrics = self._round_metrics_for_card(round_card)
+                    started_at = round_state.tool_started_at.pop(tool_id, self._clock())
+                    duration = max(self._clock() - started_at, 0.0)
+                    metrics["running_tools"] = max(int(metrics.get("running_tools") or 0) - 1, 0)
+                    metrics["local_tool_seconds"] = float(metrics.get("local_tool_seconds") or 0.0) + duration
+                    if status == "error":
+                        metrics["tool_errors"] = int(metrics.get("tool_errors") or 0) + 1
+                    elif status == "pending":
+                        metrics["tool_pending"] = int(metrics.get("tool_pending") or 0) + 1
+                    diff_payload = metadata.get("diff")
+                    if isinstance(diff_payload, dict):
+                        changed = {
+                            str(item)
+                            for item in list(metrics.get("files_changed") or [])
+                            if str(item).strip()
+                        }
+                        label = str(diff_payload.get("relative_path") or diff_payload.get("file_path") or "").strip()
+                        if label:
+                            changed.add(label)
+                        metrics["files_changed"] = sorted(changed)
+                    self._refresh_live_round_body()
+            return
+        if event_type == "round_metrics":
+            round_number = int(event.get("round") or 0)
+            if round_number <= 0:
+                return
+            card = self._find_round_card_by_number(round_number)
+            if card is None:
+                return
+            metrics = self._round_metrics_for_card(card)
+            payload = dict(event.get("metrics") or {})
+            for key, value in payload.items():
+                if key in {"files_changed", "tools_used"}:
+                    existing = {str(item) for item in list(metrics.get(key) or []) if str(item).strip()}
+                    incoming = {str(item) for item in list(value or []) if str(item).strip()}
+                    metrics[key] = sorted(existing | incoming)
+                elif value is not None:
+                    metrics[key] = value
+            if self._current_round is not None and self._current_round.number == round_number:
+                self._refresh_live_round_body()
+            else:
+                started_at = float(card.metadata.get("started_at") or 0.0)
+                finished_at = float(card.metadata.get("finished_at") or started_at)
+                outcome = str(card.metadata.get("outcome") or "completed")
+                body = self._format_completed_round_body(
+                    started_at,
+                    finished_at,
+                    metrics=metrics,
+                    outcome=outcome,
+                )
+                if body != card.body:
+                    card.body = body
+                    self._touch(card)
+            return
+        if event_type == "runtime_snapshot":
+            body = self._format_runtime_snapshot(event.get("snapshot"))
+            existing = self.find_card(self._runtime_card_id) if self._runtime_card_id else None
+            if existing is None:
+                card = self.append_card(
+                    "runtime",
+                    "Runtime Snapshot",
+                    body,
+                    status="live" if self._current_round is not None else None,
+                )
+                self._runtime_card_id = card.card_id
+            else:
+                existing.body = body
+                existing.status = "live" if self._current_round is not None else None
+                self._touch(existing)
+            return
+        if event_type == "checkpoint":
+            checkpoint = dict(event.get("checkpoint") or {})
+            annotation = self._checkpoint_annotation(checkpoint)
+            target = self._find_checkpoint_target(annotation)
+            if target is None:
+                self._pending_checkpoints.append(annotation)
+            else:
+                self._add_checkpoint_to_card(target, annotation)
             return
         if event_type == "compaction_start":
             self._finalize_current_round()
@@ -187,6 +355,7 @@ class S4TranscriptState:
             else:
                 existing.body = body
                 existing.status = "done"
+                self._touch(existing)
             self._compaction_card_id = None
             return
         if event_type == "final":
@@ -196,15 +365,17 @@ class S4TranscriptState:
             card = self._ensure_content_card()
             card.body = content
             card.status = None
+            self._touch(card)
             thinking_card = None
             if self._current_round and self._current_round.thinking_card_id:
                 thinking_card = self.find_card(self._current_round.thinking_card_id)
             if thinking_card is not None:
                 thinking_card.status = None
-            self._finalize_current_round()
+                self._touch(thinking_card)
+            self._finalize_current_round(outcome="completed")
             return
         if event_type == "interruption":
-            self._finalize_current_round()
+            self._finalize_current_round(outcome="pending")
             payload = dict(event.get("payload") or {})
             metadata = dict(payload.get("metadata") or {})
             interaction_type = str(metadata.get("interaction_type") or "")
@@ -234,11 +405,77 @@ class S4TranscriptState:
             self.append_card("system", "System", str(event.get("content") or ""))
             return
         if event_type == "error":
-            self._finalize_current_round()
+            self._finalize_current_round(outcome="error")
             self.append_card("error", "Error", str(event.get("error") or "Unknown error"))
+            return
+        if event_type == "cancelled":
+            self._finalize_current_round(outcome="interrupted")
+            self.append_card(
+                "warning",
+                "Interrupted",
+                str(event.get("content") or "Agent execution interrupted."),
+            )
 
     def has_live_round(self) -> bool:
         return self._current_round is not None
+
+    @staticmethod
+    def _checkpoint_annotation(checkpoint: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "checkpoint_id": str(checkpoint.get("checkpoint_id") or "").strip(),
+            "label": str(checkpoint.get("label") or "").strip(),
+            "reason": str(checkpoint.get("reason") or "").strip(),
+            "history_messages": checkpoint.get("history_messages", 0),
+            "created_at": str(checkpoint.get("created_at") or "").strip(),
+        }
+
+    @staticmethod
+    def _can_annotate_checkpoint(card: TranscriptCard) -> bool:
+        return card.kind not in {"separator", "round", "runtime"}
+
+    def _attach_pending_checkpoints(self, card: TranscriptCard) -> None:
+        if not self._pending_checkpoints or not self._can_annotate_checkpoint(card):
+            return
+        pending = list(self._pending_checkpoints)
+        self._pending_checkpoints.clear()
+        for checkpoint in pending:
+            self._add_checkpoint_to_card(card, checkpoint)
+
+    def _add_checkpoint_to_card(self, card: TranscriptCard, checkpoint: dict[str, Any]) -> None:
+        if not self._can_annotate_checkpoint(card):
+            self._pending_checkpoints.append(checkpoint)
+            return
+        checkpoints = card.metadata.setdefault("checkpoints", [])
+        if not isinstance(checkpoints, list):
+            checkpoints = []
+            card.metadata["checkpoints"] = checkpoints
+        checkpoint_id = str(checkpoint.get("checkpoint_id") or "")
+        if checkpoint_id and any(
+            isinstance(item, dict) and item.get("checkpoint_id") == checkpoint_id
+            for item in checkpoints
+        ):
+            return
+        checkpoints.append(dict(checkpoint))
+        self._touch(card)
+
+    def _find_checkpoint_target(self, checkpoint: dict[str, Any]) -> Optional[TranscriptCard]:
+        reason = str(checkpoint.get("reason") or "")
+        preferred_kinds: tuple[str, ...]
+        if reason == "before_prompt":
+            preferred_kinds = ("user",)
+        elif reason == "interruption":
+            preferred_kinds = ("warning", "assistant", "user")
+        elif reason == "after_prompt":
+            preferred_kinds = ("assistant", "warning", "error", "user")
+        else:
+            preferred_kinds = ("assistant", "warning", "system", "user", "error", "tool")
+        for card in reversed(self.cards):
+            if card.kind in preferred_kinds and self._can_annotate_checkpoint(card):
+                return card
+        for card in reversed(self.cards):
+            if self._can_annotate_checkpoint(card):
+                return card
+        return None
 
     def refresh_round_timers(self) -> bool:
         round_state = self._current_round
@@ -247,10 +484,15 @@ class S4TranscriptState:
         card = self.find_card(round_state.round_card_id)
         if card is None:
             return False
-        body = self._format_active_round_body(round_state.started_at, now=self._clock())
+        body = self._format_active_round_body(
+            round_state.started_at,
+            now=self._clock(),
+            metrics=self._round_metrics_for_card(card),
+        )
         if body == card.body:
             return False
         card.body = body
+        self._touch(card)
         return True
 
     def _format_tool_call_body(self, tool_args: Any) -> str:
@@ -332,7 +574,73 @@ class S4TranscriptState:
             "file_path": str(diff_payload.get("file_path") or structured_data.get("file_path") or "").strip(),
             "relative_path": str(diff_payload.get("relative_path") or "").strip(),
             "created": bool(diff_payload.get("created")),
+            "source": str(diff_payload.get("source") or "").strip(),
         }
+
+    def _format_runtime_snapshot(self, snapshot: Any) -> str:
+        if not isinstance(snapshot, dict):
+            return "Runtime snapshot unavailable."
+        session = dict(snapshot.get("session") or {})
+        worktree = dict(snapshot.get("worktree") or {})
+        active_worktree = worktree.get("active") or {}
+        agents = list(snapshot.get("agents") or [])
+        tasks = list(snapshot.get("tasks") or [])
+        background_tasks = list(snapshot.get("background_tasks") or [])
+        context = dict(snapshot.get("context") or {})
+        lines = [
+            f"Updated: {snapshot.get('generated_at') or '-'}",
+            f"Session: {session.get('session_id') or '-'} | checkpoints={session.get('checkpoints', 0)}",
+            "",
+            "Worktree:",
+        ]
+        if active_worktree:
+            lines.append(f"- {active_worktree.get('branch') or '-'} @ {active_worktree.get('path') or '-'}")
+        else:
+            lines.append("- none")
+        lines.extend(["", "Agents:"])
+        if agents:
+            for item in agents[:6]:
+                lines.append(
+                    f"- {item.get('agent_id') or '-'} | {item.get('status') or '-'} | "
+                    f"{item.get('name') or '-'}"
+                )
+        else:
+            lines.append("- none")
+        lines.extend(["", "Tasks:"])
+        if tasks or background_tasks:
+            for item in tasks[:6]:
+                lines.append(f"- {item.get('task_id') or '-'} | {item.get('status') or '-'} | {item.get('title') or '-'}")
+            for item in background_tasks[:6]:
+                command = str(item.get("command") or "").replace("\n", " ").strip()
+                if len(command) > 100:
+                    command = command[:97].rstrip() + "..."
+                duration = item.get("duration_seconds")
+                duration_text = f" | {float(duration):.1f}s" if isinstance(duration, (int, float)) else ""
+                lines.append(
+                    f"- {item.get('task_id') or '-'} | {item.get('status') or '-'} | "
+                    f"rc={item.get('return_code')}{duration_text} | {command or item.get('cwd') or '-'}"
+                )
+                stdout_tail = str(item.get("stdout_tail") or "").strip()
+                stderr_tail = str(item.get("stderr_tail") or "").strip()
+                if stdout_tail:
+                    lines.append(f"  stdout: {self._summarize_scalar(stdout_tail, max_chars=160)}")
+                if stderr_tail:
+                    lines.append(f"  stderr: {self._summarize_scalar(stderr_tail, max_chars=160)}")
+        else:
+            lines.append("- none")
+        if context:
+            lines.extend(
+                [
+                    "",
+                    (
+                        "Context: "
+                        f"used={context.get('used_tokens', '?')} "
+                        f"remaining={context.get('remaining_tokens', '?')} "
+                        f"max={context.get('max_tokens', '?')}"
+                    ),
+                ]
+            )
+        return "\n".join(lines)
 
     def _resolve_tool_card_status(self, event: dict[str, Any]) -> str:
         status = str(event.get("status") or "").strip()
@@ -424,26 +732,96 @@ class S4TranscriptState:
         hours, minutes = divmod(int(minutes), 60)
         return f"{hours}h {minutes:02d}m {remainder:04.1f}s"
 
-    def _format_active_round_body(self, started_at: float, *, now: float) -> str:
-        return f"Elapsed: {self._format_duration(now - started_at)}"
+    def _format_round_metrics_line(self, metrics: dict[str, Any], *, outcome: str) -> str:
+        items: list[str] = []
+        tool_calls = int(metrics.get("tool_calls") or 0)
+        running_tools = int(metrics.get("running_tools") or 0)
+        tool_errors = int(metrics.get("tool_errors") or 0)
+        if tool_calls:
+            label = f"Tools {tool_calls}"
+            if outcome == "running" and running_tools:
+                label += f" ({running_tools} running)"
+            items.append(label)
+        llm_duration_seconds = float(metrics.get("llm_duration_ms") or 0.0) / 1000.0
+        if llm_duration_seconds > 0:
+            items.append(f"Model {self._format_duration(llm_duration_seconds)}")
+        tool_duration_seconds = max(
+            float(metrics.get("tool_duration_ms") or 0.0) / 1000.0,
+            float(metrics.get("local_tool_seconds") or 0.0),
+        )
+        if tool_duration_seconds > 0:
+            items.append(f"Tool {self._format_duration(tool_duration_seconds)}")
+        total_tokens = int(metrics.get("total_tokens") or 0)
+        if total_tokens > 0:
+            items.append(f"Tokens {total_tokens}")
+        files_changed = list(metrics.get("files_changed") or [])
+        if files_changed:
+            items.append(f"Files {len(files_changed)}")
+        estimated_cost = metrics.get("estimated_cost_usd")
+        if estimated_cost is not None:
+            try:
+                items.append(f"Cost ${float(estimated_cost):.4f}")
+            except Exception:
+                pass
+        if tool_errors > 0:
+            items.append(f"Errors {tool_errors}")
+        if outcome == "pending":
+            items.append("Waiting")
+        elif outcome == "error":
+            items.append("Errored")
+        elif outcome == "interrupted":
+            items.append("Interrupted")
+        return " | ".join(items)
 
-    def _format_completed_round_body(self, started_at: float, finished_at: float) -> str:
-        return f"Completed in {self._format_duration(finished_at - started_at)}"
+    def _format_active_round_body(self, started_at: float, *, now: float, metrics: Optional[dict[str, Any]] = None) -> str:
+        lines = [f"Elapsed: {self._format_duration(now - started_at)}"]
+        metrics_line = self._format_round_metrics_line(metrics or {}, outcome="running")
+        if metrics_line:
+            lines.append(metrics_line)
+        return "\n".join(lines)
 
-    def _finalize_current_round(self) -> None:
+    def _format_completed_round_body(
+        self,
+        started_at: float,
+        finished_at: float,
+        *,
+        metrics: Optional[dict[str, Any]] = None,
+        outcome: str = "completed",
+    ) -> str:
+        label = {
+            "completed": "Completed in",
+            "pending": "Paused after",
+            "error": "Errored after",
+            "interrupted": "Interrupted in",
+        }.get(outcome, "Completed in")
+        lines = [f"{label} {self._format_duration(finished_at - started_at)}"]
+        metrics_line = self._format_round_metrics_line(metrics or {}, outcome=outcome)
+        if metrics_line:
+            lines.append(metrics_line)
+        return "\n".join(lines)
+
+    def _finalize_current_round(self, *, outcome: str = "completed") -> None:
         round_state = self._current_round
         if round_state is None:
             return
         finished_at = self._clock()
         card = self.find_card(round_state.round_card_id)
         if card is not None:
-            card.body = self._format_completed_round_body(round_state.started_at, finished_at)
+            metrics = self._round_metrics_for_card(card)
+            card.body = self._format_completed_round_body(
+                round_state.started_at,
+                finished_at,
+                metrics=metrics,
+                outcome=outcome,
+            )
             card.metadata.update(
                 {
                     "finished_at": finished_at,
                     "duration_seconds": max(finished_at - round_state.started_at, 0.0),
+                    "outcome": outcome,
                 }
             )
+            self._touch(card)
         self._current_round = None
 
     def _summarize_scalar(self, value: Any, *, max_chars: int) -> str:

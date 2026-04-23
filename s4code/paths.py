@@ -24,9 +24,14 @@ class S4Paths:
     task_db_path: Path
     agent_storage_dir: Path
     logs_dir: Path
-    skills_dir: Path
+    skills_dir: Path | None = None
+    global_mcp_config_path: Path | None = None
 
     def ensure(self) -> "S4Paths":
+        if self.skills_dir is None:
+            self.skills_dir = self.data_dir / "skills"
+        if self.global_mcp_config_path is None:
+            self.global_mcp_config_path = self.config_dir / "mcp.json"
         for path in (
             self.config_dir,
             self.data_dir,
@@ -37,6 +42,7 @@ class S4Paths:
         ):
             path.mkdir(parents=True, exist_ok=True)
         self.global_config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.global_mcp_config_path.parent.mkdir(parents=True, exist_ok=True)
         self.session_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.task_db_path.parent.mkdir(parents=True, exist_ok=True)
         return self
@@ -56,6 +62,7 @@ def get_s4_paths() -> S4Paths:
         agent_storage_dir=data_home / "agents",
         logs_dir=data_home / "logs",
         skills_dir=data_home / "skills",
+        global_mcp_config_path=config_home / "mcp.json",
     )
 
 
@@ -67,3 +74,24 @@ def get_project_config_path(project_root: str | Path) -> Path:
 def get_project_skills_path(project_root: str | Path) -> Path:
     root = Path(project_root).expanduser().resolve()
     return root / ".s4code" / "skills"
+
+
+def get_project_mcp_config_path(project_root: str | Path) -> Path:
+    root = Path(project_root).expanduser().resolve()
+    return root / ".s4code" / "mcp.json"
+
+
+def get_project_skills_paths(project_root: str | Path) -> tuple[Path, ...]:
+    root = Path(project_root).expanduser().resolve()
+    return (
+        root / "skills",
+        get_project_skills_path(root),
+    )
+
+
+def get_s4_repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def get_s4_repo_skills_path() -> Path:
+    return get_s4_repo_root() / "skills"

@@ -2,25 +2,26 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
 from pydantic import BaseModel, Field
 
-from .paths import S4Paths, get_project_config_path
+from .paths import S4Paths, get_project_config_path, get_project_mcp_config_path
 
 
 class LLMSettings(BaseModel):
-    provider: str = "openai"
-    base_url: str = "http://127.0.0.1:5124/v1"
-    api_key: str = "122"
-    model: str = "qwen3.5-9b"
-    temperature: float = 0.2
-    max_tokens: Optional[int] = None
-    timeout: int = 120
-    reasoning_effort: str = "high"
-    reasoning_summary: str = "auto"
+    provider: str
+    model: str
+    base_url: Optional[str]
+    api_key: Optional[str]
+    temperature: Optional[float]
+    max_tokens: Optional[int]
+    timeout: Optional[int]
+    reasoning_effort: Optional[str]
+    reasoning_summary: Optional[str]
 
 
 class MCPServerSettings(BaseModel):
@@ -29,13 +30,28 @@ class MCPServerSettings(BaseModel):
     server_args: list[str] = Field(default_factory=list)
     transport_type: Optional[str] = None
     tool_prefix: str = ""
-    auto_connect: bool = True
+    enabled: bool = True
+    persist_connection: bool = True
+    max_retries: Optional[int] = None
     include_resources: bool = True
     env: dict[str, str] = Field(default_factory=dict)
+    auth: Optional[dict[str, Any]] = None
+    policy: Optional[dict[str, Any]] = None
+    transport_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+
+class PermissionRuleSettings(BaseModel):
+    tool_name: str = "*"
+    behavior: str = "ask"
+    matcher: dict[str, Any] = Field(default_factory=dict)
+    source: str = "session"
+    description: Optional[str] = None
 
 
 class ProductSettings(BaseModel):
     permission_mode: str = "accept_edits"
+    permission_rules: list[PermissionRuleSettings] = Field(default_factory=list)
+    permission_history: list[dict[str, Any]] = Field(default_factory=list)
     enable_codeintel: bool = True
     enable_mcp: bool = True
     enable_worktree: bool = True
@@ -61,20 +77,25 @@ class ContextSettings(BaseModel):
     recent_turns: int = 4
 
 
-def _default_profiles() -> dict[str, dict[str, Any]]:
-    return {
-        "default": LLMSettings().model_dump(mode="python"),
-    }
-
-
 class S4Settings(BaseModel):
     active_model_profile: str = "default"
-    model_profiles: dict[str, LLMSettings] = Field(default_factory=lambda: {"default": LLMSettings()})
-    llm: LLMSettings = Field(default_factory=LLMSettings)
+    model_profiles: dict[str, LLMSettings]
+    llm: LLMSettings
     context: ContextSettings = Field(default_factory=ContextSettings)
     product: ProductSettings = Field(default_factory=ProductSettings)
     ui: UISettings = Field(default_factory=UISettings)
     mcp_servers: list[MCPServerSettings] = Field(default_factory=list)
+
+
+_LLM_OPTIONAL_KEYS = (
+    "base_url",
+    "api_key",
+    "temperature",
+    "max_tokens",
+    "timeout",
+    "reasoning_effort",
+    "reasoning_summary",
+)
 
 
 def _yaml_safe_load(text: str) -> dict[str, Any]:
@@ -90,6 +111,19 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     return _yaml_safe_load(path.read_text(encoding="utf-8"))
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload is None:
+        return {}
+    if isinstance(payload, list):
+        return {"servers": payload}
+    if not isinstance(payload, dict):
+        raise ValueError(f"S4Code JSON config 顶层必须是对象或数组: {path}")
+    return dict(payload)
 
 
 def _load_legacy_json(path: Path) -> dict[str, Any]:
@@ -109,21 +143,84 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
+def _base_settings_payload() -> dict[str, Any]:
+    return {
+        "active_model_profile": "default",
+        "model_profiles": {},
+        "context": ContextSettings().model_dump(mode="python"),
+        "product": ProductSettings().model_dump(mode="python"),
+        "ui": UISettings().model_dump(mode="python"),
+        "mcp_servers": [],
+    }
+
+
+def _normalize_mcp_config_payload(raw: dict[str, Any], *, source: Path) -> list[dict[str, Any]]:
+    payload = dict(raw or {})
+    servers = payload.get("servers", payload.get("mcp_servers", []))
+    if servers in (None, ""):
+        return []
+    if not isinstance(servers, list):
+        raise ValueError(f"MCP config `servers` 必须是数组: {source}")
+    normalized: list[dict[str, Any]] = []
+    for item in servers:
+        if not isinstance(item, dict):
+            raise ValueError(f"MCP server 项必须是对象: {source}")
+        server = dict(item)
+        name = str(server.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"MCP server 缺少 name: {source}")
+        normalized.append(server)
+    return normalized
+
+
+def _merge_mcp_server_lists(*server_lists: Any) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for raw_list in server_lists:
+        if not isinstance(raw_list, list):
+            continue
+        for item in raw_list:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            if name not in merged:
+                merged[name] = dict(item)
+                order.append(name)
+            else:
+                merged[name] = _deep_merge(merged[name], dict(item))
+    return [merged[name] for name in order]
+
+
+def _complete_llm_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    completed = dict(payload or {})
+    for key in _LLM_OPTIONAL_KEYS:
+        completed.setdefault(key, None)
+    return completed
+
+
 def _normalize_profiles(
     payload: dict[str, Any],
     *,
     allow_llm_overrides: bool,
-    explicit_profiles_present: bool,
 ) -> dict[str, Any]:
     normalized = dict(payload)
     raw_profiles = normalized.get("model_profiles")
-    synthesized_from_legacy = (not explicit_profiles_present) or not isinstance(raw_profiles, dict) or not raw_profiles
-    if synthesized_from_legacy:
-        raw_profiles = _default_profiles()
     legacy_llm = normalized.get("llm")
-    if synthesized_from_legacy and isinstance(legacy_llm, dict) and legacy_llm:
-        default_profile = dict(raw_profiles.get("default") or _default_profiles()["default"])
-        raw_profiles["default"] = _deep_merge(default_profile, legacy_llm)
+    if not isinstance(raw_profiles, dict) or not raw_profiles:
+        if isinstance(legacy_llm, dict) and legacy_llm:
+            raw_profiles = {"default": _complete_llm_payload(dict(legacy_llm))}
+        else:
+            raise ValueError(
+                "S4Code LLM 配置缺失。请在全局或项目 config.yaml 中配置 model_profiles，"
+                "或至少配置 legacy llm.provider 与 llm.model。"
+            )
+    else:
+        raw_profiles = {
+            str(name): _complete_llm_payload(dict(profile or {}))
+            for name, profile in raw_profiles.items()
+        }
     active_profile = str(normalized.get("active_model_profile") or "default").strip() or "default"
     if active_profile not in raw_profiles:
         active_profile = "default" if "default" in raw_profiles else next(iter(raw_profiles.keys()))
@@ -135,7 +232,7 @@ def _normalize_profiles(
     )
     normalized["active_model_profile"] = active_profile
     normalized["model_profiles"] = raw_profiles
-    normalized["llm"] = _deep_merge(effective_profile, dict(llm_overrides or {}))
+    normalized["llm"] = _complete_llm_payload(_deep_merge(effective_profile, dict(llm_overrides or {})))
     return normalized
 
 
@@ -162,33 +259,42 @@ def resolve_settings(
 ) -> S4Settings:
     global_legacy = _load_legacy_json(paths.global_config_path)
     global_yaml = _load_yaml(paths.global_config_path)
+    global_mcp = _normalize_mcp_config_payload(
+        _load_json_object((paths.global_mcp_config_path or (paths.config_dir / "mcp.json")).resolve()),
+        source=(paths.global_mcp_config_path or (paths.config_dir / "mcp.json")).resolve(),
+    )
     project_legacy: dict[str, Any] = {}
     project_yaml: dict[str, Any] = {}
+    project_mcp: list[dict[str, Any]] = []
     if project_root is not None:
         project_config_path = get_project_config_path(project_root)
         project_legacy = _load_legacy_json(project_config_path)
         project_yaml = _load_yaml(project_config_path)
+        project_mcp_path = get_project_mcp_config_path(project_root)
+        project_mcp = _normalize_mcp_config_payload(
+            _load_json_object(project_mcp_path),
+            source=project_mcp_path,
+        )
 
-    explicit_profiles_present = any(
-        isinstance(source.get("model_profiles"), dict) and bool(source.get("model_profiles"))
-        for source in (global_legacy, global_yaml, project_legacy, project_yaml, session_overrides or {})
-    )
-
-    payload: dict[str, Any] = S4Settings().model_dump(mode="python")
+    payload: dict[str, Any] = _base_settings_payload()
     payload = _deep_merge(payload, global_legacy)
     payload = _deep_merge(payload, global_yaml)
     payload = _deep_merge(payload, project_legacy)
     payload = _deep_merge(payload, project_yaml)
+    payload["mcp_servers"] = _merge_mcp_server_lists(
+        payload.get("mcp_servers"),
+        global_mcp,
+        project_mcp,
+    )
     payload = _normalize_profiles(
         payload,
         allow_llm_overrides=False,
-        explicit_profiles_present=explicit_profiles_present,
     )
     if session_overrides:
         payload = _deep_merge(payload, session_overrides)
+        payload["mcp_servers"] = _merge_mcp_server_lists(payload.get("mcp_servers"))
     payload = _normalize_profiles(
         payload,
         allow_llm_overrides=True,
-        explicit_profiles_present=explicit_profiles_present,
     )
     return S4Settings.model_validate(payload)

@@ -1,0 +1,55 @@
+{
+  "name": "ember",
+  "layout": {
+    "background": "#160b08",
+    "text": "#fff7ed",
+    "muted": "#fdba74",
+    "header_text": "#ffedd5",
+    "footer_text": "#fed7aa",
+    "transcript_border": "#f97316",
+    "sidebar_border": "#7c2d12",
+    "sidebar_text": "#ffedd5",
+    "palette_border": "#9a3412",
+    "input_border": "#fb7185",
+    "input_text": "#fff7ed",
+    "separator": "#7c2d12"
+  },
+  "cards": {
+    "system": {"border": "#fb923c", "title": "#ffedd5"},
+    "user": {"border": "#facc15", "title": "#fef9c3"},
+    "assistant": {"border": "#fb7185", "title": "#ffe4e6"},
+    "thinking": {"border": "#fdba74", "title": "#ffedd5", "text": "#fed7aa"},
+    "tool": {"border": "#f97316", "title": "#ffedd5"},
+    "warning": {"border": "#eab308", "title": "#fef08a"},
+    "error": {"border": "#ef4444", "title": "#fee2e2"},
+    "round": {"border": "#7c2d12", "title": "#fdba74", "text": "#fdba74"},
+    "runtime": {"border": "#f59e0b", "title": "#fef3c7"},
+    "default": {"border": "#9a3412", "title": "#fff7ed"}
+  },
+  "palette": {
+    "selected_prefix": "bold #450a0a on #fb7185",
+    "selected_label": "bold #450a0a on #fb7185",
+    "selected_spacer": "on #fb7185",
+    "selected_description": "#450a0a on #fecdd3",
+    "selected_alias": "#7f1d1d on #ffe4e6",
+    "prefix": "#9a3412",
+    "label": "#fff7ed",
+    "spacer": "#fed7aa",
+    "description": "#fdba74",
+    "alias": "#fb923c",
+    "empty": "#facc15",
+    "hidden_count": "#9a3412",
+    "border": "#fb7185"
+  },
+  "diff": {
+    "summary": "#fff7ed",
+    "hunk_border": "#9a3412",
+    "prelude_border": "#7c2d12",
+    "file_label": "bold #fed7aa",
+    "git_header": "bold #fdba74",
+    "add_prefix": "bold #bbf7d0 on #052e16",
+    "add_background": "#052e16",
+    "delete_prefix": "bold #fecdd3 on #450a0a",
+    "delete_background": "#450a0a"
+  }
+}
