@@ -48,27 +48,51 @@ class S4RuntimeNoticeHook(BaseHook):
             )
         return None
 
-    def flush_compaction_result(self, agent: Any) -> None:
-        if self._pending_compactions <= 0 or self._emitter is None:
-            return
+    @staticmethod
+    def _extract_compaction_state(agent: Any) -> dict[str, Any]:
         usage = {}
         try:
             usage = dict(agent.get_context_usage() or {})
         except Exception:
             usage = {}
-        compaction = dict(usage.get("compaction") or {})
-        if not bool(compaction.get("was_compacted", False)):
-            self._pending_compactions -= 1
+        compaction_raw = usage.get("last_history_compaction")
+        if not isinstance(compaction_raw, dict):
+            compaction_raw = usage.get("compaction") or {}
+        compaction = dict(compaction_raw or {})
+        if "max_tokens" not in compaction and compaction.get("budget") is not None:
+            compaction["max_tokens"] = compaction.get("budget")
+        return compaction
+
+    @staticmethod
+    def _format_compaction_message(compaction: dict[str, Any]) -> str:
+        if not compaction:
+            return "History compaction finished."
+        if compaction.get("hook_blocked"):
+            detail = str(compaction.get("hook_message") or "blocked by a runtime hook")
+            return f"History compaction blocked: {detail}"
+        budget = compaction.get("max_tokens", "?")
+        before = compaction.get("tokens_before", "?")
+        after = compaction.get("tokens_after", "?")
+        if bool(compaction.get("was_compacted", False)):
+            return (
+                f"History compaction finished: "
+                f"{before} -> {after} (budget={budget}, changed=True)."
+            )
+        if compaction.get("compaction_possible") is False:
+            return (
+                f"History compaction not needed: "
+                f"{before} token(s) already fit within the budget ({budget})."
+            )
+        return f"History compaction finished without changes (budget={budget})."
+
+    def flush_compaction_result(self, agent: Any) -> None:
+        if self._pending_compactions <= 0 or self._emitter is None:
             return
-        message = (
-            f"History compaction finished: "
-            f"{compaction.get('tokens_before', '?')} -> {compaction.get('tokens_after', '?')} "
-            f"(budget={compaction.get('max_tokens', '?')}, changed={compaction.get('was_compacted', False)})."
-        )
+        compaction = self._extract_compaction_state(agent)
         self._emitter(
             {
                 "type": "compaction_result",
-                "content": message,
+                "content": self._format_compaction_message(compaction),
                 "compaction": compaction,
             }
         )

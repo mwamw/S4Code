@@ -1,5 +1,16 @@
+from pathlib import Path
+
 from s4code.config import LLMSettings, MCPServerSettings, S4Settings
-from s4code.easyagent_adapter import _connect_registered_mcp_servers, _register_mcp_servers
+from s4code.easyagent_adapter import (
+    SkillManager,
+    SkillRegistry,
+    ToolRegistry,
+    _connect_registered_mcp_servers,
+    _preregister_meta_skill,
+    _register_mcp_servers,
+    _register_worktree_tools_if_enabled,
+)
+from s4code.project import ProjectContext
 
 
 class _FakeRegistry:
@@ -126,3 +137,74 @@ def test_connect_registered_mcp_servers_connects_disconnected_only() -> None:
     assert startup_issues == []
     assert disconnected.connect_calls == 1
     assert connected.connect_calls == 0
+
+
+def test_preregister_meta_skill_registers_skill_and_tools() -> None:
+    registry = ToolRegistry()
+    skill_registry = SkillRegistry()
+    skill_manager = SkillManager()
+    skill_manager.bind_registry(skill_registry)
+    startup_issues: list[str] = []
+
+    _preregister_meta_skill(
+        registry=registry,
+        skill_registry=skill_registry,
+        skill_manager=skill_manager,
+        startup_issues=startup_issues,
+    )
+
+    assert startup_issues == []
+    assert skill_manager.has_skill("meta_skill")
+    assert registry.has_tool("skill_discovery_tool")
+    assert registry.has_tool("skill_tool")
+    assert registry.has_tool("load_skill_tool")
+    assert registry.has_tool("unload_skill_tool")
+
+
+def test_register_worktree_tools_if_enabled(monkeypatch, tmp_path) -> None:
+    registry = ToolRegistry()
+    startup_issues: list[str] = []
+    calls: dict[str, object] = {}
+
+    class _FakeWorktreeManager:
+        def __init__(self, repo_root, *, git_binary="git", original_cwd=None):
+            calls["repo_root"] = repo_root
+            calls["git_binary"] = git_binary
+            calls["original_cwd"] = original_cwd
+
+        @staticmethod
+        def detect_repo_root(workspace_root, *, git_binary="git"):
+            calls["detect_workspace_root"] = workspace_root
+            calls["detect_git_binary"] = git_binary
+            return workspace_root
+
+    def _register_worktree_tools(registry_obj, *, worktree_manager):
+        calls["registered"] = True
+        registry_obj.register_runtime_surface("worktree_manager", "primary", worktree_manager)
+
+    monkeypatch.setattr("Tool.runtime.WorktreeManager", _FakeWorktreeManager)
+    monkeypatch.setattr("s4code.easyagent_adapter.register_worktree_tools", _register_worktree_tools)
+
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    project = ProjectContext(
+        cwd=project_root,
+        project_root=project_root,
+        git_root=project_root,
+        git_available=True,
+        is_git_repo=True,
+        branch="main",
+        git_binary="git",
+    )
+
+    _register_worktree_tools_if_enabled(
+        registry,
+        project=project,
+        settings=_settings(),
+        startup_issues=startup_issues,
+    )
+
+    assert startup_issues == []
+    assert calls["detect_workspace_root"] == str(project_root)
+    assert calls["registered"] is True
+    assert registry.list_runtime_surfaces("worktree_manager")

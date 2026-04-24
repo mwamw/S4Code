@@ -36,16 +36,55 @@ S4Code 不内置默认模型、默认 API 地址或默认 API Key。首次运行
 全局配置默认路径：
 
 ```text
-~/.config/s4code/config.yaml
+~/.config/s4code/
 ```
 
 项目级配置默认路径：
 
 ```text
+<project>/.s4code/
+```
+
+推荐使用分文件配置，按职责拆开：
+
+```text
+~/.config/s4code/models.yaml
+~/.config/s4code/context.yaml
+~/.config/s4code/product.yaml
+~/.config/s4code/ui.yaml
+~/.config/s4code/mcp.json
+```
+
+项目级也支持同样的文件名：
+
+```text
+<project>/.s4code/models.yaml
+<project>/.s4code/context.yaml
+<project>/.s4code/product.yaml
+<project>/.s4code/ui.yaml
+<project>/.s4code/mcp.json
+```
+
+S4Code 仍然兼容旧的单文件：
+
+```text
+~/.config/s4code/config.yaml
 <project>/.s4code/config.yaml
 ```
 
-项目级配置会覆盖全局配置。最小可用配置示例：
+加载顺序是：
+
+1. 全局 `config.yaml`
+2. 全局分文件配置
+3. 项目 `config.yaml`
+4. 项目分文件配置
+5. session override
+
+也就是说，分文件配置会覆盖同层的 `config.yaml`，项目配置会覆盖全局配置。
+
+最小可用配置示例：
+
+`models.yaml`
 
 ```yaml
 active_model_profile: default
@@ -61,32 +100,47 @@ model_profiles:
     timeout: 120
     reasoning_effort: null
     reasoning_summary: null
+```
 
-context:
-  enabled: true
-  max_tokens: 24000
-  history_compactor: llm
-  recent_turns: 4
+`context.yaml`
 
-product:
-  permission_mode: accept_edits
-  enable_codeintel: true
-  enable_mcp: true
-  enable_worktree: true
-  git_binary: git
-  shell: bash
-  command_timeout_ms: 120000
-  max_background_tasks: 4
-  session_auto_save: true
-  default_review_depth: full
-  enable_verifier: true
+```yaml
+enabled: true
+max_tokens: 24000
+history_compactor: llm
+recent_turns: 4
+```
 
-ui:
-  theme: s4
-  show_thinking: true
-  right_panel_open: false
+`product.yaml`
 
-mcp_servers: []
+```yaml
+permission_mode: accept_edits
+enable_codeintel: true
+enable_mcp: true
+enable_worktree: true
+git_binary: git
+shell: bash
+command_timeout_ms: 120000
+max_background_tasks: 4
+session_auto_save: true
+default_review_depth: full
+enable_verifier: true
+```
+
+`ui.yaml`
+
+```yaml
+theme: s4
+show_thinking: true
+right_panel_open: false
+```
+
+`mcp.json`
+
+```json
+{
+  "servers": []
+}
 ```
 
 如果 `api_key` 或 `base_url` 写成 `null`，底层模型客户端可以继续从环境变量读取，例如：
@@ -830,6 +884,8 @@ Matcher 可按路径、命令、host、MCP server、风险类别或参数精确�
 
 ### LLM 配置
 
+推荐文件：`models.yaml`
+
 `provider` 和 `model` 必填。其他字段可省略，解析时会补为 `null`。
 
 ```yaml
@@ -856,42 +912,45 @@ model_profiles:
 
 ### Product 配置
 
+推荐文件：`product.yaml`
+
 ```yaml
-product:
-  permission_mode: accept_edits
-  permission_rules: []
-  permission_history: []
-  enable_codeintel: true
-  enable_mcp: true
-  enable_worktree: true
-  git_binary: git
-  shell: bash
-  command_timeout_ms: 120000
-  max_background_tasks: 4
-  session_auto_save: true
-  default_review_depth: full
-  enable_verifier: true
+permission_mode: accept_edits
+permission_rules: []
+permission_history: []
+enable_codeintel: true
+enable_mcp: true
+enable_worktree: true
+git_binary: git
+shell: bash
+command_timeout_ms: 120000
+max_background_tasks: 4
+session_auto_save: true
+default_review_depth: full
+enable_verifier: true
 ```
 
 ### Context 配置
 
+推荐文件：`context.yaml`
+
 ```yaml
-context:
-  enabled: true
-  max_tokens: 24000
-  history_compactor: llm
-  recent_turns: 4
+enabled: true
+max_tokens: 24000
+history_compactor: llm
+recent_turns: 4
 ```
 
 `history_compactor` 可使用 LLM 压缩，也可以切换为规则压缩实现。`recent_turns` 用于保留最近对话轮次。
 
 ### UI 配置
 
+推荐文件：`ui.yaml`
+
 ```yaml
-ui:
-  theme: s4
-  show_thinking: true
-  right_panel_open: false
+theme: s4
+show_thinking: true
+right_panel_open: false
 ```
 
 `theme` 从 JSON 主题文件加载。内置主题包括：
@@ -908,18 +967,59 @@ aurora
 
 ### MCP 配置
 
-```yaml
-mcp_servers:
-  - name: docs
-    server_source: python
-    server_args:
-      - /path/to/server.py
-    transport_type: null
-    tool_prefix: docs_
-    auto_connect: true
-    include_resources: true
-    env: {}
+推荐文件：`mcp.json`
+
+```json
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "server_source": "npx",
+      "server_args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/ABS/PATH/TO/WORKSPACE"
+      ],
+      "tool_prefix": "fs_",
+      "enabled": true,
+      "persist_connection": true,
+      "include_resources": true,
+      "env": {}
+    }
+  ]
+}
 ```
+
+当前推荐把 MCP 配置单独放在 `mcp.json`，不要再把 `mcp_servers` 写回主配置文件。S4Code 启动时会主动连接启用的 MCP，并尽量复用长连接。
+
+仓库内已经准备了一份 curated MCP 模板：
+
+```text
+example/config_split/global/mcp.catalog.json
+```
+
+其中包含这些常用项的可直接改造模板：
+
+- `filesystem`
+- `git`
+- `fetch`
+- `memory`
+- `time`
+- `sequential_thinking`
+- `github`
+- `browsermcp`
+- `neon`
+
+这些模板默认都设为 `enabled: false`，建议按需挑选后复制到真实的 `mcp.json` 中再启用。
+
+说明：
+
+- `filesystem`、`git`、`fetch`、`memory`、`time`、`sequential_thinking` 来自 `modelcontextprotocol/servers` 官方参考仓库。
+- `github` 使用 GitHub 官方 MCP Server。
+- `browsermcp` 使用 Browser MCP。
+- `neon` 作为数据库方向的推荐项，优先于已归档的 PostgreSQL 参考服务器。
+
+我这里没有把已归档的 `server-postgres`、`server-sqlite`、`server-puppeteer` 放进默认推荐清单，因为它们已经被官方归档，不适合再当作默认首选。
 
 ## 推荐使用流程
 
@@ -970,6 +1070,7 @@ mcp_servers:
 
 ```text
 配置：~/.config/s4code/config.yaml
+配置目录：~/.config/s4code
 数据：~/.local/share/s4code
 缓存：~/.cache/s4code
 Session DB：~/.local/share/s4code/sessions.db
@@ -977,12 +1078,15 @@ Task DB：~/.local/share/s4code/tasks.db
 Agent 存储：~/.local/share/s4code/agents
 日志：~/.local/share/s4code/logs
 全局 Skills：~/.local/share/s4code/skills
+全局 MCP：~/.config/s4code/mcp.json
 ```
 
 项目级数据：
 
 ```text
 项目配置：<project>/.s4code/config.yaml
+项目配置目录：<project>/.s4code
+项目 MCP：<project>/.s4code/mcp.json
 项目 Skills：<project>/skills
 项目 Skills：<project>/.s4code/skills
 ```
@@ -996,8 +1100,9 @@ Agent 存储：~/.local/share/s4code/agents
 - Review workflow。
 - Commit workflow。
 - 模型 profile 管理。
-- YAML 配置解析。
+- 单文件和分文件配置解析。
 - 必填 LLM 配置，无硬编码模型/API 默认值。
+- 分离的 `models.yaml` / `context.yaml` / `product.yaml` / `ui.yaml` / `mcp.json`。
 - Session list/load/resume/rename/fork/tree。
 - Resume 后 transcript 从恢复 history 重建。
 - 空启动不保存 session。
@@ -1026,6 +1131,7 @@ Agent 存储：~/.local/share/s4code/agents
 - Agent show/wait/stop。
 - Worktree enter/exit。
 - MCP tool/resource 接入。
+- MCP 独立 JSON 配置、启动期连接和连接状态可观测。
 - Code intelligence 接入。
 - Skill 自动发现。
 - Skill next-turn 启用。

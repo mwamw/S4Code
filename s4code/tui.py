@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -24,6 +25,30 @@ from .commands import register_builtin_commands
 from .query_engine import S4QueryEngine
 from .theme import load_tui_theme
 from .transcript_state import S4TranscriptState, TranscriptCard
+
+
+FULL_RENDER_RECENT_CARDS = 40
+COMPACT_RENDER_AFTER_CARDS = 60
+COMPACT_CARD_BODY_LIMIT = 220
+MAX_DIFF_HUNKS_RENDERED = 6
+MAX_DIFF_LINES_PER_HUNK = 80
+
+
+class TranscriptCardView(Static):
+    def __init__(self, card_id: str) -> None:
+        super().__init__("")
+        self.card_id = card_id
+        self.render_key: tuple[Any, ...] | None = None
+
+    def sync(self, renderable: Any, render_key: tuple[Any, ...]) -> bool:
+        if self.render_key == render_key:
+            return False
+        self.render_key = render_key
+        self.update(renderable)
+        return True
+
+    def invalidate_render_cache(self) -> None:
+        self.render_key = None
 
 
 @dataclass(slots=True)
@@ -59,6 +84,12 @@ class S4TextualApp(App[None]):
         background: transparent;
     }
 
+    TranscriptCardView {
+        width: 100%;
+        height: auto;
+        background: transparent;
+    }
+
     Header {
         background: transparent;
         color: #e2e8f0;
@@ -84,12 +115,7 @@ class S4TextualApp(App[None]):
         height: 1fr;
         border: round #38bdf8;
         background: transparent;
-        padding: 0 1;
-    }
-
-    #transcript-content {
-        background: transparent;
-        padding: 1 0;
+        padding: 1 1;
     }
 
     #sidebar {
@@ -137,19 +163,26 @@ class S4TextualApp(App[None]):
         self._palette_state_key = ""
         self._query_task: asyncio.Task[None] | None = None
         self._transcript_render_task: asyncio.Task[None] | None = None
+        self._transcript_scroll_task: asyncio.Task[None] | None = None
         self._interrupt_rendered = False
         self._pending_transcript_force_scroll = False
-        self._panel_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
+        self._pending_focus_card_id: str | None = None
+        self._pending_focus_card_top = False
+        self._card_widgets: dict[str, TranscriptCardView] = {}
+        self._compact_card_ids: set[str] = set()
+        self._rendered_card_count = 0
         self._theme_revision = 0
+        self._sidebar_dirty = True
         self._last_sidebar_content = ""
+        self._last_sidebar_refresh_at = 0.0
+        self._diff_lexer_cache: dict[str, str] = {}
         self._theme = load_tui_theme(getattr(self.engine.settings.ui, "theme", "s4"))
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="body"):
             with Vertical(id="main-column"):
-                with VerticalScroll(id="transcript"):
-                    yield Static(id="transcript-content")
+                yield VerticalScroll(id="transcript")
                 yield Static(id="command-palette")
             yield Static(id="sidebar")
         yield Input(placeholder="Ask S4Code or type /help", id="prompt-input")
@@ -161,13 +194,16 @@ class S4TextualApp(App[None]):
         self._render_transcript()
         self._refresh_command_palette("")
         self._apply_sidebar_visibility()
-        self._refresh_sidebar()
-        self.set_interval(0.2, self._refresh_live_rounds)
+        self._refresh_sidebar(force=True)
+        self.set_interval(0.25, self._refresh_live_rounds)
 
     def on_unmount(self) -> None:
         if self._transcript_render_task is not None:
             self._transcript_render_task.cancel()
             self._transcript_render_task = None
+        if self._transcript_scroll_task is not None:
+            self._transcript_scroll_task.cancel()
+            self._transcript_scroll_task = None
         try:
             self.engine.close()
         except Exception:
@@ -218,8 +254,11 @@ class S4TextualApp(App[None]):
     def _reload_theme(self) -> None:
         self._theme = load_tui_theme(getattr(self.engine.settings.ui, "theme", "s4"))
         self._theme_revision += 1
-        self._panel_cache.clear()
+        for widget in self._card_widgets.values():
+            widget.invalidate_render_cache()
+        self._transcript_state.mark_all_cards_dirty()
         self._apply_theme_styles()
+        self._mark_sidebar_dirty()
         self._refresh_sidebar(force=True)
         try:
             current_input = self.query_one("#prompt-input", Input).value
@@ -230,7 +269,7 @@ class S4TextualApp(App[None]):
 
     def action_clear_log(self) -> None:
         self._transcript_state.clear()
-        self._panel_cache.clear()
+        self._compact_card_ids.clear()
         self._render_transcript()
 
     def action_copy_transcript(self) -> None:
@@ -337,8 +376,9 @@ class S4TextualApp(App[None]):
                         self._hydrate_transcript_from_engine(notice=result.message)
                     else:
                         self._transcript_state.append_card("system", "System", result.message)
-                    self._render_transcript()
+                    self._render_transcript(force_scroll=True)
                     self._apply_sidebar_visibility()
+                    self._mark_sidebar_dirty()
                 engine_action = str(result.metadata.get("engine_action") or "")
                 if engine_action == "confirm_pending":
                     await self._run_pending_resolution("approve", str(result.metadata.get("answer") or ""))
@@ -350,13 +390,15 @@ class S4TextualApp(App[None]):
                     await self._run_query(result.query)
                 if result.exit_requested:
                     self.exit()
-            self._refresh_sidebar()
+            self._mark_sidebar_dirty()
+            self._refresh_sidebar(force=True)
         except asyncio.CancelledError:
             self._mark_query_interrupted()
             self._append_invoke_separator()
         except Exception as exc:
             self._transcript_state.append_card("error", "Error", f"{type(exc).__name__}: {exc}")
-            self._render_transcript()
+            self._render_transcript(force_scroll=True)
+            self._mark_sidebar_dirty()
         finally:
             if self._interrupt_rendered:
                 try:
@@ -418,13 +460,33 @@ class S4TextualApp(App[None]):
 
     def _append_invoke_separator(self) -> None:
         self._transcript_state.append_card("separator", "", "")
-        self._render_transcript()
+        self._render_transcript(
+            focus_card_id=self._latest_non_separator_card_id(),
+            focus_top=True,
+        )
 
     def _render_event(self, event: dict[str, object]) -> None:
         self._transcript_state.consume_event(dict(event))
         event_type = str(event.get("type") or "")
+        if event_type in {
+            "round_start",
+            "tool_call",
+            "tool_result",
+            "round_metrics",
+            "final",
+            "interruption",
+            "interaction_resolved",
+            "error",
+            "checkpoint",
+            "cancelled",
+            "compaction_start",
+            "compaction_result",
+            "system_notice",
+            "runtime_snapshot",
+        }:
+            self._mark_sidebar_dirty()
         if event_type == "final":
-            self._refresh_sidebar()
+            self._refresh_sidebar(force=True)
         if event_type in {
             "thinking_delta",
             "text_delta",
@@ -437,14 +499,28 @@ class S4TextualApp(App[None]):
             return
         self._render_transcript()
 
-    def _request_transcript_render(self, *, force_scroll: bool = False, delay: float = 0.03) -> None:
+    def _request_transcript_render(
+        self,
+        *,
+        force_scroll: bool = False,
+        focus_card_id: str | None = None,
+        focus_top: bool = False,
+        delay: float = 0.03,
+    ) -> None:
         self._pending_transcript_force_scroll = self._pending_transcript_force_scroll or force_scroll
+        if focus_card_id:
+            self._pending_focus_card_id = focus_card_id
+            self._pending_focus_card_top = self._pending_focus_card_top or focus_top
         if self._transcript_render_task is not None and not self._transcript_render_task.done():
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._render_transcript(force_scroll=self._pending_transcript_force_scroll)
+            self._render_transcript(
+                force_scroll=self._pending_transcript_force_scroll,
+                focus_card_id=self._pending_focus_card_id,
+                focus_top=self._pending_focus_card_top,
+            )
             return
         self._transcript_render_task = loop.create_task(self._deferred_transcript_render(delay))
 
@@ -452,7 +528,11 @@ class S4TextualApp(App[None]):
         try:
             await asyncio.sleep(max(float(delay), 0.0))
             try:
-                self._flush_transcript_render(force_scroll=self._pending_transcript_force_scroll)
+                self._flush_transcript_render(
+                    force_scroll=self._pending_transcript_force_scroll,
+                    focus_card_id=self._pending_focus_card_id,
+                    focus_top=self._pending_focus_card_top,
+                )
             except Exception:
                 return
         except asyncio.CancelledError:
@@ -460,32 +540,81 @@ class S4TextualApp(App[None]):
         finally:
             self._transcript_render_task = None
 
-    def _render_transcript(self, *, force_scroll: bool = False) -> None:
+    def _render_transcript(
+        self,
+        *,
+        force_scroll: bool = False,
+        focus_card_id: str | None = None,
+        focus_top: bool = False,
+    ) -> None:
         if self._transcript_render_task is not None and not self._transcript_render_task.done():
             self._transcript_render_task.cancel()
             self._transcript_render_task = None
-        self._flush_transcript_render(force_scroll=force_scroll)
+        self._flush_transcript_render(
+            force_scroll=force_scroll,
+            focus_card_id=focus_card_id,
+            focus_top=focus_top,
+        )
 
-    def _flush_transcript_render(self, *, force_scroll: bool = False) -> None:
+    def _flush_transcript_render(
+        self,
+        *,
+        force_scroll: bool = False,
+        focus_card_id: str | None = None,
+        focus_top: bool = False,
+    ) -> None:
         requested_force_scroll = force_scroll or self._pending_transcript_force_scroll
         self._pending_transcript_force_scroll = False
+        target_card_id = focus_card_id or self._pending_focus_card_id
+        target_card_top = focus_top or self._pending_focus_card_top
+        self._pending_focus_card_id = None
+        self._pending_focus_card_top = False
         scroller = self.query_one("#transcript", VerticalScroll)
         should_follow = requested_force_scroll or self._should_follow_transcript(scroller)
         previous_scroll_y = getattr(scroller, "scroll_y", 0)
-        panels = [self._build_cached_panel(card) for card in self._transcript_state.cards]
-        self._prune_panel_cache()
-        content = self.query_one("#transcript-content", Static)
-        if panels:
-            content.update(Group(*panels))
-        else:
-            content.update(Text(""))
-        try:
-            if should_follow:
-                scroller.scroll_end(animate=False)
+        mount_wait = self._sync_transcript_widgets()
+        if mount_wait is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                mount_wait = None
             else:
-                scroller.scroll_to(y=previous_scroll_y, animate=False)
+                if self._transcript_scroll_task is not None and not self._transcript_scroll_task.done():
+                    self._transcript_scroll_task.cancel()
+                self._transcript_scroll_task = loop.create_task(
+                    self._restore_transcript_scroll_after_mount(
+                        mount_wait,
+                        should_follow=should_follow,
+                        previous_scroll_y=previous_scroll_y,
+                        target_card_id=target_card_id,
+                        target_card_top=target_card_top,
+                    )
+                )
+                return
+        try:
+            callback = getattr(self, "call_after_refresh", None)
+            if callable(callback):
+                callback(
+                    self._restore_transcript_scroll,
+                    should_follow,
+                    previous_scroll_y,
+                    target_card_id,
+                    target_card_top,
+                )
+            else:
+                self._restore_transcript_scroll(
+                    should_follow,
+                    previous_scroll_y,
+                    target_card_id,
+                    target_card_top,
+                )
         except Exception:
-            pass
+            self._restore_transcript_scroll(
+                should_follow,
+                previous_scroll_y,
+                target_card_id,
+                target_card_top,
+            )
 
     @staticmethod
     def _should_follow_transcript(scroller: VerticalScroll) -> bool:
@@ -496,31 +625,154 @@ class S4TextualApp(App[None]):
             return True
         return max_scroll_y <= 0 or (max_scroll_y - scroll_y) <= 2
 
-    def _build_cached_panel(self, card: TranscriptCard):
-        cache_key = (
+    def _restore_transcript_scroll(
+        self,
+        should_follow: bool,
+        previous_scroll_y: float,
+        target_card_id: str | None = None,
+        target_card_top: bool = False,
+    ) -> None:
+        try:
+            scroller = self.query_one("#transcript", VerticalScroll)
+        except Exception:
+            return
+        try:
+            if should_follow:
+                target_widget = self._card_widgets.get(target_card_id or "")
+                if target_widget is not None:
+                    if target_card_top:
+                        self._scroll_card_to_top(target_card_id)
+                    else:
+                        scroller.scroll_to_widget(
+                            target_widget,
+                            top=False,
+                            animate=False,
+                            immediate=True,
+                        )
+                else:
+                    scroller.scroll_end(animate=False)
+            else:
+                scroller.scroll_to(y=previous_scroll_y, animate=False)
+        except Exception:
+            pass
+
+    async def _restore_transcript_scroll_after_mount(
+        self,
+        mount_wait: Any,
+        *,
+        should_follow: bool,
+        previous_scroll_y: float,
+        target_card_id: str | None,
+        target_card_top: bool,
+    ) -> None:
+        try:
+            await mount_wait
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+        self._restore_transcript_scroll(
+            should_follow,
+            previous_scroll_y,
+            target_card_id,
+            target_card_top,
+        )
+
+    def _scroll_card_to_top(self, card_id: str | None) -> None:
+        if not card_id:
+            return
+        try:
+            scroller = self.query_one("#transcript", VerticalScroll)
+        except Exception:
+            return
+        target_widget = self._card_widgets.get(card_id)
+        if target_widget is None:
+            return
+        try:
+            target_y = max(float(getattr(scroller, "scroll_y", 0) or 0) + float(target_widget.region.y), 0.0)
+            scroller.scroll_to(y=target_y, animate=False, immediate=True)
+        except Exception:
+            pass
+
+    def _latest_non_separator_card_id(self) -> str | None:
+        for card in reversed(self._transcript_state.cards):
+            if card.kind != "separator":
+                return card.card_id
+        return None
+
+    def _sync_transcript_widgets(self) -> Any | None:
+        container = self.query_one("#transcript", VerticalScroll)
+        cards = self._transcript_state.cards
+        dirty_ids = self._transcript_state.consume_dirty_card_ids()
+        mount_wait = None
+        current_card_ids = [card.card_id for card in cards]
+        current_card_id_set = set(current_card_ids)
+        stale_card_ids = [
+            card_id
+            for card_id in list(self._card_widgets)
+            if card_id not in current_card_id_set
+        ]
+        for card_id in stale_card_ids:
+            widget = self._card_widgets.pop(card_id, None)
+            if widget is None:
+                continue
+            try:
+                widget.remove()
+            except Exception:
+                pass
+        compact_card_ids = self._compute_compact_card_ids(cards)
+        if compact_card_ids != self._compact_card_ids:
+            dirty_ids.update(compact_card_ids ^ self._compact_card_ids)
+            self._compact_card_ids = compact_card_ids
+        new_widgets: list[TranscriptCardView] = []
+        for card in cards:
+            if card.card_id not in self._card_widgets:
+                widget = TranscriptCardView(card.card_id)
+                self._card_widgets[card.card_id] = widget
+                new_widgets.append(widget)
+                dirty_ids.add(card.card_id)
+        if new_widgets:
+            mount_wait = container.mount_all(new_widgets)
+        self._rendered_card_count = len(cards)
+        for card_id in dirty_ids:
+            card = self._transcript_state.find_card(card_id)
+            widget = self._card_widgets.get(card_id)
+            if card is None or widget is None:
+                continue
+            render_key = self._card_render_key(card)
+            if widget.render_key == render_key:
+                continue
+            widget.sync(self._build_panel(card), render_key)
+        return mount_wait
+
+    def _reset_transcript_widgets(self) -> None:
+        for widget in list(self._card_widgets.values()):
+            try:
+                widget.remove()
+            except Exception:
+                pass
+        self._card_widgets.clear()
+        self._compact_card_ids.clear()
+        self._rendered_card_count = 0
+
+    def _card_render_key(self, card: TranscriptCard) -> tuple[Any, ...]:
+        return (
             self._theme_revision,
             int(getattr(card, "revision", 0)),
             card.kind,
             card.title,
             card.status or "",
+            card.card_id in self._compact_card_ids,
         )
-        cached = self._panel_cache.get(card.card_id)
-        if cached is not None and cached[0] == cache_key:
-            return cached[1]
-        panel = self._build_panel(card)
-        self._panel_cache[card.card_id] = (cache_key, panel)
-        return panel
-
-    def _prune_panel_cache(self) -> None:
-        active_ids = {card.card_id for card in self._transcript_state.cards}
-        stale_ids = [card_id for card_id in self._panel_cache if card_id not in active_ids]
-        for card_id in stale_ids:
-            self._panel_cache.pop(card_id, None)
 
     def _refresh_live_rounds(self) -> None:
         if self._busy and self._transcript_state.refresh_round_timers():
             self._request_transcript_render()
-        if self._busy or self.engine.has_live_runtime_activity():
+        live_sidebar = self._busy or self.engine.has_live_runtime_activity(force=False)
+        if self._sidebar_dirty:
+            self._refresh_sidebar(force=True)
+        elif live_sidebar:
             self._refresh_sidebar()
 
     def _build_panel(self, card: TranscriptCard) -> Panel:
@@ -532,9 +784,10 @@ class S4TextualApp(App[None]):
         if card.status:
             title = f"{title} [{card.status.upper()}]"
         checkpoint_subtitle = self._checkpoint_subtitle(card)
+        compact = card.card_id in self._compact_card_ids
         if card.kind == "round":
             return Panel(
-                Text(card.body or card.title, style=card_theme["text"]),
+                Text(self._compact_round_body(card) if compact else (card.body or card.title), style=card_theme["text"]),
                 title=card.title,
                 border_style=border_style,
                 title_align="left",
@@ -544,7 +797,7 @@ class S4TextualApp(App[None]):
                 padding=(0, 1),
             )
         return Panel(
-            self._render_body(card),
+            self._render_compact_body(card) if compact else self._render_body(card),
             title=title,
             border_style=border_style,
             title_align="left",
@@ -582,9 +835,23 @@ class S4TextualApp(App[None]):
         if not content:
             return Text("")
         if card.kind == "assistant":
-            return Markdown(content)
+            if self._looks_like_markdown(content):
+                markdown_content = self._prepare_streaming_markdown(content) if card.status == "streaming" else content
+                try:
+                    return Markdown(markdown_content)
+                except Exception:
+                    pass
+            return Text(content, style=self._theme_card("assistant")["text"])
         if card.kind == "thinking":
             return Text(content, style=self._theme_card("thinking")["text"])
+        if card.kind == "system":
+            return Text(content, style=self._theme_card("system")["text"])
+        if card.kind == "user":
+            return Text(content, style=self._theme_card("user")["text"])
+        if card.kind == "warning":
+            return Text(content, style=self._theme_card("warning")["text"])
+        if card.kind == "error":
+            return Text(content, style=self._theme_card("error")["text"])
         if content.startswith("{") and content.endswith("}"):
             try:
                 return Syntax(content, "json", theme="monokai", word_wrap=True)
@@ -593,6 +860,82 @@ class S4TextualApp(App[None]):
         if "diff --git" in content or content.startswith("--- ") or content.startswith("@@ "):
             return Syntax(content, "diff", theme="monokai", word_wrap=True)
         return Text(content)
+
+    @staticmethod
+    def _looks_like_markdown(content: str) -> bool:
+        starters = (
+            "# ",
+            "## ",
+            "### ",
+            "- ",
+            "* ",
+            "> ",
+            "1. ",
+            "```",
+            "|",
+        )
+        if content.startswith(starters):
+            return True
+        markers = (
+            "```",
+            "\n#",
+            "\n- ",
+            "\n* ",
+            "\n1. ",
+            "\n> ",
+            "\n|",
+            "`",
+        )
+        return any(marker in content for marker in markers)
+
+    @staticmethod
+    def _prepare_streaming_markdown(content: str) -> str:
+        normalized = str(content or "")
+        if normalized.count("```") % 2 == 1:
+            return normalized + "\n```"
+        return normalized
+
+    @staticmethod
+    def _compact_round_body(card: TranscriptCard) -> str:
+        content = str(card.body or card.title or "").strip()
+        if not content:
+            return ""
+        return content.splitlines()[0].strip()
+
+    def _compute_compact_card_ids(self, cards: list[TranscriptCard]) -> set[str]:
+        total = len(cards)
+        if total <= COMPACT_RENDER_AFTER_CARDS:
+            return set()
+        cutoff = max(total - FULL_RENDER_RECENT_CARDS, 0)
+        return {
+            card.card_id
+            for card in cards[:cutoff]
+            if card.kind != "separator"
+        }
+
+    def _render_compact_body(self, card: TranscriptCard) -> Text:
+        summary = self._compact_card_summary(card)
+        return Text(summary, style=self._theme_card(card.kind)["text"])
+
+    def _compact_card_summary(self, card: TranscriptCard) -> str:
+        diff_payload = self._extract_diff_payload(card)
+        if diff_payload is not None:
+            label = str(diff_payload.get("relative_path") or diff_payload.get("file_path") or "").strip()
+            detail = str(card.body or "").strip().splitlines()[0] if str(card.body or "").strip() else "Diff available"
+            return self._truncate_compact_text(" | ".join(item for item in [label, detail] if item))
+        body = str(card.body or "").strip()
+        if not body:
+            return ""
+        if card.kind == "round":
+            return self._compact_round_body(card)
+        return self._truncate_compact_text(" ".join(body.split()))
+
+    @staticmethod
+    def _truncate_compact_text(text: str) -> str:
+        normalized = str(text or "").strip()
+        if len(normalized) <= COMPACT_CARD_BODY_LIMIT:
+            return normalized
+        return normalized[:COMPACT_CARD_BODY_LIMIT].rstrip() + "..."
 
     @staticmethod
     def _extract_diff_payload(card: TranscriptCard) -> Optional[dict[str, Any]]:
@@ -636,15 +979,32 @@ class S4TextualApp(App[None]):
         if header is not None:
             renderables.append(header)
         lexer = self._guess_diff_lexer(diff_payload)
-        for index, hunk in enumerate(parsed.hunks, start=1):
+        hidden_hunks = max(len(parsed.hunks) - MAX_DIFF_HUNKS_RENDERED, 0)
+        for index, hunk in enumerate(parsed.hunks[:MAX_DIFF_HUNKS_RENDERED], start=1):
+            visible_lines = hunk.lines[:MAX_DIFF_LINES_PER_HUNK]
             renderables.append(
                 Panel(
-                    self._render_diff_hunk(hunk, lexer),
+                    self._render_diff_hunk(DiffHunk(hunk.header, tuple(visible_lines)), lexer),
                     title=hunk.header,
                     title_align="left",
                     border_style=self._theme_value("diff.hunk_border", "#334155"),
                     box=ROUNDED,
                     padding=(0, 1),
+                )
+            )
+            hidden_lines = max(len(hunk.lines) - len(visible_lines), 0)
+            if hidden_lines > 0:
+                renderables.append(
+                    Text(
+                        f"... {hidden_lines} more line(s) hidden in this hunk",
+                        style=self._theme_value("diff.summary", "#94a3b8"),
+                    )
+                )
+        if hidden_hunks > 0:
+            renderables.append(
+                Text(
+                    f"... {hidden_hunks} more hunk(s) hidden",
+                    style=self._theme_value("diff.summary", "#94a3b8"),
                 )
             )
         if len(renderables) == 1 and summary:
@@ -692,11 +1052,16 @@ class S4TextualApp(App[None]):
         file_path = str(diff_payload.get("file_path") or diff_payload.get("relative_path") or "").strip()
         if not file_path:
             return "text"
+        cached = self._diff_lexer_cache.get(file_path)
+        if cached is not None:
+            return cached
         code_sample = self._diff_code_sample(str(diff_payload.get("unified") or ""))
         try:
-            return Syntax.guess_lexer(file_path, code=code_sample or None)
+            lexer = Syntax.guess_lexer(file_path, code=code_sample or None)
         except Exception:
-            return "text"
+            lexer = "text"
+        self._diff_lexer_cache[file_path] = lexer
+        return lexer
 
     @staticmethod
     def _diff_code_sample(diff_text: str) -> str:
@@ -982,6 +1347,47 @@ class S4TextualApp(App[None]):
                         if fragment in entry.label.lower() or fragment in entry.description.lower()
                     ]
                 return (entries, f"permissions-rule:{subcommand}:{fragment}")
+            if subcommand in {"clear", "reset"}:
+                fragment = invocation.arg_text[len(invocation.args[0]) :].strip().lower()
+                sources = ("session", "all")
+                entries = [
+                    PaletteEntry(
+                        label=source,
+                        description=f"Clear {source} permission rules.",
+                        insert_text=f"/permissions clear {source}",
+                        execute_text=f"/permissions clear {source}",
+                        mode="execute",
+                    )
+                    for source in sources
+                    if not fragment or fragment in source
+                ]
+                return (entries, f"permissions-clear:{fragment}")
+
+        if invocation.name == "plan":
+            fragment = invocation.arg_text.strip().lower()
+            entries = [
+                PaletteEntry("/plan on", "Enter plan mode.", "/plan on", "/plan on", mode="execute"),
+                PaletteEntry("/plan off", "Exit plan mode.", "/plan off", "/plan off", mode="execute"),
+            ]
+            if fragment:
+                entries = [
+                    entry for entry in entries
+                    if fragment in entry.label.lower() or fragment in entry.description.lower()
+                ]
+            return (entries, f"plan:{fragment}")
+
+        if invocation.name == "copy":
+            fragment = invocation.arg_text.strip().lower()
+            entries = [
+                PaletteEntry("/copy transcript", "Copy the full transcript.", "/copy transcript", "/copy transcript", mode="execute"),
+                PaletteEntry("/copy last", "Copy only the latest card.", "/copy last", "/copy last", mode="execute"),
+            ]
+            if fragment:
+                entries = [
+                    entry for entry in entries
+                    if fragment in entry.label.lower() or fragment in entry.description.lower()
+                ]
+            return (entries, f"copy:{fragment}")
 
         if invocation.name == "skills":
             if not invocation.args:
@@ -1009,6 +1415,51 @@ class S4TextualApp(App[None]):
                 return (
                     self._build_skill_palette_entries(remainder, prefix="/skills use "),
                     f"skills-use:{remainder}",
+                )
+
+        if invocation.name == "mcp":
+            if not invocation.args:
+                entries = [
+                    PaletteEntry("/mcp list", "List MCP services and connection status.", "/mcp list", "/mcp list"),
+                    PaletteEntry("/mcp status", "Show one MCP service in detail.", "/mcp status ", "/mcp status ", mode="insert"),
+                    PaletteEntry("/mcp tools", "List tools exposed by one MCP service.", "/mcp tools ", "/mcp tools ", mode="insert"),
+                    PaletteEntry("/mcp resources", "List resources exposed by one MCP service.", "/mcp resources ", "/mcp resources ", mode="insert"),
+                    PaletteEntry("/mcp refresh", "Refresh one MCP service or all services.", "/mcp refresh ", "/mcp refresh ", mode="insert"),
+                    PaletteEntry("/mcp connect", "Connect one MCP service or all services.", "/mcp connect ", "/mcp connect ", mode="insert"),
+                    PaletteEntry("/mcp disconnect", "Disconnect one MCP service or all services.", "/mcp disconnect ", "/mcp disconnect ", mode="insert"),
+                ]
+                return (entries, "mcp:root")
+            subcommand = invocation.args[0].lower()
+            remainder = invocation.arg_text[len(invocation.args[0]) :].strip().lower()
+            if subcommand == "status":
+                return (
+                    self._build_mcp_palette_entries(remainder, prefix="/mcp status "),
+                    f"mcp-status:{remainder}",
+                )
+            if subcommand == "tools":
+                return (
+                    self._build_mcp_palette_entries(remainder, prefix="/mcp tools "),
+                    f"mcp-tools:{remainder}",
+                )
+            if subcommand in {"resources", "res"}:
+                return (
+                    self._build_mcp_palette_entries(remainder, prefix="/mcp resources "),
+                    f"mcp-resources:{remainder}",
+                )
+            if subcommand in {"refresh", "reload"}:
+                return (
+                    self._build_mcp_palette_entries(remainder, prefix="/mcp refresh ", include_all=True),
+                    f"mcp-refresh:{remainder}",
+                )
+            if subcommand in {"connect", "reconnect"}:
+                return (
+                    self._build_mcp_palette_entries(remainder, prefix="/mcp connect ", include_all=True),
+                    f"mcp-connect:{remainder}",
+                )
+            if subcommand in {"disconnect", "close"}:
+                return (
+                    self._build_mcp_palette_entries(remainder, prefix="/mcp disconnect ", include_all=True),
+                    f"mcp-disconnect:{remainder}",
                 )
 
         if invocation.name == "worktree":
@@ -1130,8 +1581,21 @@ class S4TextualApp(App[None]):
                 entries = [
                     entry for entry in entries
                     if fragment in entry.label.lower() or fragment in entry.description.lower()
-                ]
+            ]
             return (entries, f"checkpoint:{fragment}")
+
+        if invocation.name == "sidebar":
+            fragment = invocation.arg_text.strip().lower()
+            entries = [
+                PaletteEntry("/sidebar show", "Show the right-side info panel.", "/sidebar show", "/sidebar show", mode="execute"),
+                PaletteEntry("/sidebar hide", "Hide the right-side info panel.", "/sidebar hide", "/sidebar hide", mode="execute"),
+            ]
+            if fragment:
+                entries = [
+                    entry for entry in entries
+                    if fragment in entry.label.lower() or fragment in entry.description.lower()
+                ]
+            return (entries, f"sidebar:{fragment}")
 
         command_fragment = invocation.name
         if " " not in text[1:]:
@@ -1278,6 +1742,43 @@ class S4TextualApp(App[None]):
             )
         return entries
 
+    def _build_mcp_palette_entries(self, fragment: str, *, prefix: str, include_all: bool = False) -> list[PaletteEntry]:
+        entries: list[PaletteEntry] = []
+        if include_all and (not fragment or "all".startswith(fragment)):
+            entries.append(
+                PaletteEntry(
+                    label="all",
+                    description="Apply this action to all MCP services.",
+                    insert_text=prefix.rstrip(),
+                    execute_text=prefix.rstrip(),
+                    mode="execute",
+                )
+            )
+        for item in self.engine.get_mcp_status_payload(include_capabilities=False):
+            server_name = str(item.get("server_name") or "").strip()
+            if not server_name:
+                continue
+            status = str(item.get("status") or "-").strip()
+            transport = str(item.get("transport_summary") or "-").strip()
+            last_error = str(item.get("last_error") or "").strip()
+            search_blob = " ".join([server_name, status, transport, last_error]).lower()
+            if fragment and fragment not in search_blob:
+                continue
+            marker = "* " if status == "connected" else ""
+            description = f"{status} · {transport}"
+            if last_error:
+                description += f" · {last_error}"
+            entries.append(
+                PaletteEntry(
+                    label=f"{marker}{server_name}",
+                    description=description,
+                    insert_text=f"{prefix}{server_name}",
+                    execute_text=f"{prefix}{server_name}",
+                    mode="execute",
+                )
+            )
+        return entries
+
     def _resolve_palette_submit(self, text: str) -> tuple[str, str] | None:
         if not text.startswith("/") or not self._palette_entries:
             return None
@@ -1313,9 +1814,57 @@ class S4TextualApp(App[None]):
             message = "Transcript copied."
         if not text:
             self._transcript_state.append_card("system", "Notice", "Nothing to copy yet.")
-            self._render_transcript()
+            self._render_transcript(
+                force_scroll=True,
+                focus_card_id=self._latest_non_separator_card_id(),
+            )
+            self._force_scroll_transcript_end()
             return
         self._copy_to_clipboard(text, success_message=message)
+        self._render_transcript(
+            force_scroll=True,
+            focus_card_id=self._latest_non_separator_card_id(),
+        )
+        self._force_scroll_transcript_end()
+
+    def _force_scroll_transcript_end(self) -> None:
+        def _scroll() -> None:
+            try:
+                scroller = self.query_one("#transcript", VerticalScroll)
+            except Exception:
+                return
+            try:
+                scroller.scroll_to(
+                    y=float(getattr(scroller, "max_scroll_y", 0) or 0),
+                    animate=False,
+                    immediate=True,
+                )
+            except Exception:
+                pass
+
+        _scroll()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            async def _scroll_later() -> None:
+                try:
+                    await asyncio.sleep(0)
+                    _scroll()
+                    await asyncio.sleep(0.05)
+                    _scroll()
+                except Exception:
+                    return
+
+            loop.create_task(_scroll_later())
+        try:
+            callback = getattr(self, "call_after_refresh", None)
+            if callable(callback):
+                callback(_scroll)
+        except Exception:
+            _scroll()
 
     def _build_transcript_plain_text(self) -> str:
         blocks = []
@@ -1371,12 +1920,27 @@ class S4TextualApp(App[None]):
             )
         self._render_transcript()
 
+    def _mark_sidebar_dirty(self) -> None:
+        self._sidebar_dirty = True
+
     def _refresh_sidebar(self, *, force: bool = False) -> None:
-        content = self.engine.format_sidebar()
-        if not force and content == self._last_sidebar_content:
+        sidebar = self.query_one("#sidebar", Static)
+        if not bool(sidebar.display):
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_sidebar_refresh_at) < 0.75:
+            return
+        content = self.engine.format_sidebar(force=force)
+        self._last_sidebar_refresh_at = now
+        self._sidebar_dirty = False
+        if content == self._last_sidebar_content:
             return
         self._last_sidebar_content = content
-        self.query_one("#sidebar", Static).update(content)
+        sidebar.update(content)
 
     def _apply_sidebar_visibility(self) -> None:
-        self.query_one("#sidebar", Static).display = bool(getattr(self.engine, "sidebar_visible", False))
+        sidebar = self.query_one("#sidebar", Static)
+        visible = bool(getattr(self.engine, "sidebar_visible", False))
+        sidebar.display = visible
+        if visible:
+            self._mark_sidebar_dirty()

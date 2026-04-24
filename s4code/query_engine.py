@@ -34,6 +34,16 @@ def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[st
     return merged
 
 
+def _extract_last_compaction_state(usage: dict[str, Any]) -> dict[str, Any]:
+    compaction_raw = usage.get("last_history_compaction")
+    if not isinstance(compaction_raw, dict):
+        compaction_raw = usage.get("compaction") or {}
+    compaction = dict(compaction_raw or {})
+    if "max_tokens" not in compaction and compaction.get("budget") is not None:
+        compaction["max_tokens"] = compaction.get("budget")
+    return compaction
+
+
 class S4QueryEngine:
     def __init__(
         self,
@@ -58,6 +68,7 @@ class S4QueryEngine:
         self._last_close_report: Optional[dict[str, Any]] = None
         self._checkpoints: list[dict[str, Any]] = []
         self._session_dirty = False
+        self._runtime_cache: dict[str, tuple[float, Any]] = {}
 
         if session_id is not None:
             self._apply_session_record(self._require_session_record(session_id))
@@ -84,6 +95,36 @@ class S4QueryEngine:
     @property
     def registry(self):
         return self.bundle.registry
+
+    def _get_cached_runtime_value(
+        self,
+        key: str,
+        *,
+        max_age: float,
+        force: bool = False,
+        producer,
+    ) -> Any:
+        if not force:
+            cached = self._runtime_cache.get(key)
+            if cached is not None:
+                cached_at, value = cached
+                if (time.monotonic() - cached_at) <= max(float(max_age), 0.0):
+                    return value
+        value = producer()
+        self._runtime_cache[key] = (time.monotonic(), value)
+        return value
+
+    def _invalidate_runtime_cache(self, *prefixes: str) -> None:
+        if not prefixes:
+            self._runtime_cache.clear()
+            return
+        stale = [
+            key
+            for key in self._runtime_cache
+            if any(key == prefix or key.startswith(f"{prefix}:") for prefix in prefixes)
+        ]
+        for key in stale:
+            self._runtime_cache.pop(key, None)
 
     @property
     def was_restored(self) -> bool:
@@ -276,41 +317,49 @@ class S4QueryEngine:
             ),
         }
 
-    def _get_background_task_snapshots(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        manager = self._get_process_manager()
-        if manager is None:
-            return []
-        try:
-            snapshots = manager.list_tasks()
-        except Exception:
-            return []
-        result: list[dict[str, Any]] = []
-        for snapshot in snapshots[: max(int(limit), 0)]:
-            stdout = str(getattr(snapshot, "stdout", "") or "")
-            stderr = str(getattr(snapshot, "stderr", "") or "")
-            started_at = getattr(snapshot, "started_at", None)
-            finished_at = getattr(snapshot, "finished_at", None)
-            duration_seconds = None
-            if isinstance(started_at, (int, float)):
-                end_time = finished_at if isinstance(finished_at, (int, float)) else time.time()
-                duration_seconds = max(float(end_time) - float(started_at), 0.0)
-            result.append(
-                {
-                    "task_id": getattr(snapshot, "task_id", ""),
-                    "status": getattr(snapshot, "status", ""),
-                    "cwd": getattr(snapshot, "cwd", ""),
-                    "command": getattr(snapshot, "command", ""),
-                    "return_code": getattr(snapshot, "return_code", None),
-                    "started_at": started_at,
-                    "finished_at": finished_at,
-                    "duration_seconds": duration_seconds,
-                    "stdout_tail": self._tail_text(stdout, max_chars=1200),
-                    "stderr_tail": self._tail_text(stderr, max_chars=1200),
-                    "stdout_bytes": len(stdout.encode("utf-8", errors="ignore")),
-                    "stderr_bytes": len(stderr.encode("utf-8", errors="ignore")),
-                }
-            )
-        return result
+    def _get_background_task_snapshots(self, *, limit: int = 20, force: bool = False) -> list[dict[str, Any]]:
+        def _produce() -> list[dict[str, Any]]:
+            manager = self._get_process_manager()
+            if manager is None:
+                return []
+            try:
+                snapshots = manager.list_tasks()
+            except Exception:
+                return []
+            result: list[dict[str, Any]] = []
+            for snapshot in snapshots[: max(int(limit), 0)]:
+                stdout = str(getattr(snapshot, "stdout", "") or "")
+                stderr = str(getattr(snapshot, "stderr", "") or "")
+                started_at = getattr(snapshot, "started_at", None)
+                finished_at = getattr(snapshot, "finished_at", None)
+                duration_seconds = None
+                if isinstance(started_at, (int, float)):
+                    end_time = finished_at if isinstance(finished_at, (int, float)) else time.time()
+                    duration_seconds = max(float(end_time) - float(started_at), 0.0)
+                result.append(
+                    {
+                        "task_id": getattr(snapshot, "task_id", ""),
+                        "status": getattr(snapshot, "status", ""),
+                        "cwd": getattr(snapshot, "cwd", ""),
+                        "command": getattr(snapshot, "command", ""),
+                        "return_code": getattr(snapshot, "return_code", None),
+                        "started_at": started_at,
+                        "finished_at": finished_at,
+                        "duration_seconds": duration_seconds,
+                        "stdout_tail": self._tail_text(stdout, max_chars=1200),
+                        "stderr_tail": self._tail_text(stderr, max_chars=1200),
+                        "stdout_bytes": len(stdout.encode("utf-8", errors="ignore")),
+                        "stderr_bytes": len(stderr.encode("utf-8", errors="ignore")),
+                    }
+                )
+            return result
+
+        return self._get_cached_runtime_value(
+            f"background:{int(limit)}",
+            max_age=0.35,
+            force=force,
+            producer=_produce,
+        )
 
     @staticmethod
     def _tail_text(value: str, *, max_chars: int = 1200) -> str:
@@ -1143,11 +1192,20 @@ class S4QueryEngine:
     def compact_history(self, max_tokens: Optional[int] = None) -> str:
         changed = self.agent.compact_history(max_tokens=max_tokens)
         usage = self.agent.get_context_usage()
-        compaction = dict(usage.get("compaction") or {})
+        compaction = _extract_last_compaction_state(dict(usage or {}))
         self.ensure_autosave()
+        if compaction.get("hook_blocked"):
+            return f"Compaction blocked.\nmessage={compaction.get('hook_message') or 'blocked by hook'}"
         if changed:
             return (
                 "Conversation compacted.\n"
+                f"before={compaction.get('tokens_before', '?')} "
+                f"after={compaction.get('tokens_after', '?')} "
+                f"budget={compaction.get('max_tokens', '?')}"
+            )
+        if compaction.get("compaction_possible") is False:
+            return (
+                "Compaction not needed.\n"
                 f"before={compaction.get('tokens_before', '?')} "
                 f"after={compaction.get('tokens_after', '?')} "
                 f"budget={compaction.get('max_tokens', '?')}"
@@ -1361,13 +1419,13 @@ class S4QueryEngine:
         }
         return json.dumps(status, ensure_ascii=False, indent=2)
 
-    def format_sidebar(self) -> str:
+    def format_sidebar(self, *, force: bool = False) -> str:
         permission_mode = getattr(getattr(self.agent, "permission_context", None), "mode", None).value
         permission_status = self.get_permission_status_payload()
         agent_mode = self.agent.get_execution_mode().value
-        handles = self.agent.agent_runtime.list_handles(limit=5) if self.agent.agent_runtime is not None else []
-        tasks = self.bundle.task_service.list_tasks(limit=5)
-        background_tasks = self._get_background_task_snapshots(limit=5)
+        handles = self.get_agent_choices(limit=5, force=force)
+        tasks = self.get_task_choices(limit=5, force=force)
+        background_tasks = self._get_background_task_snapshots(limit=5, force=force)
         worktree = self.get_worktree_status_payload()
         skills = self.get_skill_choices()
         active_skills = [item["name"] for item in skills if item["active"]]
@@ -1456,19 +1514,19 @@ class S4QueryEngine:
         lines.extend(
             [
                 "",
-            "Recent Tasks:",
+                "Recent Tasks:",
             ]
         )
         if tasks:
             for task in tasks[:5]:
-                lines.append(f"- {task.task_id}: {task.title} [{task.status.value}]")
+                lines.append(f"- {task['task_id']}: {task['title']} [{task['status']}]")
         else:
             lines.append("- none")
         lines.append("")
         lines.append("Agents:")
         if handles:
             for handle in handles[:5]:
-                lines.append(f"- {handle.agent_id}: {handle.status}")
+                lines.append(f"- {handle['agent_id']}: {handle['status']}")
         else:
             lines.append("- none")
         return "\n".join(lines)
@@ -1658,55 +1716,77 @@ class S4QueryEngine:
         self.ensure_autosave()
         return result.to_display_string()
 
-    def get_agent_choices(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        runtime = self.agent.agent_runtime
-        if runtime is None:
-            return []
-        handles = runtime.list_handles(limit=limit)
-        return [
-            {
-                "agent_id": handle.agent_id,
-                "status": handle.status,
-                "name": handle.name,
-                "task_id": getattr(getattr(handle, "execution_context", None), "current_task_id", None),
-                "output_file": handle.output_file,
-            }
-            for handle in handles
-        ]
-
-    def get_task_choices(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        for task in self.bundle.task_service.list_tasks(limit=limit):
-            seen_ids.add(task.task_id)
-            result.append(
+    def get_agent_choices(self, *, limit: int = 20, force: bool = False) -> list[dict[str, Any]]:
+        def _produce() -> list[dict[str, Any]]:
+            runtime = self.agent.agent_runtime
+            if runtime is None:
+                return []
+            handles = runtime.list_handles(limit=limit)
+            return [
                 {
-                    "task_id": task.task_id,
-                    "status": task.status.value,
-                    "title": task.title,
-                    "kind": "structured",
+                    "agent_id": handle.agent_id,
+                    "status": handle.status,
+                    "name": handle.name,
+                    "task_id": getattr(getattr(handle, "execution_context", None), "current_task_id", None),
+                    "output_file": handle.output_file,
                 }
-            )
-        for snapshot in self._get_background_task_snapshots(limit=limit):
-            task_id = str(snapshot.get("task_id") or "")
-            if not task_id or task_id in seen_ids:
-                continue
-            result.append(
-                {
-                    "task_id": task_id,
-                    "status": str(snapshot.get("status") or ""),
-                    "title": str(snapshot.get("command") or snapshot.get("cwd") or task_id),
-                    "kind": "background",
-                }
-            )
-        return result
+                for handle in handles
+            ]
 
-    def has_live_runtime_activity(self) -> bool:
+        return self._get_cached_runtime_value(
+            f"agents:{int(limit)}",
+            max_age=0.35,
+            force=force,
+            producer=_produce,
+        )
+
+    def get_task_choices(self, *, limit: int = 20, force: bool = False) -> list[dict[str, Any]]:
+        def _produce() -> list[dict[str, Any]]:
+            result: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            for task in self.bundle.task_service.list_tasks(limit=limit):
+                seen_ids.add(task.task_id)
+                result.append(
+                    {
+                        "task_id": task.task_id,
+                        "status": task.status.value,
+                        "title": task.title,
+                        "kind": "structured",
+                    }
+                )
+            for snapshot in self._get_background_task_snapshots(limit=limit, force=force):
+                task_id = str(snapshot.get("task_id") or "")
+                if not task_id or task_id in seen_ids:
+                    continue
+                result.append(
+                    {
+                        "task_id": task_id,
+                        "status": str(snapshot.get("status") or ""),
+                        "title": str(snapshot.get("command") or snapshot.get("cwd") or task_id),
+                        "kind": "background",
+                    }
+                )
+            return result
+
+        return self._get_cached_runtime_value(
+            f"tasks:{int(limit)}",
+            max_age=0.35,
+            force=force,
+            producer=_produce,
+        )
+
+    def has_live_runtime_activity(self, *, force: bool = False) -> bool:
         live_task_statuses = {"open", "in_progress", "blocked", "running"}
         live_agent_statuses = {"running", "queued", "waiting", "busy"}
-        if any(str(item.get("status") or "").lower() in live_agent_statuses for item in self.get_agent_choices(limit=100)):
+        if any(
+            str(item.get("status") or "").lower() in live_agent_statuses
+            for item in self.get_agent_choices(limit=100, force=force)
+        ):
             return True
-        if any(str(item.get("status") or "").lower() in live_task_statuses for item in self.get_task_choices(limit=100)):
+        if any(
+            str(item.get("status") or "").lower() in live_task_statuses
+            for item in self.get_task_choices(limit=100, force=force)
+        ):
             return True
         return False
 

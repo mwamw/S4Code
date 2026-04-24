@@ -1,0 +1,13 @@
+permission_mode: accept_edits
+permission_rules: []
+permission_history: []
+enable_codeintel: true
+enable_mcp: true
+enable_worktree: true
+git_binary: git
+shell: bash
+command_timeout_ms: 120000
+max_background_tasks: 4
+session_auto_save: true
+default_review_depth: full
+enable_verifier: true

@@ -117,7 +117,7 @@ class _LifecycleAgent(_DummyAgent):
             "used_tokens": len(self.history),
             "remaining_tokens": 1000,
             "max_tokens": 1000,
-            "compaction": {},
+            "last_history_compaction": {},
         }
 
     def compact_history(self, max_tokens: int | None = None) -> bool:
@@ -152,6 +152,39 @@ class _LifecycleAgent(_DummyAgent):
 
     def get_execution_mode(self):
         return SimpleNamespace(value="execute")
+
+
+def test_query_engine_compact_history_uses_last_history_compaction_payload() -> None:
+    class _CompactionAgent:
+        def __init__(self) -> None:
+            self.calls: list[int | None] = []
+
+        def compact_history(self, max_tokens: int | None = None) -> bool:
+            self.calls.append(max_tokens)
+            return True
+
+        def get_context_usage(self) -> dict[str, object]:
+            return {
+                "last_history_compaction": {
+                    "was_compacted": True,
+                    "compaction_possible": True,
+                    "tokens_before": 25000,
+                    "tokens_after": 9000,
+                    "budget": 24000,
+                }
+            }
+
+    autosaves: list[bool] = []
+    agent = _CompactionAgent()
+    engine = object.__new__(query_engine.S4QueryEngine)
+    engine.bundle = SimpleNamespace(agent=agent)
+    engine.ensure_autosave = lambda: autosaves.append(True)  # type: ignore[method-assign]
+
+    result = query_engine.S4QueryEngine.compact_history(engine, max_tokens=24000)
+
+    assert result == "Conversation compacted.\nbefore=25000 after=9000 budget=24000"
+    assert agent.calls == [24000]
+    assert autosaves == [True]
 
 
 class _FakeSessionManager:
@@ -280,6 +313,59 @@ class _FakeMCPManager:
     def close(self) -> dict[str, object]:
         self.close_calls += 1
         return {"status": "closed"}
+
+
+class _CountingAgentRuntime:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def list_handles(self, limit: int = 20) -> list[object]:
+        self.calls += 1
+        return [
+            SimpleNamespace(
+                agent_id="agent-1",
+                status="running",
+                name="worker",
+                execution_context=SimpleNamespace(current_task_id="task-1"),
+                output_file="out.log",
+            )
+        ][:limit]
+
+
+class _CountingTaskService:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def list_tasks(self, limit: int = 20) -> list[object]:
+        self.calls += 1
+        return [
+            SimpleNamespace(
+                task_id="task-1",
+                status=SimpleNamespace(value="running"),
+                title="Run tests",
+            )
+        ][:limit]
+
+
+class _CountingProcessManager:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def list_tasks(self) -> list[object]:
+        self.calls += 1
+        return [
+            SimpleNamespace(
+                task_id="bg-1",
+                status="running",
+                cwd="/tmp",
+                command="pytest -q",
+                return_code=None,
+                started_at=10.0,
+                finished_at=None,
+                stdout="collecting",
+                stderr="",
+            )
+        ]
 
 
 def _make_project(path: Path) -> ProjectContext:
@@ -543,6 +629,83 @@ def test_query_engine_turn_skill_queue_is_ephemeral(tmp_path: Path, monkeypatch)
     assert "### reviewer" in agent.invocations[-1]
     assert agent.skill_manager.has_skill("reviewer") is False
     assert engine.clear_turn_skills() == "No queued turn skills."
+
+
+def test_query_engine_runtime_queries_are_cached_for_short_polling_windows(tmp_path: Path, monkeypatch) -> None:
+    paths = _paths(tmp_path)
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+
+    session_manager = _FakeSessionManager(record=None)
+    agent = _LifecycleAgent()
+    runtime = _CountingAgentRuntime()
+    task_service = _CountingTaskService()
+    process_manager = _CountingProcessManager()
+    agent.agent_runtime = runtime
+
+    current_time = 100.0
+
+    monkeypatch.setattr(query_engine, "get_s4_paths", lambda: paths)
+    monkeypatch.setattr(query_engine, "S4SessionManager", lambda raw_paths: session_manager)
+    monkeypatch.setattr(
+        query_engine.ProjectContext,
+        "detect",
+        classmethod(lambda cls, cwd=None, git_binary="git": _make_project(Path(cwd or project_root))),
+    )
+    monkeypatch.setattr(query_engine, "resolve_settings", lambda *args, **kwargs: _settings())
+    monkeypatch.setattr(query_engine.time, "monotonic", lambda: current_time)
+    monkeypatch.setattr(
+        query_engine,
+        "build_agent_bundle",
+        lambda **kwargs: SimpleNamespace(
+            agent=agent,
+            registry=SimpleNamespace(
+                get_tool_names=lambda: ["Bash"],
+                list_tool_specs=lambda: [],
+                list_runtime_surfaces=lambda surface: {},
+                get_tool=lambda name: (
+                    SimpleNamespace(process_manager=process_manager)
+                    if name == "Bash"
+                    else None
+                ),
+            ),
+            task_service=task_service,
+            context_manager=None,
+            runtime_notice_hook=None,
+            startup_issues=[],
+            restore_report=None,
+            skill_registry=_FakeSkillRegistry([], {}),
+            skill_sources=(),
+        ),
+    )
+
+    engine = query_engine.S4QueryEngine(cwd=project_root)
+
+    assert engine.get_agent_choices(limit=5) == engine.get_agent_choices(limit=5)
+    assert runtime.calls == 1
+
+    first_tasks = engine.get_task_choices(limit=5)
+    second_tasks = engine.get_task_choices(limit=5)
+    assert first_tasks == second_tasks
+    assert task_service.calls == 1
+    assert process_manager.calls == 1
+
+    assert engine.has_live_runtime_activity() is True
+    assert engine.has_live_runtime_activity() is True
+    assert runtime.calls == 2
+    assert task_service.calls == 1
+
+    current_time = 100.5
+    engine.get_agent_choices(limit=5)
+    engine.get_task_choices(limit=5)
+    assert runtime.calls == 3
+    assert task_service.calls == 2
+    assert process_manager.calls == 2
+
+    engine.format_sidebar(force=True)
+    assert runtime.calls == 4
+    assert task_service.calls == 3
+    assert process_manager.calls == 4
 
 
 def test_query_engine_permission_rules_are_session_persisted(tmp_path: Path, monkeypatch) -> None:

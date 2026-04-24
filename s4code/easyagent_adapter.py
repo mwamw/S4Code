@@ -18,7 +18,7 @@ from core.guardrails import build_default_hook_manager
 from core.llm import EasyLLM
 from core.permissions import PermissionContext, PermissionMode, PermissionRule
 from db import SessionStore
-from mcp import MCPHub
+from Emcp import MCPHub
 from runtime import ExecutionContext
 from task import SQLiteTaskStore, TaskService
 from Tool import ToolRegistry
@@ -36,6 +36,7 @@ from Tool.builtin import (
     register_shell_tools,
     register_todo_write_tool,
     register_web_fetch_tool,
+    register_worktree_tools,
 )
 from Tool.builtin.mcp_tool import MCPToolManager
 from skill import MetaSkill, SkillManager, SkillRegistry
@@ -43,22 +44,7 @@ from .config import S4Settings
 from .paths import S4Paths, get_project_skills_paths, get_s4_repo_skills_path
 from .project import ProjectContext
 from .runtime_hooks import S4RuntimeNoticeHook
-
-
-S4_AGENT_SYSTEM_PROMPT = """You are S4Code, a serious code agent running inside a local CLI.
-
-Operating rules:
-- Treat the repository as the source of truth. Inspect before changing anything.
-- Prefer file, search, code-intel, task, and runtime tools over unsupported assumptions.
-- For non-trivial work, keep a structured task list and update it as work progresses.
-- When the user asks for review, prioritize findings: bugs, regressions, risks, and missing tests.
-- When editing code, keep changes scoped, coherent, and production-grade.
-- Use subagents only for bounded parallel work with clear ownership.
-- If tool results include IDs, output files, task IDs, or runtime handles, use those structured values instead of inventing your own labels.
-- Respect the current permission mode. In plan mode, produce plans; in execute mode, do the work.
-- When code intelligence is available, prefer symbol-aware inspection over blind file scanning.
-- Be concise, but do not omit concrete technical details needed to complete the task.
-"""
+from .system_prompt import S4PromptComposer, build_s4_system_prompt
 
 
 @dataclass(slots=True)
@@ -202,6 +188,12 @@ def _register_base_tools(
     register_ask_user_question_tool(registry)
     register_enter_plan_mode_tool(registry)
     register_exit_plan_mode_tool(registry)
+    _register_worktree_tools_if_enabled(
+        registry,
+        project=project,
+        settings=settings,
+        startup_issues=startup_issues,
+    )
     if codeintel_manager is not None:
         register_codeintel_tools(
             registry,
@@ -215,6 +207,32 @@ def _register_base_tools(
             settings=settings,
             startup_issues=startup_issues,
         )
+
+
+def _register_worktree_tools_if_enabled(
+    registry: ToolRegistry,
+    *,
+    project: ProjectContext,
+    settings: S4Settings,
+    startup_issues: list[str],
+) -> None:
+    if not settings.product.enable_worktree or not project.is_git_repo:
+        return
+    try:
+        from Tool.runtime import WorktreeManager
+
+        repo_root = WorktreeManager.detect_repo_root(
+            str(project.project_root),
+            git_binary=settings.product.git_binary,
+        )
+        manager = WorktreeManager(
+            repo_root=repo_root,
+            git_binary=settings.product.git_binary,
+            original_cwd=str(project.project_root),
+        )
+        register_worktree_tools(registry, worktree_manager=manager)
+    except Exception as exc:
+        startup_issues.append(f"Worktree tool initialization failed: {exc}")
 
 
 def _register_mcp_servers(
@@ -349,6 +367,26 @@ def _preregister_restore_skills(
             startup_issues.append(f"Skill preregistration failed for '{skill_name}': {exc}")
 
 
+def _preregister_meta_skill(
+    *,
+    registry: ToolRegistry,
+    skill_registry: SkillRegistry,
+    skill_manager: SkillManager,
+    startup_issues: list[str],
+) -> None:
+    if skill_manager.has_skill("meta_skill"):
+        return
+    try:
+        meta_skill = MetaSkill(skill_registry, skill_manager)
+        skill_manager.register(meta_skill, auto_activate=False)
+        for tool in meta_skill.get_tools():
+            if registry.has_tool(tool.name):
+                continue
+            registry.register_tool(tool, visibility="resident")
+    except Exception as exc:
+        startup_issues.append(f"Meta skill preregistration failed: {exc}")
+
+
 def _attach_meta_skill(
     *,
     agent: BasicAgent,
@@ -356,6 +394,20 @@ def _attach_meta_skill(
     startup_issues: list[str],
 ) -> None:
     if agent.skill_manager.has_skill("meta_skill"):
+        if not agent.skill_manager.is_active("meta_skill"):
+            try:
+                skill = agent.skill_manager.get_skill("meta_skill")
+                tool_names = [tool.name for tool in skill.get_tools()]
+                tool_registry = getattr(agent, "tool_registry", None)
+                if tool_registry is not None and all(tool_registry.has_tool(name) for name in tool_names):
+                    skill._is_active = True
+                    agent.skill_manager._active_skills["meta_skill"] = skill
+                    agent.skill_manager._skill_tool_names["meta_skill"] = list(tool_names)
+                    agent.skill_manager._skill_source_names.setdefault("meta_skill", [])
+                else:
+                    agent.skill_manager.activate("meta_skill", tool_visibility="resident")
+            except Exception as exc:
+                startup_issues.append(f"Meta skill activation failed: {exc}")
         return
     try:
         agent.with_skill(MetaSkill(registry, agent.skill_manager))
@@ -423,6 +475,7 @@ def build_agent_bundle(
     runtime_notice_hook = S4RuntimeNoticeHook()
     hook_manager.add_hook(runtime_notice_hook)
     context_manager = _build_context_manager(settings, llm)
+    system_prompt = build_s4_system_prompt(paths=paths, project=project)
     codeintel_manager: Optional[CodeIntelManager] = None
     skill_registry, skill_sources = _discover_skill_registry(
         paths=paths,
@@ -431,6 +484,12 @@ def build_agent_bundle(
     )
     skill_manager = SkillManager()
     skill_manager.bind_registry(skill_registry)
+    _preregister_meta_skill(
+        registry=registry,
+        skill_registry=skill_registry,
+        skill_manager=skill_manager,
+        startup_issues=startup_issues,
+    )
     restore_snapshot = _load_restore_snapshot(session_store, restore_session_id)
     if restore_snapshot:
         _preregister_restore_skills(
@@ -468,11 +527,13 @@ def build_agent_bundle(
             task_service=task_service,
             skill_manager=skill_manager,
         )
+        agent.system_prompt = system_prompt
+        agent.prompt_composer = S4PromptComposer(paths=paths, project=project)
     else:
         agent = BasicAgent(
             name="S4Code",
             llm=llm,
-            system_prompt=S4_AGENT_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             enable_tool=True,
             tool_registry=registry,
             config=config,
@@ -489,6 +550,7 @@ def build_agent_bundle(
                 execution_mode="execute",
             ),
             verbose_thinking=settings.ui.show_thinking,
+            prompt_composer=S4PromptComposer(paths=paths, project=project),
             reasoning={
                 key: value
                 for key, value in {

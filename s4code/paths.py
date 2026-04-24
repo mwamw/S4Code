@@ -71,6 +71,11 @@ def get_project_config_path(project_root: str | Path) -> Path:
     return root / ".s4code" / "config.yaml"
 
 
+def get_project_config_dir(project_root: str | Path) -> Path:
+    root = Path(project_root).expanduser().resolve()
+    return root / ".s4code"
+
+
 def get_project_skills_path(project_root: str | Path) -> Path:
     root = Path(project_root).expanduser().resolve()
     return root / ".s4code" / "skills"

@@ -45,6 +45,30 @@ def test_transcript_state_keeps_round_order() -> None:
     assert state.cards[4].body.startswith("Completed in ")
 
 
+def test_transcript_state_tracks_dirty_cards_and_index_lookups() -> None:
+    state = S4TranscriptState()
+    system = state.append_card("system", "System", "Ready")
+    user = state.append_card("user", "You", "Fix the bug")
+
+    assert state.find_card(system.card_id) is system
+    assert state.find_card(user.card_id) is user
+    assert state.consume_dirty_card_ids() == {system.card_id, user.card_id}
+    assert state.consume_dirty_card_ids() == set()
+
+    state.consume_event({"type": "round_start", "round": 1})
+    round_card = _find_card(state, "round", "Cycle 1")
+    assert state.find_card(round_card.card_id) is round_card
+    assert state.consume_dirty_card_ids() == {round_card.card_id}
+
+    state.consume_event({"type": "text_delta", "delta": "Working..."})
+    assistant = _find_card(state, "assistant", "Model Response")
+    assert state.consume_dirty_card_ids() == {assistant.card_id}
+
+    state.clear()
+    assert state.find_card(system.card_id) is None
+    assert state.consume_dirty_card_ids() == set()
+
+
 def test_transcript_state_updates_round_elapsed_until_completion() -> None:
     current_time = 100.0
 
@@ -228,10 +252,84 @@ def test_transcript_state_tracks_compaction_stage() -> None:
     assert state.cards[0].title == "Context Compaction"
     assert state.cards[0].status == "running"
 
-    state.consume_event({"type": "compaction_result", "content": "History compaction finished: 100 -> 40."})
+    state.consume_event(
+        {
+            "type": "compaction_result",
+            "content": "History compaction finished: 100 -> 40.",
+            "compaction": {
+                "was_compacted": True,
+                "tokens_before": 100,
+                "tokens_after": 40,
+                "budget": 24000,
+            },
+        }
+    )
     assert len(state.cards) == 1
     assert state.cards[0].status == "done"
     assert "100 -> 40" in state.cards[0].body
+
+
+def test_transcript_state_hides_noop_compaction_card() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "compaction_start", "content": "Compacting history..."})
+
+    state.consume_event(
+        {
+            "type": "compaction_result",
+            "content": "History compaction not needed.",
+            "compaction": {
+                "was_compacted": False,
+                "compaction_possible": False,
+                "tokens_before": 1200,
+                "tokens_after": 1200,
+                "budget": 24000,
+            },
+        }
+    )
+
+    assert state.cards == []
+
+
+def test_transcript_state_clears_streaming_status_on_round_finalize() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "round_start", "round": 1})
+    state.consume_event({"type": "thinking_delta", "delta": "inspect"})
+    state.consume_event({"type": "text_delta", "delta": "partial reply"})
+
+    state.consume_event({"type": "round_start", "round": 2})
+
+    thinking_cards = [card for card in state.cards if card.kind == "thinking"]
+    assistant_cards = [card for card in state.cards if card.kind == "assistant"]
+    assert len(thinking_cards) == 1
+    assert len(assistant_cards) == 1
+    assert thinking_cards[0].status is None
+    assert assistant_cards[0].status is None
+
+
+def test_transcript_state_compaction_before_final_does_not_create_extra_response_card() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "round_start", "round": 1})
+    state.consume_event({"type": "text_delta", "delta": "**partial"})
+    state.consume_event({"type": "compaction_start", "content": "Compacting history..."})
+    state.consume_event(
+        {
+            "type": "compaction_result",
+            "content": "History compaction finished: 300 -> 120.",
+            "compaction": {
+                "was_compacted": True,
+                "tokens_before": 300,
+                "tokens_after": 120,
+                "budget": 24000,
+            },
+        }
+    )
+    state.consume_event({"type": "final", "content": "**partial**"})
+
+    round_cards = [card for card in state.cards if card.kind == "round"]
+    assistant_cards = [card for card in state.cards if card.kind == "assistant"]
+    assert len(round_cards) == 1
+    assert len(assistant_cards) == 1
+    assert assistant_cards[0].body == "**partial**"
 
 
 def test_transcript_state_formats_pending_interaction_and_resolution() -> None:

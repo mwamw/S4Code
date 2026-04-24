@@ -31,6 +31,9 @@ class _RoundState:
 class S4TranscriptState:
     def __init__(self, *, clock: Optional[Callable[[], float]] = None) -> None:
         self.cards: list[TranscriptCard] = []
+        self._card_index: dict[str, TranscriptCard] = {}
+        self._round_card_ids: dict[int, str] = {}
+        self._dirty_card_ids: set[str] = set()
         self._next_card_id = 0
         self._current_round: Optional[_RoundState] = None
         self._tool_card_ids: dict[str, str] = {}
@@ -39,13 +42,16 @@ class S4TranscriptState:
         self._pending_checkpoints: list[dict[str, Any]] = []
         self._clock = clock or time.monotonic
 
-    @staticmethod
-    def _touch(card: Optional[TranscriptCard]) -> None:
+    def _touch(self, card: Optional[TranscriptCard]) -> None:
         if card is not None:
             card.revision += 1
+            self._dirty_card_ids.add(card.card_id)
 
     def clear(self) -> None:
         self.cards.clear()
+        self._card_index.clear()
+        self._round_card_ids.clear()
+        self._dirty_card_ids.clear()
         self._tool_card_ids.clear()
         self._current_round = None
         self._compaction_card_id = None
@@ -71,14 +77,38 @@ class S4TranscriptState:
             metadata=dict(metadata or {}),
         )
         self.cards.append(card)
+        self._card_index[card.card_id] = card
+        round_number = metadata.get("round") if isinstance(metadata, dict) else None
+        if kind == "round" and isinstance(round_number, int):
+            self._round_card_ids[round_number] = card.card_id
+        self._dirty_card_ids.add(card.card_id)
         self._attach_pending_checkpoints(card)
         return card
 
     def find_card(self, card_id: str) -> Optional[TranscriptCard]:
-        for card in self.cards:
-            if card.card_id == card_id:
-                return card
-        return None
+        return self._card_index.get(card_id)
+
+    def _remove_card(self, card_id: str) -> None:
+        card = self._card_index.pop(card_id, None)
+        if card is None:
+            return
+        self.cards = [item for item in self.cards if item.card_id != card_id]
+        self._dirty_card_ids.discard(card_id)
+        if card.kind == "round":
+            round_number = card.metadata.get("round")
+            if isinstance(round_number, int):
+                self._round_card_ids.pop(round_number, None)
+        stale_tool_ids = [tool_id for tool_id, value in self._tool_card_ids.items() if value == card_id]
+        for tool_id in stale_tool_ids:
+            self._tool_card_ids.pop(tool_id, None)
+
+    def consume_dirty_card_ids(self) -> set[str]:
+        dirty = set(self._dirty_card_ids)
+        self._dirty_card_ids.clear()
+        return dirty
+
+    def mark_all_cards_dirty(self) -> None:
+        self._dirty_card_ids.update(card.card_id for card in self.cards)
 
     def _find_tool_card(self, tool_id: str) -> Optional[TranscriptCard]:
         card_id = self._tool_card_ids.get(tool_id)
@@ -112,10 +142,10 @@ class S4TranscriptState:
         }
 
     def _find_round_card_by_number(self, number: int) -> Optional[TranscriptCard]:
-        for card in self.cards:
-            if card.kind == "round" and int(card.metadata.get("round") or 0) == int(number):
-                return card
-        return None
+        card_id = self._round_card_ids.get(int(number))
+        if card_id is None:
+            return None
+        return self.find_card(card_id)
 
     def _round_metrics_for_card(self, card: TranscriptCard) -> dict[str, Any]:
         metrics = card.metadata.get("metrics")
@@ -338,7 +368,6 @@ class S4TranscriptState:
                 self._add_checkpoint_to_card(target, annotation)
             return
         if event_type == "compaction_start":
-            self._finalize_current_round()
             card = self.append_card(
                 "warning",
                 "Context Compaction",
@@ -348,7 +377,13 @@ class S4TranscriptState:
             self._compaction_card_id = card.card_id
             return
         if event_type == "compaction_result":
+            compaction = dict(event.get("compaction") or {})
             existing = self.find_card(self._compaction_card_id) if self._compaction_card_id else None
+            if not bool(compaction.get("was_compacted", False)):
+                if existing is not None:
+                    self._remove_card(existing.card_id)
+                self._compaction_card_id = None
+                return
             body = str(event.get("content") or "History compaction finished.")
             if existing is None:
                 self.append_card("warning", "Context Compaction", body, status="done")
@@ -822,6 +857,15 @@ class S4TranscriptState:
                 }
             )
             self._touch(card)
+        for card_id in (round_state.thinking_card_id, round_state.content_card_id):
+            if not card_id:
+                continue
+            related = self.find_card(card_id)
+            if related is None:
+                continue
+            if related.status is not None:
+                related.status = None
+                self._touch(related)
         self._current_round = None
 
     def _summarize_scalar(self, value: Any, *, max_chars: int) -> str:

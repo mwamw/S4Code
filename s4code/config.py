@@ -9,7 +9,12 @@ from typing import Any, Optional
 import yaml
 from pydantic import BaseModel, Field
 
-from .paths import S4Paths, get_project_config_path, get_project_mcp_config_path
+from .paths import (
+    S4Paths,
+    get_project_config_dir,
+    get_project_config_path,
+    get_project_mcp_config_path,
+)
 
 
 class LLMSettings(BaseModel):
@@ -97,6 +102,13 @@ _LLM_OPTIONAL_KEYS = (
     "reasoning_summary",
 )
 
+_SPLIT_SECTION_FILES = {
+    "models.yaml": "models",
+    "context.yaml": "context",
+    "product.yaml": "product",
+    "ui.yaml": "ui",
+}
+
 
 def _yaml_safe_load(text: str) -> dict[str, Any]:
     payload = yaml.safe_load(text)
@@ -131,6 +143,54 @@ def _load_legacy_json(path: Path) -> dict[str, Any]:
     if not legacy_path.exists():
         return {}
     return _yaml_safe_load(legacy_path.read_text(encoding="utf-8"))
+
+
+def _normalize_split_section_payload(
+    raw: dict[str, Any],
+    *,
+    section_name: str,
+    source: Path,
+) -> dict[str, Any]:
+    payload = dict(raw or {})
+    if not payload:
+        return {}
+    if section_name == "models":
+        normalized = {
+            key: value
+            for key, value in payload.items()
+            if key in {"active_model_profile", "model_profiles", "llm"}
+        }
+        if not normalized:
+            raise ValueError(
+                f"Split config `{source.name}` 必须包含 active_model_profile、model_profiles 或 llm。"
+            )
+        return normalized
+
+    if section_name in payload:
+        value = payload.get(section_name)
+        if value in (None, ""):
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"Split config `{source.name}` 中的 `{section_name}` 必须是对象。")
+        return {section_name: dict(value)}
+
+    return {section_name: payload}
+
+
+def _load_split_yaml_dir(base_dir: Path) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for filename, section_name in _SPLIT_SECTION_FILES.items():
+        path = base_dir / filename
+        raw = _load_yaml(path)
+        if not raw:
+            continue
+        normalized = _normalize_split_section_payload(
+            raw,
+            section_name=section_name,
+            source=path,
+        )
+        payload = _deep_merge(payload, normalized)
+    return payload
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -259,17 +319,20 @@ def resolve_settings(
 ) -> S4Settings:
     global_legacy = _load_legacy_json(paths.global_config_path)
     global_yaml = _load_yaml(paths.global_config_path)
+    global_split_yaml = _load_split_yaml_dir(paths.config_dir)
     global_mcp = _normalize_mcp_config_payload(
         _load_json_object((paths.global_mcp_config_path or (paths.config_dir / "mcp.json")).resolve()),
         source=(paths.global_mcp_config_path or (paths.config_dir / "mcp.json")).resolve(),
     )
     project_legacy: dict[str, Any] = {}
     project_yaml: dict[str, Any] = {}
+    project_split_yaml: dict[str, Any] = {}
     project_mcp: list[dict[str, Any]] = []
     if project_root is not None:
         project_config_path = get_project_config_path(project_root)
         project_legacy = _load_legacy_json(project_config_path)
         project_yaml = _load_yaml(project_config_path)
+        project_split_yaml = _load_split_yaml_dir(get_project_config_dir(project_root))
         project_mcp_path = get_project_mcp_config_path(project_root)
         project_mcp = _normalize_mcp_config_payload(
             _load_json_object(project_mcp_path),
@@ -279,8 +342,10 @@ def resolve_settings(
     payload: dict[str, Any] = _base_settings_payload()
     payload = _deep_merge(payload, global_legacy)
     payload = _deep_merge(payload, global_yaml)
+    payload = _deep_merge(payload, global_split_yaml)
     payload = _deep_merge(payload, project_legacy)
     payload = _deep_merge(payload, project_yaml)
+    payload = _deep_merge(payload, project_split_yaml)
     payload["mcp_servers"] = _merge_mcp_server_lists(
         payload.get("mcp_servers"),
         global_mcp,
