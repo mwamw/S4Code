@@ -1,6 +1,16 @@
 from s4code.transcript_state import S4TranscriptState
 
 
+def _find_card(state: S4TranscriptState, kind: str, title: str | None = None):
+    for card in state.cards:
+        if card.kind != kind:
+            continue
+        if title is not None and card.title != title:
+            continue
+        return card
+    raise AssertionError(f"card not found: kind={kind!r} title={title!r}")
+
+
 def test_transcript_state_keeps_round_order() -> None:
     state = S4TranscriptState()
 
@@ -35,6 +45,30 @@ def test_transcript_state_keeps_round_order() -> None:
     assert state.cards[4].body.startswith("Completed in ")
 
 
+def test_transcript_state_tracks_dirty_cards_and_index_lookups() -> None:
+    state = S4TranscriptState()
+    system = state.append_card("system", "System", "Ready")
+    user = state.append_card("user", "You", "Fix the bug")
+
+    assert state.find_card(system.card_id) is system
+    assert state.find_card(user.card_id) is user
+    assert state.consume_dirty_card_ids() == {system.card_id, user.card_id}
+    assert state.consume_dirty_card_ids() == set()
+
+    state.consume_event({"type": "round_start", "round": 1})
+    round_card = _find_card(state, "round", "Cycle 1")
+    assert state.find_card(round_card.card_id) is round_card
+    assert state.consume_dirty_card_ids() == {round_card.card_id}
+
+    state.consume_event({"type": "text_delta", "delta": "Working..."})
+    assistant = _find_card(state, "assistant", "Model Response")
+    assert state.consume_dirty_card_ids() == {assistant.card_id}
+
+    state.clear()
+    assert state.find_card(system.card_id) is None
+    assert state.consume_dirty_card_ids() == set()
+
+
 def test_transcript_state_updates_round_elapsed_until_completion() -> None:
     current_time = 100.0
 
@@ -64,7 +98,7 @@ def test_transcript_state_summarizes_tool_result() -> None:
     state.consume_event({"type": "tool_call", "tool_name": "Bash", "tool_id": "tool-1", "tool_args": {"command": "pytest -q"}})
     state.consume_event({"type": "tool_result", "tool_name": "Bash", "tool_id": "tool-1", "content": "tests passed\nline2\nline3"})
 
-    tool_card = state.cards[0]
+    tool_card = _find_card(state, "tool", "Tool · Bash")
     assert tool_card.status == "done"
     assert "... 2 more line(s) hidden" in tool_card.body
 
@@ -105,10 +139,111 @@ def test_transcript_state_preserves_file_diff_metadata() -> None:
         }
     )
 
-    tool_card = state.cards[0]
+    tool_card = _find_card(state, "tool", "Tool · FileEdit")
     assert tool_card.status == "done"
     assert tool_card.metadata["diff"]["relative_path"] == "src/app.py"
     assert "+print('new')" in tool_card.metadata["diff"]["unified"]
+
+
+def test_transcript_state_updates_runtime_snapshot_card_in_place() -> None:
+    state = S4TranscriptState()
+
+    state.consume_event(
+        {
+            "type": "runtime_snapshot",
+            "snapshot": {
+                "generated_at": "2026-04-23T10:00:00",
+                "session": {"session_id": "sess-1", "checkpoints": 1},
+                "worktree": {"active": None},
+                "agents": [],
+                "tasks": [],
+                "background_tasks": [
+                    {
+                        "task_id": "task-1",
+                        "status": "running",
+                        "return_code": None,
+                        "command": "pytest -q",
+                        "duration_seconds": 1.2,
+                        "stdout_tail": "collecting",
+                    }
+                ],
+                "context": {"used_tokens": 10, "remaining_tokens": 90, "max_tokens": 100},
+            },
+        }
+    )
+    state.consume_event(
+        {
+            "type": "runtime_snapshot",
+            "snapshot": {
+                "generated_at": "2026-04-23T10:00:02",
+                "session": {"session_id": "sess-1", "checkpoints": 2},
+                "worktree": {"active": {"branch": "feature", "path": "/tmp/repo"}},
+                "agents": [{"agent_id": "agent-1", "status": "running", "name": "worker"}],
+                "tasks": [],
+                "background_tasks": [],
+                "context": {"used_tokens": 20, "remaining_tokens": 80, "max_tokens": 100},
+            },
+        }
+    )
+
+    runtime_cards = [card for card in state.cards if card.kind == "runtime"]
+    assert len(runtime_cards) == 1
+    assert "2026-04-23T10:00:02" in runtime_cards[0].body
+    assert "agent-1" in runtime_cards[0].body
+    assert "checkpoints=2" in runtime_cards[0].body
+
+
+def test_transcript_state_attaches_checkpoints_to_message_cards() -> None:
+    state = S4TranscriptState()
+    user = state.append_card("user", "You", "Fix the bug")
+
+    state.consume_event(
+        {
+            "type": "checkpoint",
+            "checkpoint": {
+                "checkpoint_id": "cp-001",
+                "label": "before turn",
+                "reason": "before_prompt",
+                "history_messages": 3,
+                "created_at": "2026-04-23T10:00:00",
+            },
+        }
+    )
+
+    assert len(state.cards) == 1
+    assert user.metadata["checkpoints"][0]["checkpoint_id"] == "cp-001"
+    assert user.metadata["checkpoints"][0]["history_messages"] == 3
+
+    state.consume_event({"type": "round_start", "round": 1})
+    state.consume_event({"type": "final", "content": "Done"})
+    state.consume_event(
+        {
+            "type": "checkpoint",
+            "checkpoint": {
+                "checkpoint_id": "cp-002",
+                "label": "after turn",
+                "reason": "after_prompt",
+                "history_messages": 5,
+                "created_at": "2026-04-23T10:00:05",
+            },
+        }
+    )
+
+    assistant = _find_card(state, "assistant", "Model Response")
+    assert assistant.metadata["checkpoints"][0]["checkpoint_id"] == "cp-002"
+
+
+def test_transcript_state_marks_cancelled_round_as_interrupted() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "round_start", "round": 1})
+
+    state.consume_event({"type": "cancelled", "content": "Agent execution interrupted by Esc."})
+
+    round_card = _find_card(state, "round", "Cycle 1")
+    warning = _find_card(state, "warning", "Interrupted")
+    assert round_card.body.startswith("Interrupted in ")
+    assert warning.body == "Agent execution interrupted by Esc."
+    assert state.has_live_round() is False
 
 
 def test_transcript_state_tracks_compaction_stage() -> None:
@@ -117,10 +252,84 @@ def test_transcript_state_tracks_compaction_stage() -> None:
     assert state.cards[0].title == "Context Compaction"
     assert state.cards[0].status == "running"
 
-    state.consume_event({"type": "compaction_result", "content": "History compaction finished: 100 -> 40."})
+    state.consume_event(
+        {
+            "type": "compaction_result",
+            "content": "History compaction finished: 100 -> 40.",
+            "compaction": {
+                "was_compacted": True,
+                "tokens_before": 100,
+                "tokens_after": 40,
+                "budget": 24000,
+            },
+        }
+    )
     assert len(state.cards) == 1
     assert state.cards[0].status == "done"
     assert "100 -> 40" in state.cards[0].body
+
+
+def test_transcript_state_hides_noop_compaction_card() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "compaction_start", "content": "Compacting history..."})
+
+    state.consume_event(
+        {
+            "type": "compaction_result",
+            "content": "History compaction not needed.",
+            "compaction": {
+                "was_compacted": False,
+                "compaction_possible": False,
+                "tokens_before": 1200,
+                "tokens_after": 1200,
+                "budget": 24000,
+            },
+        }
+    )
+
+    assert state.cards == []
+
+
+def test_transcript_state_clears_streaming_status_on_round_finalize() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "round_start", "round": 1})
+    state.consume_event({"type": "thinking_delta", "delta": "inspect"})
+    state.consume_event({"type": "text_delta", "delta": "partial reply"})
+
+    state.consume_event({"type": "round_start", "round": 2})
+
+    thinking_cards = [card for card in state.cards if card.kind == "thinking"]
+    assistant_cards = [card for card in state.cards if card.kind == "assistant"]
+    assert len(thinking_cards) == 1
+    assert len(assistant_cards) == 1
+    assert thinking_cards[0].status is None
+    assert assistant_cards[0].status is None
+
+
+def test_transcript_state_compaction_before_final_does_not_create_extra_response_card() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "round_start", "round": 1})
+    state.consume_event({"type": "text_delta", "delta": "**partial"})
+    state.consume_event({"type": "compaction_start", "content": "Compacting history..."})
+    state.consume_event(
+        {
+            "type": "compaction_result",
+            "content": "History compaction finished: 300 -> 120.",
+            "compaction": {
+                "was_compacted": True,
+                "tokens_before": 300,
+                "tokens_after": 120,
+                "budget": 24000,
+            },
+        }
+    )
+    state.consume_event({"type": "final", "content": "**partial**"})
+
+    round_cards = [card for card in state.cards if card.kind == "round"]
+    assistant_cards = [card for card in state.cards if card.kind == "assistant"]
+    assert len(round_cards) == 1
+    assert len(assistant_cards) == 1
+    assert assistant_cards[0].body == "**partial**"
 
 
 def test_transcript_state_formats_pending_interaction_and_resolution() -> None:
@@ -160,3 +369,59 @@ def test_transcript_state_formats_pending_interaction_and_resolution() -> None:
         }
     )
     assert state.cards[1].title == "Interaction Resolved"
+
+
+def test_transcript_state_merges_round_metrics_while_running_and_after_completion() -> None:
+    current_time = 50.0
+
+    def _clock() -> float:
+        return current_time
+
+    state = S4TranscriptState(clock=_clock)
+    state.consume_event({"type": "round_start", "round": 1})
+    state.consume_event({"type": "tool_call", "tool_name": "FileEdit", "tool_id": "tool-1", "tool_args": {"file_path": "src/app.py"}})
+    state.consume_event(
+        {
+            "type": "tool_result",
+            "tool_name": "FileEdit",
+            "tool_id": "tool-1",
+            "content": "updated",
+            "structured_data": {
+                "diff": {
+                    "relative_path": "src/app.py",
+                    "unified": "@@ -1 +1 @@\n-old\n+new",
+                }
+            },
+        }
+    )
+    state.consume_event(
+        {
+            "type": "round_metrics",
+            "round": 1,
+            "metrics": {
+                "tool_calls": 1,
+                "llm_duration_ms": 1200,
+                "tool_duration_ms": 450,
+                "total_tokens": 321,
+                "estimated_cost_usd": 0.0123,
+                "files_changed": ["src/app.py"],
+            },
+        }
+    )
+
+    round_card = _find_card(state, "round", "Cycle 1")
+    assert "Elapsed: 0.0s" in round_card.body
+    assert "Tools 1" in round_card.body
+    assert "Model 1.2s" in round_card.body
+    assert "Tool 0.5s" in round_card.body
+    assert "Tokens 321" in round_card.body
+    assert "Files 1" in round_card.body
+    assert "Cost $0.0123" in round_card.body
+
+    current_time = 52.0
+    state.consume_event({"type": "final", "content": "done"})
+
+    round_card = _find_card(state, "round", "Cycle 1")
+    assert round_card.body.startswith("Completed in 2.0s")
+    assert "Model 1.2s" in round_card.body
+    assert "Tool 0.5s" in round_card.body

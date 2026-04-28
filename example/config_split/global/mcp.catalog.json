@@ -1,0 +1,151 @@
+{
+  "name": "s4code-curated-mcp-catalog",
+  "generated_at": "2026-04-24",
+  "notes": [
+    "Copy selected entries into ~/.config/s4code/mcp.json or <project>/.s4code/mcp.json.",
+    "All entries are disabled by default so the catalog is safe to keep as a template.",
+    "The official modelcontextprotocol reference servers are documented as educational references rather than production-ready services."
+  ],
+  "servers": [
+    {
+      "name": "filesystem",
+      "enabled": false,
+      "server_source": "npx",
+      "server_args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/ABS/PATH/TO/WORKSPACE"
+      ],
+      "tool_prefix": "fs_",
+      "include_resources": true,
+      "persist_connection": true,
+      "tags": ["official", "core", "local"],
+      "why": "Safe default for project file access when you need an external MCP filesystem surface.",
+      "source_url": "https://github.com/modelcontextprotocol/servers/blob/main/src/filesystem/README.md"
+    },
+    {
+      "name": "git",
+      "enabled": false,
+      "server_source": "uvx",
+      "server_args": [
+        "mcp-server-git",
+        "--repository",
+        "/ABS/PATH/TO/GIT/REPO"
+      ],
+      "tool_prefix": "git_",
+      "include_resources": true,
+      "persist_connection": true,
+      "tags": ["official", "core", "git"],
+      "why": "Adds Git-native operations outside S4Code builtin Git and worktree features.",
+      "source_url": "https://github.com/modelcontextprotocol/servers"
+    },
+    {
+      "name": "fetch",
+      "enabled": false,
+      "server_source": "uvx",
+      "server_args": [
+        "mcp-server-fetch"
+      ],
+      "tool_prefix": "fetch_",
+      "include_resources": true,
+      "persist_connection": true,
+      "tags": ["official", "web", "retrieval"],
+      "why": "Useful when you want MCP-hosted web fetching instead of builtin web fetch.",
+      "source_url": "https://github.com/modelcontextprotocol/servers/blob/main/src/fetch/README.md"
+    },
+    {
+      "name": "memory",
+      "enabled": false,
+      "server_source": "npx",
+      "server_args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ],
+      "tool_prefix": "memory_",
+      "include_resources": true,
+      "persist_connection": true,
+      "tags": ["official", "memory"],
+      "why": "Persistent cross-session memory graph for longer-running agent workflows.",
+      "source_url": "https://github.com/modelcontextprotocol/servers"
+    },
+    {
+      "name": "time",
+      "enabled": false,
+      "server_source": "uvx",
+      "server_args": [
+        "mcp-server-time"
+      ],
+      "tool_prefix": "time_",
+      "include_resources": false,
+      "persist_connection": true,
+      "tags": ["official", "utility"],
+      "why": "Useful for timezone conversion and explicit time calculations.",
+      "source_url": "https://github.com/modelcontextprotocol/servers"
+    },
+    {
+      "name": "sequential_thinking",
+      "enabled": false,
+      "server_source": "npx",
+      "server_args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
+      "tool_prefix": "think_",
+      "include_resources": false,
+      "persist_connection": true,
+      "tags": ["official", "reasoning"],
+      "why": "Good for forcing explicit stepwise decomposition on difficult planning or diagnosis tasks.",
+      "source_url": "https://github.com/modelcontextprotocol/servers/blob/main/src/sequentialthinking/README.md"
+    },
+    {
+      "name": "github",
+      "enabled": false,
+      "server_source": "https://api.githubcopilot.com/mcp/",
+      "transport_type": "http",
+      "tool_prefix": "github_",
+      "include_resources": true,
+      "persist_connection": true,
+      "auth": {
+        "kind": "bearer",
+        "token": "<replace-with-github-pat>"
+      },
+      "tags": ["official-vendor", "github", "remote"],
+      "why": "High-value remote MCP for repos, PRs, issues, Actions, and code security data.",
+      "source_url": "https://github.com/github/github-mcp-server"
+    },
+    {
+      "name": "browsermcp",
+      "enabled": false,
+      "server_source": "npx",
+      "server_args": [
+        "-y",
+        "@browsermcp/mcp"
+      ],
+      "tool_prefix": "browser_",
+      "include_resources": false,
+      "persist_connection": true,
+      "tags": ["community", "browser", "automation"],
+      "why": "Popular local browser automation MCP that uses your real browser profile.",
+      "requires": [
+        "Browser MCP browser extension"
+      ],
+      "source_url": "https://docs.browsermcp.io/setup-server"
+    },
+    {
+      "name": "neon",
+      "enabled": false,
+      "server_source": "https://mcp.neon.tech/mcp",
+      "transport_type": "http",
+      "tool_prefix": "neon_",
+      "include_resources": true,
+      "persist_connection": true,
+      "auth": {
+        "kind": "bearer",
+        "token": "<replace-with-neon-api-key>"
+      },
+      "tags": ["official-vendor", "database", "postgres", "remote"],
+      "why": "Strong managed Postgres option when you want database operations without relying on archived reference servers.",
+      "source_url": "https://github.com/neondatabase/mcp-server-neon"
+    }
+  ]
+}

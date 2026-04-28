@@ -25,9 +25,9 @@
 
   context:
     enabled: true
-    max_tokens: 108000
+    max_tokens: 150000
     history_compactor: llm
-    recent_turns: 6
+    recent_turns: 2
 
   product:
     permission_mode: accept_edits

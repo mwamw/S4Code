@@ -1,0 +1,17 @@
+{
+  "name": "s4",
+  "layout": {
+    "background": "transparent",
+    "text": "#e2e8f0",
+    "muted": "#94a3b8",
+    "header_text": "#e2e8f0",
+    "footer_text": "#94a3b8",
+    "transcript_border": "#38bdf8",
+    "sidebar_border": "#475569",
+    "sidebar_text": "#cbd5e1",
+    "palette_border": "#334155",
+    "input_border": "#22d3ee",
+    "input_text": "#e2e8f0",
+    "separator": "#475569"
+  }
+}

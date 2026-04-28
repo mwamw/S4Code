@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from re import S
 from typing import Any, Optional
 
 from ._easyagent_bootstrap import ensure_easyagent_environment
@@ -17,8 +16,9 @@ from context import ContextManager, LLMHistoryCompactor, RuleBasedHistoryCompact
 from core.Config import Config
 from core.guardrails import build_default_hook_manager
 from core.llm import EasyLLM
-from core.permissions import PermissionContext, PermissionMode
+from core.permissions import PermissionContext, PermissionMode, PermissionRule
 from db import SessionStore
+from Emcp import MCPHub
 from runtime import ExecutionContext
 from task import SQLiteTaskStore, TaskService
 from Tool import ToolRegistry
@@ -32,33 +32,19 @@ from Tool.builtin import (
     register_file_write_tool,
     register_filesystem_tools,
     register_notebook_edit_tool,
-    register_mcp_tools,
     register_search_tool,
     register_shell_tools,
     register_todo_write_tool,
     register_web_fetch_tool,
+    register_worktree_tools,
 )
-from skill import SkillManager, SkillRegistry
+from Tool.builtin.mcp_tool import MCPToolManager
+from skill import MetaSkill, SkillManager, SkillRegistry
 from .config import S4Settings
-from .paths import S4Paths, get_project_skills_path
+from .paths import S4Paths, get_project_skills_paths, get_s4_repo_skills_path
 from .project import ProjectContext
 from .runtime_hooks import S4RuntimeNoticeHook
-
-
-S4_AGENT_SYSTEM_PROMPT = """You are S4Code, a serious code agent running inside a local CLI.
-
-Operating rules:
-- Treat the repository as the source of truth. Inspect before changing anything.
-- Prefer file, search, code-intel, task, and runtime tools over unsupported assumptions.
-- For non-trivial work, keep a structured task list and update it as work progresses.
-- When the user asks for review, prioritize findings: bugs, regressions, risks, and missing tests.
-- When editing code, keep changes scoped, coherent, and production-grade.
-- Use subagents only for bounded parallel work with clear ownership.
-- If tool results include IDs, output files, task IDs, or runtime handles, use those structured values instead of inventing your own labels.
-- Respect the current permission mode. In plan mode, produce plans; in execute mode, do the work.
-- When code intelligence is available, prefer symbol-aware inspection over blind file scanning.
-- Be concise, but do not omit concrete technical details needed to complete the task.
-"""
+from .system_prompt import S4PromptComposer, build_s4_system_prompt
 
 
 @dataclass(slots=True)
@@ -71,11 +57,13 @@ class S4AgentBundle:
     registry: ToolRegistry
     task_service: TaskService
     session_store: SessionStore
+    skill_registry: SkillRegistry
     codeintel_manager: Optional[CodeIntelManager] = None
     context_manager: Optional[ContextManager] = None
     runtime_notice_hook: Optional[S4RuntimeNoticeHook] = None
     startup_issues: list[str] = field(default_factory=list)
     restore_report: Optional[dict[str, Any]] = None
+    skill_sources: tuple[str, ...] = ()
 
 
 def _build_llm(settings: S4Settings) -> EasyLLM:
@@ -109,6 +97,17 @@ def _build_agent_config(settings: S4Settings, project: ProjectContext) -> Config
 def _build_permission_context(settings: S4Settings) -> PermissionContext:
     context = PermissionContext()
     context.set_mode(PermissionMode(str(settings.product.permission_mode)))
+    rules_by_source: dict[str, list[PermissionRule]] = {}
+    for item in list(settings.product.permission_rules or []):
+        try:
+            payload = item.model_dump(mode="python") if hasattr(item, "model_dump") else dict(item)
+            rule = PermissionRule.model_validate(payload)
+        except Exception:
+            continue
+        source = str(rule.source or "session").strip() or "session"
+        rules_by_source.setdefault(source, []).append(rule)
+    for source, rules in rules_by_source.items():
+        context.set_source_rules(source, rules)
     return context
 
 
@@ -189,6 +188,12 @@ def _register_base_tools(
     register_ask_user_question_tool(registry)
     register_enter_plan_mode_tool(registry)
     register_exit_plan_mode_tool(registry)
+    _register_worktree_tools_if_enabled(
+        registry,
+        project=project,
+        settings=settings,
+        startup_issues=startup_issues,
+    )
     if codeintel_manager is not None:
         register_codeintel_tools(
             registry,
@@ -197,21 +202,257 @@ def _register_base_tools(
             allowed_roots=allowed_roots,
         )
     if settings.product.enable_mcp:
-        for server in settings.mcp_servers:
+        _register_mcp_servers(
+            registry,
+            settings=settings,
+            startup_issues=startup_issues,
+        )
+
+
+def _register_worktree_tools_if_enabled(
+    registry: ToolRegistry,
+    *,
+    project: ProjectContext,
+    settings: S4Settings,
+    startup_issues: list[str],
+) -> None:
+    if not settings.product.enable_worktree or not project.is_git_repo:
+        return
+    try:
+        from Tool.runtime import WorktreeManager
+
+        repo_root = WorktreeManager.detect_repo_root(
+            str(project.project_root),
+            git_binary=settings.product.git_binary,
+        )
+        manager = WorktreeManager(
+            repo_root=repo_root,
+            git_binary=settings.product.git_binary,
+            original_cwd=str(project.project_root),
+        )
+        register_worktree_tools(registry, worktree_manager=manager)
+    except Exception as exc:
+        startup_issues.append(f"Worktree tool initialization failed: {exc}")
+
+
+def _register_mcp_servers(
+    registry: ToolRegistry,
+    *,
+    settings: S4Settings,
+    startup_issues: list[str],
+) -> None:
+    enabled_servers = [server for server in settings.mcp_servers if bool(server.enabled)]
+    if not enabled_servers:
+        return
+    hub = MCPHub()
+    for server in enabled_servers:
+        manager = MCPToolManager(
+            server_source=server.server_source,
+            server_args=server.server_args,
+            transport_type=server.transport_type,
+            env=server.env,
+            tool_prefix=server.tool_prefix,
+            auto_connect=False,
+            auth_config=server.auth,
+            policy_context=server.policy,
+            max_retries=server.max_retries,
+            persist_connection=server.persist_connection,
+            include_resources=server.include_resources,
+            **dict(server.transport_kwargs or {}),
+        )
+        try:
+            manager.connect()
+        except Exception as exc:
+            startup_issues.append(f"MCP server '{server.name}' connection failed: {exc}")
+            continue
+        try:
+            manager.register_to_registry(
+                registry,
+                hub=hub,
+                server_name=server.name,
+                legacy_resource_tools=False,
+            )
+        except Exception as exc:
+            startup_issues.append(f"MCP server '{server.name}' registration failed: {exc}")
             try:
-                register_mcp_tools(
-                    registry,
-                    server_source=server.server_source,
-                    server_args=server.server_args,
-                    transport_type=server.transport_type,
-                    tool_prefix=server.tool_prefix,
-                    auto_connect=server.auto_connect,
-                    include_resources=server.include_resources,
-                    env=server.env,
-                    server_name=server.name,
-                )
+                manager.close()
+            except Exception:
+                pass
+
+
+def _connect_registered_mcp_servers(
+    registry: ToolRegistry,
+    *,
+    startup_issues: list[str],
+) -> None:
+    surfaces = registry.list_runtime_surfaces("mcp_manager")
+    for name, manager in surfaces.items():
+        try:
+            client = getattr(manager, "client", None)
+            is_connected = callable(getattr(client, "is_connected", None)) and bool(client.is_connected())
+            if is_connected:
+                continue
+            connect = getattr(manager, "connect", None)
+            if callable(connect):
+                connect()
+        except Exception as exc:
+            startup_issues.append(f"MCP server '{name}' startup connect failed: {exc}")
+
+
+def _discover_skill_registry(
+    *,
+    paths: S4Paths,
+    project: ProjectContext,
+    startup_issues: list[str],
+) -> tuple[SkillRegistry, tuple[str, ...]]:
+    registry = SkillRegistry()
+    discovered_dirs: list[str] = []
+    seen: set[str] = set()
+    candidates = (
+        get_s4_repo_skills_path(),
+        paths.skills_dir,
+        *get_project_skills_paths(project.project_root),
+    )
+    for candidate in candidates:
+        resolved = Path(candidate).expanduser().resolve()
+        marker = str(resolved)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if not resolved.exists() or not resolved.is_dir():
+            continue
+        discovered_dirs.append(marker)
+        try:
+            registry.discover_from_directory(marker)
+        except Exception as exc:
+            startup_issues.append(f"Skill discovery failed for '{marker}': {exc}")
+    return registry, tuple(discovered_dirs)
+
+
+def _load_restore_snapshot(
+    session_store: SessionStore,
+    restore_session_id: Optional[str],
+) -> dict[str, Any]:
+    if not restore_session_id:
+        return {}
+    try:
+        record = session_store.get_session(restore_session_id)
+    except Exception:
+        return {}
+    if not isinstance(record, dict):
+        return {}
+    snapshot = record.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return {}
+    return dict(snapshot)
+
+
+def _preregister_restore_skills(
+    *,
+    manager: SkillManager,
+    registry: SkillRegistry,
+    snapshot: dict[str, Any],
+    startup_issues: list[str],
+) -> None:
+    for name in list(snapshot.get("registered_skills") or []):
+        skill_name = str(name or "").strip()
+        if not skill_name or skill_name == "meta_skill" or manager.has_skill(skill_name):
+            continue
+        if not registry.has(skill_name):
+            startup_issues.append(f"Saved session skill unavailable: {skill_name}")
+            continue
+        try:
+            manager.register(registry.create(skill_name), auto_activate=False)
+        except Exception as exc:
+            startup_issues.append(f"Skill preregistration failed for '{skill_name}': {exc}")
+
+
+def _preregister_meta_skill(
+    *,
+    registry: ToolRegistry,
+    skill_registry: SkillRegistry,
+    skill_manager: SkillManager,
+    startup_issues: list[str],
+) -> None:
+    if skill_manager.has_skill("meta_skill"):
+        return
+    try:
+        meta_skill = MetaSkill(skill_registry, skill_manager)
+        skill_manager.register(meta_skill, auto_activate=False)
+        for tool in meta_skill.get_tools():
+            if registry.has_tool(tool.name):
+                continue
+            registry.register_tool(tool, visibility="resident")
+    except Exception as exc:
+        startup_issues.append(f"Meta skill preregistration failed: {exc}")
+
+
+def _attach_meta_skill(
+    *,
+    agent: BasicAgent,
+    registry: SkillRegistry,
+    startup_issues: list[str],
+) -> None:
+    if agent.skill_manager.has_skill("meta_skill"):
+        if not agent.skill_manager.is_active("meta_skill"):
+            try:
+                skill = agent.skill_manager.get_skill("meta_skill")
+                tool_names = [tool.name for tool in skill.get_tools()]
+                tool_registry = getattr(agent, "tool_registry", None)
+                if tool_registry is not None and all(tool_registry.has_tool(name) for name in tool_names):
+                    skill._is_active = True
+                    agent.skill_manager._active_skills["meta_skill"] = skill
+                    agent.skill_manager._skill_tool_names["meta_skill"] = list(tool_names)
+                    agent.skill_manager._skill_source_names.setdefault("meta_skill", [])
+                else:
+                    agent.skill_manager.activate("meta_skill", tool_visibility="resident")
             except Exception as exc:
-                startup_issues.append(f"MCP server '{server.name}' registration failed: {exc}")
+                startup_issues.append(f"Meta skill activation failed: {exc}")
+        return
+    try:
+        agent.with_skill(MetaSkill(registry, agent.skill_manager))
+    except Exception as exc:
+        startup_issues.append(f"Meta skill initialization failed: {exc}")
+
+
+def _restore_active_skills(
+    *,
+    agent: BasicAgent,
+    snapshot: dict[str, Any],
+    startup_issues: list[str],
+) -> None:
+    for name in list(snapshot.get("active_skills") or []):
+        skill_name = str(name or "").strip()
+        if not skill_name or skill_name == "meta_skill":
+            continue
+        if not agent.skill_manager.has_skill(skill_name):
+            startup_issues.append(f"Active session skill could not be restored: {skill_name}")
+            continue
+        if agent.skill_manager.is_active(skill_name):
+            continue
+        try:
+            skill = agent.skill_manager.get_skill(skill_name)
+            visibility = "runtime" if skill.get_exposure_mode() == "on_demand" else "resident"
+            agent.skill_manager.activate(skill_name, tool_visibility=visibility)
+        except Exception as exc:
+            startup_issues.append(f"Skill activation failed for '{skill_name}': {exc}")
+
+
+def _register_resident_skills(
+    *,
+    agent: BasicAgent,
+    registry: SkillRegistry,
+    startup_issues: list[str],
+) -> None:
+    for manifest in registry.list_manifests():
+        if manifest.name == "meta_skill" or manifest.exposure_mode != "resident":
+            continue
+        if agent.skill_manager.has_skill(manifest.name):
+            continue
+        try:
+            agent.with_skill(registry.create(manifest.name))
+        except Exception as exc:
+            startup_issues.append(f"Resident skill load failed for '{manifest.name}': {exc}")
 
 
 def build_agent_bundle(
@@ -234,13 +475,29 @@ def build_agent_bundle(
     runtime_notice_hook = S4RuntimeNoticeHook()
     hook_manager.add_hook(runtime_notice_hook)
     context_manager = _build_context_manager(settings, llm)
+    system_prompt = build_s4_system_prompt(paths=paths, project=project)
     codeintel_manager: Optional[CodeIntelManager] = None
-    skill_register:SkillRegistry = SkillRegistry()
-    skill_register.discover_from_directory(str(paths.skills_dir))
-
-    local_skill_dir = get_project_skills_path(project.project_root)
-    if local_skill_dir.exists() and local_skill_dir.is_dir():
-        skill_register.discover_from_directory(str(local_skill_dir))
+    skill_registry, skill_sources = _discover_skill_registry(
+        paths=paths,
+        project=project,
+        startup_issues=startup_issues,
+    )
+    skill_manager = SkillManager()
+    skill_manager.bind_registry(skill_registry)
+    _preregister_meta_skill(
+        registry=registry,
+        skill_registry=skill_registry,
+        skill_manager=skill_manager,
+        startup_issues=startup_issues,
+    )
+    restore_snapshot = _load_restore_snapshot(session_store, restore_session_id)
+    if restore_snapshot:
+        _preregister_restore_skills(
+            manager=skill_manager,
+            registry=skill_registry,
+            snapshot=restore_snapshot,
+            startup_issues=startup_issues,
+        )
 
     if settings.product.enable_codeintel:
         try:
@@ -268,12 +525,15 @@ def build_agent_bundle(
             hook_manager=hook_manager,
             permission_context=permission_context,
             task_service=task_service,
+            skill_manager=skill_manager,
         )
+        agent.system_prompt = system_prompt
+        agent.prompt_composer = S4PromptComposer(paths=paths, project=project)
     else:
         agent = BasicAgent(
             name="S4Code",
             llm=llm,
-            system_prompt=S4_AGENT_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             enable_tool=True,
             tool_registry=registry,
             config=config,
@@ -282,6 +542,7 @@ def build_agent_bundle(
             permission_context=permission_context,
             hook_manager=hook_manager,
             task_service=task_service,
+            skill_manager=skill_manager,
             execution_context=ExecutionContext(
                 workspace_root=str(project.project_root),
                 allowed_roots=project.allowed_roots,
@@ -289,19 +550,45 @@ def build_agent_bundle(
                 execution_mode="execute",
             ),
             verbose_thinking=settings.ui.show_thinking,
+            prompt_composer=S4PromptComposer(paths=paths, project=project),
             reasoning={
-                "effort": settings.llm.reasoning_effort,
-                "summary": settings.llm.reasoning_summary,
+                key: value
+                for key, value in {
+                    "effort": settings.llm.reasoning_effort,
+                    "summary": settings.llm.reasoning_summary,
+                }.items()
+                if value is not None
             },
         )
-    for skill in skill_register.list_available_names():
-        agent.with_skill(skill_register.create(skill))
+
+    agent.skill_manager.bind_registry(skill_registry)
+    _attach_meta_skill(
+        agent=agent,
+        registry=skill_registry,
+        startup_issues=startup_issues,
+    )
+    if restore_snapshot:
+        _restore_active_skills(
+            agent=agent,
+            snapshot=restore_snapshot,
+            startup_issues=startup_issues,
+        )
+    else:
+        _register_resident_skills(
+            agent=agent,
+            registry=skill_registry,
+            startup_issues=startup_issues,
+        )
     if agent.agent_runtime is None:
         agent.enable_multi_agent_system(
             workspace_root=str(project.project_root),
             storage_dir=str(paths.agent_storage_dir),
             max_background_tasks=settings.product.max_background_tasks,
         )
+    _connect_registered_mcp_servers(
+        registry,
+        startup_issues=startup_issues,
+    )
     restore_report = None
     restore_report_getter = getattr(agent, "get_last_restore_report", None)
     if callable(restore_report_getter):
@@ -316,9 +603,11 @@ def build_agent_bundle(
         registry=registry,
         task_service=task_service,
         session_store=session_store,
+        skill_registry=skill_registry,
         codeintel_manager=codeintel_manager,
         context_manager=context_manager,
         runtime_notice_hook=runtime_notice_hook,
         startup_issues=startup_issues,
         restore_report=restore_report,
+        skill_sources=skill_sources,
     )

@@ -1,0 +1,4 @@
+enabled: true
+max_tokens: 24000
+history_compactor: llm
+recent_turns: 4

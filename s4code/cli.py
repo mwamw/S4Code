@@ -45,10 +45,13 @@ def main(
     if ctx.invoked_subcommand is not None:
         return
     engine = _build_engine(cwd=cwd.resolve(), session_id=resume)
-    if prompt:
-        console.print(engine.run_prompt(prompt))
-        return
-    S4TextualApp(engine).run()
+    try:
+        if prompt:
+            console.print(engine.run_prompt(prompt))
+            return
+        S4TextualApp(engine).run()
+    finally:
+        engine.close()
 
 
 @app.command("review")
@@ -57,7 +60,10 @@ def review(
     cwd: Path = typer.Option(Path("."), "--cwd", help="Working directory / repository root."),
 ) -> None:
     engine = _build_engine(cwd=cwd.resolve())
-    console.print(engine.run_prompt(engine.build_review_prompt(target)))
+    try:
+        console.print(engine.run_prompt(engine.build_review_prompt(target)))
+    finally:
+        engine.close()
 
 
 @app.command("commit")
@@ -65,7 +71,10 @@ def commit(
     cwd: Path = typer.Option(Path("."), "--cwd", help="Working directory / repository root."),
 ) -> None:
     engine = _build_engine(cwd=cwd.resolve())
-    console.print(engine.run_prompt(engine.build_commit_prompt()))
+    try:
+        console.print(engine.run_prompt(engine.build_commit_prompt()))
+    finally:
+        engine.close()
 
 
 @app.command("config")
@@ -73,7 +82,10 @@ def show_config(
     cwd: Path = typer.Option(Path("."), "--cwd", help="Working directory / repository root."),
 ) -> None:
     engine = _build_engine(cwd=cwd.resolve())
-    console.print(engine.format_config())
+    try:
+        console.print(engine.format_config())
+    finally:
+        engine.close()
 
 
 @app.command("doctor")
@@ -81,7 +93,10 @@ def doctor(
     cwd: Path = typer.Option(Path("."), "--cwd", help="Working directory / repository root."),
 ) -> None:
     engine = _build_engine(cwd=cwd.resolve())
-    console.print(engine.format_doctor())
+    try:
+        console.print(engine.format_doctor())
+    finally:
+        engine.close()
 
 
 @session_app.command("list")
@@ -89,4 +104,7 @@ def session_list(
     cwd: Path = typer.Option(Path("."), "--cwd", help="Working directory / repository root."),
 ) -> None:
     engine = _build_engine(cwd=cwd.resolve())
-    console.print(engine.format_sessions())
+    try:
+        console.print(engine.format_sessions())
+    finally:
+        engine.close()

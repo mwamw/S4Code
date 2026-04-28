@@ -21,26 +21,26 @@ _BOOTSTRAPPED = False
 
 def _active_mcp_is_compatible() -> bool:
     try:
-        module = importlib.import_module("mcp")
+        module = importlib.import_module("Emcp")
     except Exception:
         return False
     return hasattr(module, "MCPClient") and hasattr(module, "MCPHub")
 
 
 def _clear_incompatible_mcp_module() -> None:
-    module = sys.modules.get("mcp")
+    module = sys.modules.get("Emcp")
     if module is None:
         return
     if hasattr(module, "MCPClient") and hasattr(module, "MCPHub"):
         return
-    sys.modules.pop("mcp", None)
+    sys.modules.pop("Emcp", None)
 
 
 def _is_easyagent_root(path: Path) -> bool:
     return (
         (path / "easyagent" / "__init__.py").exists()
         and (path / "Tool" / "__init__.py").exists()
-        and (path / "mcp" / "__init__.py").exists()
+        and (path / "Emcp" / "__init__.py").exists()
     )
 
 
