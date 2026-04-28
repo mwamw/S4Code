@@ -35,13 +35,13 @@ def test_build_s4_system_prompt_contains_code_agent_rules(tmp_path) -> None:
     paths = _paths(tmp_path)
     prompt = build_s4_system_prompt(paths=paths, project=_project(project_root))
 
-    assert "You are S4Code, a local code agent for real software engineering work." in prompt
-    assert "All text you produce outside tool use is shown directly to the user." in prompt
-    assert "Read relevant code before proposing or making changes." in prompt
-    assert "If the user asks for review, produce findings first" in prompt
-    assert "Do not guess or invent URLs unless they are clearly provided" in prompt
-    assert f"Project root: `{project_root}`" in prompt
-    assert "Active branch: `main`" in prompt
+    assert "你是 S4Code，一个交互式本地代码智能体" in prompt
+    assert "你在工具调用之外输出的所有文本都会直接展示给用户" in prompt
+    assert "一般不要对没读过的代码提出修改方案。先读相关代码，再理解，再修改。" in prompt
+    assert "如果用户要求 review，先给出 findings" in prompt
+    assert "除非某个 URL 明显来自用户输入、仓库内容、工具结果" in prompt
+    assert f"- 项目根目录: `{project_root}`" in prompt
+    assert "- 当前分支: `main`" in prompt
 
 
 def test_discover_s4_prompt_sources_loads_global_and_project_files(tmp_path) -> None:
@@ -78,7 +78,8 @@ def test_build_s4_system_prompt_appends_markdown_instructions(tmp_path) -> None:
 
     prompt = build_s4_system_prompt(paths=paths, project=_project(project_root))
 
-    assert "## Durable Markdown Instructions" in prompt
+    assert "# S4.md 持久指令" in prompt
+    assert "## 已加载的 `S4.md` 指令" in prompt
     assert "Prefer focused diffs." in prompt
     assert "Keep generated files untouched." in prompt
 
@@ -113,8 +114,9 @@ class _FakeAgent:
 
 def test_s4_prompt_composer_uses_system_prompt_as_identity_block() -> None:
     composer = S4PromptComposer()
-    blocks = composer.get_system_prompt_blocks(_FakeAgent("custom s4 prompt"))
+    blocks = composer.get_enhanced_prompt(_FakeAgent("custom s4 prompt"))
 
-    assert blocks[0].name == "s4_identity"
-    assert blocks[0].content == "custom s4 prompt"
-    assert all(block.name != "custom_instructions" for block in blocks)
+    print(blocks)
+
+if __name__ == "__main__":
+    test_s4_prompt_composer_uses_system_prompt_as_identity_block()

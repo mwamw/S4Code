@@ -1,5 +1,10 @@
-# S4Code
 
+# S4Code
+效果展示：
+此例子为让S4Code评测自己的项目仓库
+- ![1](./s4code/figure/1.png)
+- ![2](./s4code/figure/2.png)
+- ![3](./s4code/figure/3.png)
 S4Code 是一个本地优先的代码 Agent CLI/TUI。它面向真实工程仓库工作：能读取和修改文件、运行命令、管理会话、处理权限确认、加载项目技能、启动后台任务、调用子 Agent、展示工具 diff、追踪每个模型 cycle 的指标，并把这些运行状态集中在一个终端产品里。
 
 S4Code 的设计目标不是做一个简单聊天壳，而是把代码 Agent 需要的闭环能力产品化：

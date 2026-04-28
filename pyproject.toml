@@ -24,3 +24,5 @@ s4 = "s4code.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["s4code"]
 artifacts = ["s4code/themes/*.json"]
+[tool.pyrefly]
+search_path = ["/home/wxd/LLM/EasyAgent"]
