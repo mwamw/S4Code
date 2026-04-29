@@ -8,21 +8,6 @@
       model: qwen3.5-9b
       temperature: 0.5
       timeout: 120
-    gemini-3-flash:
-      provider: google_native
-      base_url: http://210.45.70.84:30000/
-      api_key: "sk-b5685adb3LBGrqpMpzyJpwWrlKQgli1Sg1TLvwxBYUZKkk5c"
-      model: gemini-3-flash
-      temperature: 0.5
-      timeout: 220
-    MiniMax-M2.5:
-      provider: openai
-      base_url: http://210.45.70.84:30000/v1
-      api_key: "sk-b5685adb3LBGrqpMpzyJpwWrlKQgli1Sg1TLvwxBYUZKkk5c"
-      model: MiniMax-M2.5
-      temperature: 0.5
-      timeout: 220
-
   context:
     enabled: true
     max_tokens: 150000
