@@ -171,7 +171,7 @@ export function getDefaultAppState(): AppState {
       selection: 0,
     },
     ui: {
-      sidebarVisible: true,
+      sidebarVisible: false,
       theme: 's4',
       input: '',
     },

@@ -1,8 +1,7 @@
-import React from 'react'
-import { Box, Text } from 'ink'
+import React, { useEffect, useState } from 'react'
+import { Box, Text, Static, useStdout } from 'ink'
 import { useAppState } from '../state/AppState'
-import { getVisibleTranscriptCards } from '../state/transcript'
-import { TranscriptView } from './TranscriptView'
+import { TranscriptView, Card } from './TranscriptView'
 import type { TranscriptCard } from '../state/AppStateStore'
 
 function equalCards(left: TranscriptCard[], right: TranscriptCard[]): boolean {
@@ -25,14 +24,55 @@ function equalCards(left: TranscriptCard[], right: TranscriptCard[]): boolean {
 }
 
 export function TranscriptPane() {
-  const cards = useAppState(state => {
-    const visible = getVisibleTranscriptCards(state.transcript)
-    return state.runtime.autoFollowTranscript ? visible.slice(-80) : visible
+  const { stdout } = useStdout()
+  const [rows, setRows] = useState(stdout.rows || 24)
+
+  useEffect(() => {
+    const onResize = () => setRows(stdout.rows)
+    stdout.on('resize', onResize)
+    return () => {
+      stdout.off('resize', onResize)
+    }
+  }, [stdout])
+
+  const committedCards = useAppState(state => {
+    return state.transcript.committedCards || state.transcript.cards || []
   }, equalCards)
+
+  const liveCards = useAppState(state => {
+    return [
+      state.transcript.liveRoundCard,
+      state.transcript.liveThinkingCard,
+      state.transcript.liveAssistantCard,
+      ...Object.values(state.transcript.liveToolCards || {}),
+    ].filter((card): card is TranscriptCard => Boolean(card))
+  }, equalCards)
+
+  // Reserve ~5 lines for the composer, footer, and padding
+  const maxLiveHeight = Math.max(5, rows - 5)
+  
+  // Estimate height: title (1 line) + body lines + margin bottom (1 line)
+  const estimatedLiveLines = liveCards.reduce((acc, card) => {
+    const bodyLines = String(card.body || '').split('\n').length
+    return acc + bodyLines + 2 // title + body + margin
+  }, 0)
+
+  const isOverflowing = estimatedLiveLines > maxLiveHeight
+
   return (
     <Box flexDirection="column" flexGrow={1} marginRight={1}>
-      <Text bold color="cyan">S4Code</Text>
-      <TranscriptView cards={cards} />
+      <Static items={committedCards}>
+        {card => <Card key={card.id} card={card} />}
+      </Static>
+      {committedCards.length === 0 && <Text bold color="cyan">S4Code</Text>}
+      <Box 
+        flexDirection="column" 
+        overflow="hidden" 
+        justifyContent="flex-end"
+        height={isOverflowing ? maxLiveHeight : undefined}
+      >
+        <TranscriptView cards={liveCards} />
+      </Box>
     </Box>
   )
 }

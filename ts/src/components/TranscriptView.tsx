@@ -25,7 +25,7 @@ function cardColor(kind: TranscriptCard['kind']): string {
   }
 }
 
-function Card(props: { card: TranscriptCard }) {
+export function Card(props: { card: TranscriptCard }) {
   const { card } = props
   if (card.kind === 'separator') {
     return <Text color="gray">────────────────────────────────────────</Text>

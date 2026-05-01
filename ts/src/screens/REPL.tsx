@@ -28,8 +28,8 @@ export function REPL(props: { engine: QueryEngine }) {
   })
 
   return (
-    <Box flexDirection="column">
-      <Box>
+    <Box flexDirection="column" width="100%">
+      <Box flexDirection="row" width="100%">
         <TranscriptPane />
         <SidebarPane />
       </Box>
