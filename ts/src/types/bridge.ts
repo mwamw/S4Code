@@ -7,10 +7,16 @@ export type BridgeResponseEnvelope = {
   type: 'response'
   ok: boolean
   result?: unknown
-  error?: {
-    type: string
-    message: string
-  }
+  error?: BridgeErrorPayload
+}
+
+export type BridgeErrorPayload = {
+  type?: string
+  message?: string
+  reason: string
+  impact: string
+  next_step: string
+  debug?: string
 }
 
 export type BridgeEventEnvelope = {

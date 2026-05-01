@@ -50,11 +50,95 @@ export function getCommands(): Command[] {
     viewCommand('trace', 'Show recent turn summaries.', 'trace', undefined, { category: 'debug', priority: 20 }),
     viewCommand('tools', 'Show available tools and their availability.', 'tools', undefined, { category: 'runtime', priority: 70 }),
     viewCommand('skills', 'Show active and queued skills.', 'skills', undefined, { category: 'runtime', priority: 75 }),
+    {
+      type: 'local',
+      name: 'skills queue',
+      description: 'Queue a skill for the next turn.',
+      argumentHint: '<skill-name>',
+      category: 'runtime',
+      priority: 76,
+      run: async (args, engine) => {
+        await engine.queueSkill(args)
+      },
+    },
+    {
+      type: 'local',
+      name: 'skills clear',
+      description: 'Clear skills queued for the next turn.',
+      category: 'runtime',
+      priority: 76,
+      run: async (_args, engine) => {
+        await engine.clearTurnSkills()
+      },
+    },
     viewCommand('worktree', 'Show current worktree state.', 'worktree', undefined, { category: 'workspace', priority: 75 }),
+    {
+      type: 'local',
+      name: 'worktree enter',
+      description: 'Enter a managed worktree.',
+      argumentHint: '[name]',
+      category: 'workspace',
+      priority: 74,
+      immediate: true,
+      run: async (args, engine) => {
+        await engine.enterWorktree(args)
+      },
+    },
+    {
+      type: 'local',
+      name: 'worktree exit',
+      description: 'Exit the current managed worktree.',
+      argumentHint: '[keep|remove] [discard]',
+      category: 'workspace',
+      priority: 74,
+      immediate: true,
+      isSensitive: true,
+      run: async (args, engine) => {
+        await engine.exitWorktree(args)
+      },
+    },
     viewCommand('restore', 'Show restore continuity information.', 'restore', undefined, { category: 'session', priority: 65 }),
     viewCommand('pending', 'Show pending approval or question state.', 'pending', undefined, { category: 'approval', priority: 100 }),
     viewCommand('tasks', 'Show structured and background tasks.', 'tasks', undefined, { category: 'runtime', priority: 80 }),
     viewCommand('mcp', 'Show MCP server status.', 'mcp', undefined, { category: 'runtime', priority: 35 }),
+    viewCommand('mcp server', 'Show one MCP server detail.', 'mcp_server', '<server-name>', { category: 'runtime', priority: 35 }),
+    viewCommand('mcp tools', 'Show tools for one MCP server.', 'mcp_tools', '<server-name>', { category: 'runtime', priority: 35 }),
+    viewCommand('mcp resources', 'Show resources for one MCP server.', 'mcp_resources', '<server-name>', { category: 'runtime', priority: 35 }),
+    {
+      type: 'local',
+      name: 'mcp refresh',
+      description: 'Refresh MCP server connections.',
+      argumentHint: '[server-name]',
+      category: 'runtime',
+      priority: 35,
+      run: async (args, engine) => {
+        await engine.runMcpAction('refresh_mcp', args)
+      },
+    },
+    {
+      type: 'local',
+      name: 'mcp connect',
+      description: 'Connect MCP servers.',
+      argumentHint: '[server-name]',
+      category: 'runtime',
+      priority: 35,
+      run: async (args, engine) => {
+        await engine.runMcpAction('connect_mcp', args)
+      },
+    },
+    {
+      type: 'local',
+      name: 'mcp disconnect',
+      description: 'Disconnect MCP servers.',
+      argumentHint: '[server-name]',
+      category: 'runtime',
+      priority: 35,
+      run: async (args, engine) => {
+        await engine.runMcpAction('disconnect_mcp', args)
+      },
+    },
+    viewCommand('agents', 'Show active subagents.', 'agents', undefined, { category: 'runtime', priority: 64 }),
+    viewCommand('agent', 'Show one subagent by id.', 'agent_detail', '<agent-id>', { category: 'runtime', priority: 63 }),
     {
       type: 'local',
       name: 'task',
@@ -100,6 +184,11 @@ export function getCommands(): Command[] {
         await engine.showView('sessions', '')
       },
     },
+    viewCommand('session', 'Show the current session details.', 'session', undefined, { category: 'session', priority: 72 }),
+    viewCommand('session show', 'Show the current session details.', 'session', undefined, { category: 'session', priority: 72 }),
+    viewCommand('session checkpoints', 'List restorable checkpoints.', 'session_checkpoints', undefined, { category: 'session', priority: 71 }),
+    viewCommand('session timeline', 'Show checkpoint and trace timeline.', 'session_timeline', undefined, { category: 'session', priority: 71 }),
+    viewCommand('session tree', 'Show session fork and restore tree.', 'session_tree', undefined, { category: 'session', priority: 71 }),
     {
       type: 'local',
       name: 'session load',
@@ -111,6 +200,55 @@ export function getCommands(): Command[] {
       immediate: true,
       run: async (args, engine) => {
         await engine.loadSession(args)
+      },
+    },
+    {
+      type: 'local',
+      name: 'session restore',
+      description: 'Restore a saved session.',
+      argumentHint: '<session-id>',
+      category: 'session',
+      aliases: ['restore-session'],
+      priority: 70,
+      immediate: true,
+      run: async (args, engine) => {
+        await engine.loadSession(args)
+      },
+    },
+    {
+      type: 'local',
+      name: 'session rewind',
+      description: 'Rewind to a checkpoint.',
+      argumentHint: '<checkpoint-id|index|last>',
+      category: 'session',
+      priority: 69,
+      immediate: true,
+      isSensitive: true,
+      run: async (args, engine) => {
+        await engine.rewindSession(args)
+      },
+    },
+    {
+      type: 'local',
+      name: 'session fork',
+      description: 'Fork the current session.',
+      argumentHint: '[title]',
+      category: 'session',
+      priority: 68,
+      immediate: true,
+      run: async (args, engine) => {
+        await engine.forkSession(args)
+      },
+    },
+    {
+      type: 'local',
+      name: 'session rename',
+      description: 'Rename the current session.',
+      argumentHint: '<title>',
+      category: 'session',
+      priority: 68,
+      run: async (args, engine) => {
+        await engine.renameSession(args)
       },
     },
     {
@@ -163,14 +301,15 @@ export function getCommands(): Command[] {
     {
       type: 'local',
       name: 'permissions',
-      description: 'Switch the permission mode.',
-      argumentHint: '<mode>',
+      description: 'Show or update permission mode and rules.',
+      argumentHint: '[mode|allow|deny|ask|clear|history] ...',
       category: 'approval',
       priority: 60,
       run: async (args, engine) => {
-        await engine.setPermissionMode(args)
+        await engine.updatePermission(args)
       },
     },
+    viewCommand('models', 'Show configured model profiles.', 'models', undefined, { category: 'runtime', priority: 41 }),
     {
       type: 'local',
       name: 'compact',
@@ -180,6 +319,17 @@ export function getCommands(): Command[] {
       priority: 55,
       run: async (args, engine) => {
         await engine.compactHistory(args)
+      },
+    },
+    {
+      type: 'local',
+      name: 'clear',
+      description: 'Clear conversation history.',
+      category: 'runtime',
+      priority: 35,
+      isSensitive: true,
+      run: async (_args, engine) => {
+        await engine.runActionCard('History', 'clear_history')
       },
     },
     {
@@ -219,6 +369,7 @@ export function getCommands(): Command[] {
         await engine.showView('doctor', '')
       },
     },
+    viewCommand('runtime', 'Show raw runtime state for debugging.', 'runtime', undefined, { category: 'debug', priority: 5 }),
   ]
 }
 

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { BridgeProcess } from './bridgeProcess'
 import type {
   BridgeEnvelope,
+  BridgeErrorPayload,
   BridgeEventEnvelope,
   BridgeResponseEnvelope,
   ContextPayload,
@@ -10,6 +11,14 @@ import type {
   S4BridgeEvent,
   SidebarPayload,
 } from '../types/bridge'
+
+export type BridgeTransport = {
+  send: (request: { request_id: string; method: string; params?: Record<string, unknown> }) => void
+  subscribe: (listener: (payload: BridgeEnvelope) => void) => () => void
+  onError: (listener: (error: Error) => void) => () => void
+  setSessionId: (sessionId: string | null | undefined) => void
+  close: () => void
+}
 
 type PendingRequest = {
   resolve: (value: unknown) => void
@@ -25,18 +34,33 @@ class BridgeClosedError extends Error {
   }
 }
 
+class BridgeRequestError extends Error {
+  readonly payload: BridgeErrorPayload
+
+  constructor(payload: BridgeErrorPayload) {
+    const lines = [
+      payload.reason || payload.message || 'Bridge request failed',
+      payload.impact ? `Impact: ${payload.impact}` : '',
+      payload.next_step ? `Next step: ${payload.next_step}` : '',
+    ].filter(Boolean)
+    super(lines.join('\n'))
+    this.name = payload.type || 'BridgeRequestError'
+    this.payload = payload
+  }
+}
+
 export function isBridgeClosedError(error: unknown): boolean {
   return error instanceof BridgeClosedError
     || (error instanceof Error && error.message === 'Bridge process is closed')
 }
 
 export class BridgeClient {
-  private process: BridgeProcess
+  private process: BridgeTransport
   private pending = new Map<string, PendingRequest>()
   private closed = false
 
-  constructor(process: BridgeProcess) {
-    this.process = process
+  constructor(transport: BridgeTransport = new BridgeProcess(globalThis.process.cwd())) {
+    this.process = transport
     this.process.subscribe(payload => this.handleEnvelope(payload))
     this.process.onError(error => this.failPending(error))
   }
@@ -76,7 +100,11 @@ export class BridgeClient {
       clearTimeout(request.timeout)
     }
     if (!response.ok) {
-      request.reject(new Error(response.error?.message || 'Bridge request failed'))
+      request.reject(new BridgeRequestError(response.error || {
+        reason: 'The Python bridge could not complete the request.',
+        impact: 'S4Code could not update this view or turn.',
+        next_step: 'Run /doctor for diagnostics, then retry the command.',
+      }))
       return
     }
     this.captureSessionId(response.result)
@@ -118,11 +146,19 @@ export class BridgeClient {
         }, timeoutMs)
       }
       this.pending.set(requestId, request)
-      this.process.send({
-        request_id: requestId,
-        method,
-        params,
-      })
+      try {
+        this.process.send({
+          request_id: requestId,
+          method,
+          params,
+        })
+      } catch (error) {
+        if (request.timeout) {
+          clearTimeout(request.timeout)
+        }
+        this.pending.delete(requestId)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
     })
   }
 
@@ -132,6 +168,9 @@ export class BridgeClient {
     onEvent: (event: S4BridgeEvent) => void,
     timeoutMs = 0,
   ): Promise<T> {
+    if (this.closed) {
+      return Promise.reject(new BridgeClosedError())
+    }
     const requestId = randomUUID()
     return new Promise<T>((resolve, reject) => {
       const request: PendingRequest = {
@@ -146,11 +185,19 @@ export class BridgeClient {
         }, timeoutMs)
       }
       this.pending.set(requestId, request)
-      this.process.send({
-        request_id: requestId,
-        method,
-        params,
-      })
+      try {
+        this.process.send({
+          request_id: requestId,
+          method,
+          params,
+        })
+      } catch (error) {
+        if (request.timeout) {
+          clearTimeout(request.timeout)
+        }
+        this.pending.delete(requestId)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
     })
   }
 
@@ -202,10 +249,10 @@ export class BridgeClient {
     if (this.closed) {
       return Promise.resolve({ closed: true })
     }
-    return this.request<{ closed: boolean }>('shutdown')
-      .finally(() => {
-        this.closed = true
-      })
+    this.closed = true
+    this.resolvePendingAsClosed()
+    this.process.close()
+    return Promise.resolve({ closed: true })
   }
 
   terminate(): void {

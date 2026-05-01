@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
+import traceback
 from typing import Any, Optional
 
 from .query_engine import S4QueryEngine
@@ -24,13 +26,28 @@ def _json_default(value: Any) -> Any:
 
 
 class BridgeSession:
-    def __init__(self, *, cwd: str | Path, session_id: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        *,
+        cwd: str | Path,
+        session_id: Optional[str] = None,
+        transient_session: bool = False,
+    ) -> None:
         self.cwd = Path(cwd).resolve()
         self._session_id = session_id
+        self.transient_session = transient_session
         self.engine = self._create_engine(session_id=session_id)
+        if self.transient_session:
+            self._disable_autosave()
 
     def _create_engine(self, *, session_id: Optional[str]) -> S4QueryEngine:
         return S4QueryEngine(cwd=self.cwd, session_id=session_id)
+
+    def _disable_autosave(self) -> None:
+        settings = getattr(self.engine, "settings", None)
+        product = getattr(settings, "product", None)
+        if product is not None and hasattr(product, "session_auto_save"):
+            product.session_auto_save = False
 
     def close(self) -> None:
         try:
@@ -42,6 +59,8 @@ class BridgeSession:
         self.close()
         self._session_id = session_id
         self.engine = self._create_engine(session_id=session_id)
+        if self.transient_session:
+            self._disable_autosave()
 
     @staticmethod
     def _permission_mode(engine: S4QueryEngine) -> str:
@@ -51,7 +70,7 @@ class BridgeSession:
 
     def init_payload(self) -> dict[str, Any]:
         saver = getattr(self.engine, "save_session", None)
-        if callable(saver):
+        if callable(saver) and not self.transient_session:
             try:
                 saver(tolerate_failure=True)
             except Exception:
@@ -93,11 +112,40 @@ class BridgeSession:
             return {"title": "Skills", "text": engine.format_skills()}
         if view_name == "worktree":
             return {"title": "Worktree", "text": engine.format_worktree_status(), "payload": engine.get_worktree_status_payload()}
+        if view_name == "permissions":
+            return {"title": "Permissions", "text": engine.format_permissions(), "payload": engine.get_permission_status_payload()}
+        if view_name == "permission_history":
+            return {"title": "Permission History", "text": engine.format_permission_history()}
+        if view_name == "models":
+            return {"title": "Models", "text": engine.format_models(), "payload": engine.get_model_choices()}
+        if view_name == "agents":
+            limit = int(params.get("limit") or 20)
+            return {"title": "Agents", "text": engine.format_agents(limit=limit)}
+        if view_name == "agent_detail":
+            agent_id = str(params.get("agent_id") or "").strip()
+            return {"title": f"Agent {agent_id or '-'}", "text": engine.format_agent_detail(agent_id)}
         if view_name == "mcp":
             return {"title": "MCP", "text": engine.format_mcp()}
+        if view_name == "mcp_server":
+            server_name = str(params.get("server_name") or "").strip()
+            return {"title": f"MCP {server_name or '-'}", "text": engine.format_mcp_server_detail(server_name, refresh=bool(params.get("refresh")))}
+        if view_name == "mcp_tools":
+            server_name = str(params.get("server_name") or "").strip()
+            return {"title": f"MCP Tools {server_name or '-'}", "text": engine.format_mcp_tools(server_name)}
+        if view_name == "mcp_resources":
+            server_name = str(params.get("server_name") or "").strip()
+            return {"title": f"MCP Resources {server_name or '-'}", "text": engine.format_mcp_resources(server_name)}
         if view_name == "sessions":
             limit = int(params.get("limit") or 20)
             return {"title": "Sessions", "text": engine.format_sessions(limit=limit)}
+        if view_name == "session":
+            return {"title": "Session", "text": engine.format_current_session()}
+        if view_name == "session_checkpoints":
+            return {"title": "Session Checkpoints", "text": engine.format_checkpoints()}
+        if view_name == "session_timeline":
+            return {"title": "Session Timeline", "text": engine.format_timeline()}
+        if view_name == "session_tree":
+            return {"title": "Session Tree", "text": engine.format_session_tree()}
         if view_name == "restore":
             return {"title": "Restore", "text": engine.format_restore_report(), "payload": engine.get_restore_continuity_payload()}
         if view_name == "pending":
@@ -150,6 +198,15 @@ class BridgeSession:
                 "text": f"Loaded session {self.engine.session_id}.",
                 "init": self.init_payload(),
             }
+        if action_name == "rename_session":
+            title = str(params.get("title") or "").strip()
+            return {"text": engine.rename_session(title)}
+        if action_name == "fork_session":
+            title = str(params.get("title") or "").strip() or None
+            return {"text": engine.fork_session(title)}
+        if action_name == "rewind_session":
+            target = str(params.get("target") or "").strip() or None
+            return {"text": engine.rewind_to_checkpoint(target)}
         if action_name == "set_model":
             target = str(params.get("target") or "").strip()
             updater = getattr(engine, "update_model", None)
@@ -162,10 +219,22 @@ class BridgeSession:
             if not callable(updater):
                 raise ValueError("Permission mode switching is unavailable")
             return {"text": updater(mode)}
+        if action_name == "permission_rule":
+            behavior = str(params.get("behavior") or "").strip()
+            tool_name = str(params.get("tool_name") or "").strip()
+            tokens = params.get("tokens") or []
+            if not isinstance(tokens, list):
+                tokens = []
+            return {"text": engine.add_permission_rule_from_tokens(behavior=behavior, tool_name=tool_name, tokens=[str(item) for item in tokens])}
+        if action_name == "clear_permissions":
+            source = str(params.get("source") or "session").strip() or "session"
+            return {"text": engine.clear_permission_rules(source=source)}
         if action_name == "compact_history":
             max_tokens = params.get("max_tokens")
             max_tokens_arg = int(max_tokens) if max_tokens is not None else None
             return {"text": engine.compact_history(max_tokens=max_tokens_arg)}
+        if action_name == "clear_history":
+            return {"text": engine.clear_history()}
         if action_name == "queue_skill":
             name = str(params.get("name") or "").strip()
             queuer = getattr(engine, "queue_turn_skill", None)
@@ -193,6 +262,15 @@ class BridgeSession:
                     discard_changes=bool(params.get("discard_changes")),
                 )
             }
+        if action_name == "connect_mcp":
+            server_name = str(params.get("server_name") or "").strip() or None
+            return {"text": engine.connect_mcp(server_name)}
+        if action_name == "disconnect_mcp":
+            server_name = str(params.get("server_name") or "").strip() or None
+            return {"text": engine.disconnect_mcp(server_name)}
+        if action_name == "refresh_mcp":
+            server_name = str(params.get("server_name") or "").strip() or None
+            return {"text": engine.refresh_mcp(server_name)}
         if action_name == "stop_task":
             task_id = str(params.get("task_id") or "").strip()
             stopper = getattr(engine, "stop_task", None)
@@ -202,17 +280,44 @@ class BridgeSession:
         raise ValueError(f"Unknown action: {action_name}")
 
 
+def _error_payload(exc: Exception) -> dict[str, str]:
+    exc_type = type(exc).__name__
+    message = str(exc).strip() or exc_type
+    return {
+        "type": exc_type,
+        "message": message,
+        "reason": message,
+        "impact": "The requested S4Code operation did not complete.",
+        "next_step": "Run /doctor for diagnostics, then retry the command or adjust its arguments.",
+        "debug": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+    }
+
+
+def _emit_response(request_id: str, payload: dict[str, Any]) -> None:
+    envelope = {
+        "request_id": request_id,
+        **payload,
+    }
+    sys.stdout.write(json.dumps(envelope, ensure_ascii=False, default=_json_default) + "\n")
+    sys.stdout.flush()
+
+
 class BridgeServer:
-    def __init__(self, *, cwd: str | Path, session_id: Optional[str] = None) -> None:
-        self.session = BridgeSession(cwd=cwd, session_id=session_id)
+    def __init__(
+        self,
+        *,
+        cwd: str | Path,
+        session_id: Optional[str] = None,
+        transient_session: bool = False,
+    ) -> None:
+        self.session = BridgeSession(
+            cwd=cwd,
+            session_id=session_id,
+            transient_session=transient_session,
+        )
 
     def emit(self, request_id: str, payload: dict[str, Any]) -> None:
-        envelope = {
-            "request_id": request_id,
-            **payload,
-        }
-        sys.stdout.write(json.dumps(envelope, ensure_ascii=False, default=_json_default) + "\n")
-        sys.stdout.flush()
+        _emit_response(request_id, payload)
 
     async def _handle_stream_prompt(self, request_id: str, params: dict[str, Any]) -> None:
         prompt = params.get("prompt")
@@ -320,11 +425,32 @@ class BridgeServer:
         )
 
 
-def run_server(*, cwd: str | Path, session_id: Optional[str]) -> int:
-    server = BridgeServer(cwd=cwd, session_id=session_id)
+def run_server(
+    *,
+    cwd: str | Path,
+    session_id: Optional[str],
+    transient_session: bool = False,
+) -> int:
+    server: BridgeServer | None = None
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
+        try:
+            server = BridgeServer(
+                cwd=cwd,
+                session_id=session_id,
+                transient_session=transient_session,
+            )
+        except Exception as exc:
+            _emit_response(
+                "unknown",
+                {
+                    "type": "response",
+                    "ok": False,
+                    "error": _error_payload(exc),
+                },
+            )
+            return 1
         while True:
             line = sys.stdin.readline()
             if not line:
@@ -340,33 +466,42 @@ def run_server(*, cwd: str | Path, session_id: Optional[str]) -> int:
                 request_id = str(request.get("request_id") or "").strip()
                 loop.run_until_complete(server.dispatch(request))
             except Exception as exc:
-                server.emit(
+                _emit_response(
                     request_id or "unknown",
                     {
                         "type": "response",
                         "ok": False,
-                        "error": {
-                            "type": type(exc).__name__,
-                            "message": str(exc),
-                        },
+                        "error": _error_payload(exc),
                     },
                 )
     finally:
-        server.session.close()
+        if server is not None:
+            server.session.close()
         loop.run_until_complete(loop.shutdown_asyncgens())
         asyncio.set_event_loop(None)
         loop.close()
     return 0
 
 
-def run_single_request(*, cwd: str | Path, session_id: Optional[str], request_json: str) -> int:
-    server = BridgeServer(cwd=cwd, session_id=session_id)
+def run_single_request(
+    *,
+    cwd: str | Path,
+    session_id: Optional[str],
+    request_json: str,
+    transient_session: bool = False,
+) -> int:
+    server: BridgeServer | None = None
     request_id = ""
     try:
         request = json.loads(request_json)
         if not isinstance(request, dict):
             raise ValueError("request must be an object")
         request_id = str(request.get("request_id") or "").strip()
+        server = BridgeServer(
+            cwd=cwd,
+            session_id=session_id,
+            transient_session=transient_session,
+        )
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -376,20 +511,18 @@ def run_single_request(*, cwd: str | Path, session_id: Optional[str], request_js
             asyncio.set_event_loop(None)
             loop.close()
     except Exception as exc:
-        server.emit(
+        _emit_response(
             request_id or "unknown",
             {
                 "type": "response",
                 "ok": False,
-                "error": {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                },
+                "error": _error_payload(exc),
             },
         )
         return 1
     finally:
-        server.session.close()
+        if server is not None:
+            server.session.close()
     return 0
 
 
@@ -397,11 +530,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="S4Code TypeScript bridge")
     parser.add_argument("--cwd", default=".", help="Working directory")
     parser.add_argument("--session-id", default=None, help="Optional session id to resume")
+    parser.add_argument("--transient-session", action="store_true", help="Do not persist a new one-shot session")
     parser.add_argument("--request-json", default=None, help="Optional one-shot request payload")
     args = parser.parse_args(argv)
+    transient_session = bool(args.transient_session or os.environ.get("S4CODE_TRANSIENT_SESSION") == "1")
     if args.request_json:
-        return run_single_request(cwd=args.cwd, session_id=args.session_id, request_json=args.request_json)
-    return run_server(cwd=args.cwd, session_id=args.session_id)
+        return run_single_request(
+            cwd=args.cwd,
+            session_id=args.session_id,
+            request_json=args.request_json,
+            transient_session=transient_session,
+        )
+    return run_server(cwd=args.cwd, session_id=args.session_id, transient_session=transient_session)
 
 
 if __name__ == "__main__":

@@ -1547,11 +1547,6 @@ class S4QueryEngine:
                         )
                     if runtime_hook is not None and runtime_hook.has_pending_compactions:
                         runtime_hook.flush_compaction_result(self.agent)
-                    await queue.put(event)
-                    if event_type == "tool_result" and tool_name == "Bash":
-                        background_notice = self._background_task_notice_from_event(event)
-                        if background_notice is not None:
-                            await queue.put(background_notice)
                     if event_type in {"tool_result", "final", "interruption", "error"} and active_round > 0:
                         metrics = self._build_round_metrics(
                             round_number=active_round,
@@ -1568,6 +1563,11 @@ class S4QueryEngine:
                                         "metrics": metrics,
                                     }
                                 )
+                    await queue.put(event)
+                    if event_type == "tool_result" and tool_name == "Bash":
+                        background_notice = self._background_task_notice_from_event(event)
+                        if background_notice is not None:
+                            await queue.put(background_notice)
                     if event_type in {"final", "interruption"}:
                         after_checkpoint = self.create_checkpoint(
                             "after turn" if event_type == "final" else "paused turn",

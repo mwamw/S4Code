@@ -20,20 +20,20 @@ export class BridgeProcess {
   private activeChildren = new Map<string, ActiveChild>()
   private closed = false
   private readonly bridgeEnv: NodeJS.ProcessEnv
+  private readonly transientSession: boolean
 
   constructor(
     cwd: string,
     sessionId?: string | null,
+    options: { transientSession?: boolean } = {},
   ) {
     this.cwd = cwd
     this.sessionId = sessionId || null
+    this.transientSession = Boolean(options.transientSession)
     this.python = process.env.S4CODE_PYTHON || this.findProjectPython() || 'python'
-    const runtimeRoot = join(this.cwd, '.s4code', 'ts-runtime')
     this.bridgeEnv = {
       ...process.env,
-      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME || join(runtimeRoot, 'config'),
-      XDG_DATA_HOME: process.env.XDG_DATA_HOME || join(runtimeRoot, 'data'),
-      XDG_CACHE_HOME: process.env.XDG_CACHE_HOME || join(runtimeRoot, 'cache'),
+      S4CODE_TRANSIENT_SESSION: this.transientSession ? '1' : process.env.S4CODE_TRANSIENT_SESSION,
     }
   }
 
@@ -46,6 +46,9 @@ export class BridgeProcess {
   }
 
   setSessionId(sessionId: string | null | undefined): void {
+    if (this.transientSession) {
+      return
+    }
     this.sessionId = sessionId || null
   }
 
@@ -96,6 +99,9 @@ export class BridgeProcess {
     const args = ['-m', 's4code.bridge', '--cwd', this.cwd]
     if (this.sessionId) {
       args.push('--session-id', this.sessionId)
+    }
+    if (this.transientSession) {
+      args.push('--transient-session')
     }
     args.push('--request-json', JSON.stringify(request))
 

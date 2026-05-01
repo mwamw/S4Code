@@ -1,5 +1,6 @@
 import { render } from 'ink'
 import React from 'react'
+import { resolve } from 'node:path'
 import { App } from './components/App'
 import { REPL } from './screens/REPL'
 import { setup } from './setup'
@@ -27,12 +28,12 @@ function parseArgs(argv: string[]) {
     }
   }
 
-  return { cwd, sessionId, prompt }
+  return { cwd: resolve(cwd), sessionId, prompt }
 }
 
 async function buildRuntime() {
-  const { cwd, sessionId } = parseArgs(process.argv.slice(2))
-  return setup({ cwd, sessionId })
+  const { cwd, sessionId, prompt } = parseArgs(process.argv.slice(2))
+  return setup({ cwd, sessionId, transientSession: Boolean(prompt && !sessionId) })
 }
 
 async function runPromptMode(prompt: string): Promise<void> {

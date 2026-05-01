@@ -130,7 +130,7 @@ export class QueryEngine {
       this.flushStreamBuffer()
       const message = error instanceof Error ? error.message : String(error)
       this.setAppState(prev => ({
-        ...appendCard(prev, 'error', 'Error', message, 'done'),
+        ...consumeBridgeEvent(prev, { type: 'error', error: message }),
         runtime: {
           ...prev.runtime,
           busy: false,
@@ -141,12 +141,33 @@ export class QueryEngine {
   }
 
   async showHelp(): Promise<void> {
+    const grouped = new Map<string, Command[]>()
+    for (const command of this.commands) {
+      const category = command.category || 'core'
+      grouped.set(category, [...(grouped.get(category) || []), command])
+    }
     const lines = [
-      'S4Code quick start',
+      'S4Code help',
       '',
-      'Core commands:',
-      ...this.commands.map(command => `- /${command.name}${command.argumentHint ? ` ${command.argumentHint}` : ''}: ${command.description}`),
+      'Common workflows:',
+      '- Inspect state: /status, /context, /tasks, /pending',
+      '- Continue a saved session: /session list, then /session load <id>',
+      '- Resolve a pause: /confirm, /deny, or /answer <text>',
+      '- Review work: /diff, then /review [target]',
+      '- Manage runtime: /model <profile>, /permissions ..., /compact',
+      '',
+      'Commands:',
     ]
+    for (const category of ['core', 'workspace', 'session', 'runtime', 'approval', 'debug']) {
+      const commands = [...(grouped.get(category) || [])].sort((left, right) => left.name.localeCompare(right.name))
+      if (!commands.length) {
+        continue
+      }
+      lines.push('', `${category}:`)
+      for (const command of commands) {
+        lines.push(`- /${command.name}${command.argumentHint ? ` ${command.argumentHint}` : ''}: ${command.description}`)
+      }
+    }
     this.setAppState(prev => appendCard(prev, 'system', 'Help', lines.join('\n'), 'done'))
   }
 
@@ -157,6 +178,12 @@ export class QueryEngine {
     }
     if (view === 'task_output') {
       params.task_id = args.trim()
+    }
+    if (view === 'agent_detail') {
+      params.agent_id = args.trim()
+    }
+    if (view === 'mcp_server' || view === 'mcp_tools' || view === 'mcp_resources') {
+      params.server_name = args.trim()
     }
     if (view === 'diff' && args.trim()) {
       params.target = args.trim()
@@ -186,6 +213,77 @@ export class QueryEngine {
     } else {
       this.setAppState(prev => appendCard(prev, 'system', 'Session', result.text, 'done'))
     }
+  }
+
+  async runActionCard(title: string, action: string, params: Record<string, unknown> = {}): Promise<void> {
+    const result = await this.bridge.runAction(action, params)
+    this.setAppState(prev => appendCard(prev, 'system', title, result.text, 'done'))
+    await this.refreshSidebar(true)
+  }
+
+  async renameSession(title: string): Promise<void> {
+    await this.runActionCard('Session', 'rename_session', { title: title.trim() })
+  }
+
+  async forkSession(title: string): Promise<void> {
+    await this.runActionCard('Session', 'fork_session', { title: title.trim() || undefined })
+  }
+
+  async rewindSession(target: string): Promise<void> {
+    await this.runActionCard('Session Rewind', 'rewind_session', { target: target.trim() || undefined })
+  }
+
+  async queueSkill(name: string): Promise<void> {
+    await this.runActionCard('Skills', 'queue_skill', { name: name.trim() })
+  }
+
+  async clearTurnSkills(): Promise<void> {
+    await this.runActionCard('Skills', 'clear_turn_skills')
+  }
+
+  async enterWorktree(name: string): Promise<void> {
+    await this.runActionCard('Worktree', 'enter_worktree', { name: name.trim() || undefined })
+  }
+
+  async exitWorktree(args: string): Promise<void> {
+    const tokens = args.trim().split(/\s+/).filter(Boolean)
+    const action = tokens.find(token => token !== 'discard') || 'keep'
+    const discardChanges = tokens.includes('discard')
+    await this.runActionCard('Worktree', 'exit_worktree', { action, discard_changes: discardChanges })
+  }
+
+  async updatePermission(args: string): Promise<void> {
+    const tokens = args.trim().split(/\s+/).filter(Boolean)
+    const [first, second, ...rest] = tokens
+    if (!first || first === 'show') {
+      await this.showView('permissions', '')
+      return
+    }
+    if (first === 'history') {
+      await this.showView('permission_history', '')
+      return
+    }
+    if (first === 'mode') {
+      await this.setPermissionMode(second || '')
+      return
+    }
+    if (first === 'clear') {
+      await this.runActionCard('Permissions', 'clear_permissions', { source: second || 'session' })
+      return
+    }
+    if (['allow', 'deny', 'ask'].includes(first)) {
+      await this.runActionCard('Permissions', 'permission_rule', {
+        behavior: first,
+        tool_name: second || '',
+        tokens: rest,
+      })
+      return
+    }
+    await this.setPermissionMode(args)
+  }
+
+  async runMcpAction(action: 'connect_mcp' | 'disconnect_mcp' | 'refresh_mcp', serverName: string): Promise<void> {
+    await this.runActionCard('MCP', action, { server_name: serverName.trim() || undefined })
   }
 
   async setModel(target: string): Promise<void> {
@@ -274,9 +372,10 @@ export class QueryEngine {
       }))
       await this.refreshSidebar(true)
     } catch (error) {
+      this.flushStreamBuffer()
       const message = error instanceof Error ? error.message : String(error)
       this.setAppState(prev => ({
-        ...appendCard(prev, 'error', 'Error', message, 'done'),
+        ...consumeBridgeEvent(prev, { type: 'error', error: message }),
         runtime: {
           ...prev.runtime,
           busy: false,

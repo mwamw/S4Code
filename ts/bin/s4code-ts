@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -L "${SOURCE_PATH}" ]]; do
+  SOURCE_DIR="$(cd "$(dirname "${SOURCE_PATH}")" && pwd)"
+  SOURCE_PATH="$(readlink "${SOURCE_PATH}")"
+  [[ "${SOURCE_PATH}" != /* ]] && SOURCE_PATH="${SOURCE_DIR}/${SOURCE_PATH}"
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${SOURCE_PATH}")" && pwd)"
+TS_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+if [[ -n "${S4CODE_BUN:-}" ]]; then
+  BUN_BIN="${S4CODE_BUN}"
+elif [[ -x "${HOME}/.bun/bin/bun" ]]; then
+  BUN_BIN="${HOME}/.bun/bin/bun"
+elif command -v bun >/dev/null 2>&1; then
+  BUN_BIN="$(command -v bun)"
+else
+  printf 's4code-ts: bun not found. Set S4CODE_BUN or install bun.\n' >&2
+  exit 127
+fi
+
+declare -a FORWARD_ARGS=()
+HAS_CWD=0
+
+while (($# > 0)); do
+  case "$1" in
+    --cwd|-C)
+      HAS_CWD=1
+      FORWARD_ARGS+=("$1")
+      shift
+      if (($# == 0)); then
+        printf 's4code-ts: %s requires a path argument.\n' "${FORWARD_ARGS[-1]}" >&2
+        exit 2
+      fi
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    *)
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if ((HAS_CWD == 0)); then
+  FORWARD_ARGS=(--cwd "$PWD" "${FORWARD_ARGS[@]}")
+fi
+
+exec "${BUN_BIN}" run "${TS_ROOT}/src/main.tsx" "${FORWARD_ARGS[@]}"

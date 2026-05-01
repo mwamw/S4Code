@@ -18,6 +18,40 @@ export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }
     if (!paletteVisible) {
       return
     }
+    if (key.escape) {
+      setAppState(prev => ({
+        ...prev,
+        ui: {
+          ...prev.ui,
+          input: '',
+        },
+        palette: {
+          ...prev.palette,
+          selection: 0,
+        },
+      }))
+      return
+    }
+    if (key.pageUp) {
+      setAppState(prev => ({
+        ...prev,
+        palette: {
+          ...prev.palette,
+          selection: Math.max(0, boundedSelection - 10),
+        },
+      }))
+      return
+    }
+    if (key.pageDown) {
+      setAppState(prev => ({
+        ...prev,
+        palette: {
+          ...prev.palette,
+          selection: Math.min(matches.length - 1, boundedSelection + 10),
+        },
+      }))
+      return
+    }
     if (key.upArrow) {
       setAppState(prev => ({
         ...prev,

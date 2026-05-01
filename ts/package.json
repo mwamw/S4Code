@@ -8,9 +8,11 @@
     "bun": ">=1.1.0"
   },
   "scripts": {
-    "dev": "bun run src/main.tsx",
-    "start": "bun run src/main.tsx",
-    "typecheck": "tsc --noEmit"
+    "dev": "bun run src/main.tsx --cwd ..",
+    "start": "bun run src/main.tsx --cwd ..",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "smoke": "bun run src/main.tsx --cwd .. --prompt /status && bun run src/main.tsx --cwd .. --prompt /context && bun run src/main.tsx --cwd .. --prompt /help && bun run src/main.tsx --cwd .. --prompt /tasks && bun run src/main.tsx --cwd .. --prompt '/session list' && bun run src/main.tsx --cwd .. --prompt /mcp && bun run src/main.tsx --cwd .. --prompt /quit"
   },
   "dependencies": {
     "chalk": "^5.4.1",
