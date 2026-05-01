@@ -1,0 +1,29 @@
+{
+  "name": "cyberpunk",
+  "layout": {
+    "background": "transparent",
+    "text": "#fdf8ff",
+    "muted": "#a882dd",
+    "header_text": "#ff003c",
+    "footer_text": "#00f0ff",
+    "transcript_border": "#ff003c",
+    "sidebar_border": "#00f0ff",
+    "sidebar_text": "#e0e7ff",
+    "palette_border": "#ff003c",
+    "input_border": "#00f0ff",
+    "input_text": "#fdf8ff",
+    "separator": "#880055"
+  },
+  "cards": {
+    "system": {"border": "#00f0ff", "title": "#00f0ff"},
+    "user": {"border": "#ff003c", "title": "#ffaaee"},
+    "assistant": {"border": "#00ffcc", "title": "#ccffee"},
+    "thinking": {"border": "#9933ff", "title": "#eebbff", "text": "#cc99ff"},
+    "tool": {"border": "#fcee0a", "title": "#ff99cc"},
+    "warning": {"border": "#fcee0a", "title": "#ffee99"},
+    "error": {"border": "#ff0000", "title": "#ffcccc"},
+    "round": {"border": "#440022", "title": "#aa4488", "text": "#aa4488"},
+    "runtime": {"border": "#00f0ff", "title": "#99ffff"},
+    "default": {"border": "#8800ff", "title": "#fdf8ff"}
+  }
+}

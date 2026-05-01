@@ -703,9 +703,115 @@ def test_query_engine_runtime_queries_are_cached_for_short_polling_windows(tmp_p
     assert process_manager.calls == 2
 
     engine.format_sidebar(force=True)
-    assert runtime.calls == 4
-    assert task_service.calls == 3
-    assert process_manager.calls == 4
+    assert runtime.calls == 3
+    assert task_service.calls == 2
+    assert process_manager.calls == 3
+
+
+def test_query_engine_format_context_supports_v2_usage_payload(tmp_path: Path, monkeypatch) -> None:
+    paths = _paths(tmp_path)
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+
+    session_manager = _FakeSessionManager(record=None)
+
+    class _V2UsageAgent(_LifecycleAgent):
+        def get_context_usage(self) -> dict[str, object]:
+            return {
+                "version": 2,
+                "budget": {
+                    "maxTokens": 24000,
+                    "historyBudgetTokens": 18000,
+                    "remainingTokens": 21000,
+                },
+                "requestEstimate": {
+                    "estimatedRequestTokens": 3000,
+                    "source": "local_request_estimate",
+                },
+                "tokenBreakdown": {
+                    "historyTokens": 1200,
+                    "systemTokens": 900,
+                    "toolTokens": 600,
+                    "reasoningTokens": 300,
+                },
+                "history": {
+                    "canonicalMessages": 8,
+                    "replayMessages": 10,
+                    "pendingStepActive": False,
+                },
+                "compaction": {
+                    "last": {
+                        "was_compacted": False,
+                        "compaction_possible": False,
+                        "tokens_before": 1200,
+                        "tokens_after": 1200,
+                        "budget": 24000,
+                    }
+                },
+                "cache": {
+                    "enabled": True,
+                    "anchorActive": True,
+                    "pendingAnchorActive": False,
+                    "lastCacheUsage": {
+                        "cachedInputTokens": 512,
+                        "cacheReadTokens": 256,
+                    },
+                    "lastBreak": {
+                        "reason": "system_prompt_changed",
+                        "field": "system.identity",
+                    },
+                },
+            }
+
+    agent = _V2UsageAgent()
+
+    monkeypatch.setattr(query_engine, "get_s4_paths", lambda: paths)
+    monkeypatch.setattr(query_engine, "S4SessionManager", lambda raw_paths: session_manager)
+    monkeypatch.setattr(
+        query_engine.ProjectContext,
+        "detect",
+        classmethod(lambda cls, cwd=None, git_binary="git": _make_project(Path(cwd or project_root))),
+    )
+    monkeypatch.setattr(query_engine, "resolve_settings", lambda *args, **kwargs: _settings())
+    monkeypatch.setattr(
+        query_engine,
+        "build_agent_bundle",
+        lambda **kwargs: SimpleNamespace(
+            agent=agent,
+            registry=SimpleNamespace(
+                get_tool_names=lambda: [],
+                list_tool_specs=lambda: [],
+                list_runtime_surfaces=lambda surface: {},
+            ),
+            task_service=SimpleNamespace(list_tasks=lambda limit=20: []),
+            context_manager=None,
+            runtime_notice_hook=None,
+            startup_issues=[],
+            restore_report=None,
+            skill_registry=_FakeSkillRegistry([], {}),
+            skill_sources=(),
+        ),
+    )
+
+    engine = query_engine.S4QueryEngine(cwd=project_root)
+
+    payload = engine.get_context_panel_payload()
+    assert payload["used_tokens"] == 3000
+    assert payload["remaining_tokens"] == 21000
+    assert payload["history_tokens"] == 1200
+    assert payload["system_tokens"] == 900
+    assert payload["tool_tokens"] == 600
+    assert payload["reasoning_tokens"] == 300
+    assert payload["cache_enabled"] is True
+
+    rendered = engine.format_context()
+    assert "Context: [##--------------] 12% (3000 / 24000 used, 21000 remaining)" in rendered
+    assert "- Breakdown: history=1200, system=900, tools=600, reasoning=300" in rendered
+    assert "- History budget: 1200 / 18000" in rendered
+    assert "- Messages: canonical=8, replay=10" in rendered
+    assert "- Cache: enabled | anchor=True | pending=False" in rendered
+    assert "- Last cache usage: cachedInput=512, cacheRead=256" in rendered
+    assert "- Last cache break: system_prompt_changed (system.identity)" in rendered
 
 
 def test_query_engine_permission_rules_are_session_persisted(tmp_path: Path, monkeypatch) -> None:
@@ -1245,3 +1351,52 @@ def test_stream_prompt_emits_bash_diff_and_checkpoints_without_runtime_card(tmp_
     assert not any(event.get("type") == "runtime_snapshot" for event in events)
     assert [event.get("type") for event in events].count("checkpoint") == 2
     assert len(engine.get_checkpoint_choices()) == 2
+
+
+def test_query_engine_formats_pending_confirmation_with_clear_next_steps() -> None:
+    engine = object.__new__(query_engine.S4QueryEngine)
+    engine.bundle = SimpleNamespace(
+        agent=SimpleNamespace(
+            get_last_tool_interrupt=lambda: {
+                "status": "needs_confirmation",
+                "tool_name": "Bash",
+                "message": "The command needs approval before it can run.",
+                "tool_args": {"command": "git push"},
+                "metadata": {
+                    "interaction_type": "confirmation",
+                    "reason": "This action affects shared state.",
+                    "allowedActions": ["push code to the remote branch"],
+                },
+            }
+        )
+    )
+
+    text = query_engine.S4QueryEngine.format_pending_interaction(engine)
+
+    assert "waiting for your approval" in text
+    assert "Tool: Bash" in text
+    assert "Why this needs approval: This action affects shared state." in text
+    assert "Approve with `/confirm [note]`." in text
+    assert "Deny and remember a session rule with `/deny remember`." in text
+
+
+def test_query_engine_builds_background_task_notice() -> None:
+    engine = object.__new__(query_engine.S4QueryEngine)
+
+    notice = query_engine.S4QueryEngine._background_task_notice_from_event(
+        engine,
+        {
+            "type": "tool_result",
+            "tool_name": "Bash",
+            "structured_data": {
+                "task_id": "task-1",
+                "status": "running",
+                "command": "pytest -q",
+            },
+        },
+    )
+
+    assert notice is not None
+    assert notice["title"] == "Background Task Started"
+    assert "/task output task-1" in notice["content"]
+    assert "/task stop task-1" in notice["content"]

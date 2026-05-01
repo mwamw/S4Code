@@ -11,6 +11,12 @@ class _DummyEngine:
     def format_doctor(self) -> str:
         return "doctor"
 
+    def format_help(self) -> str:
+        return "help"
+
+    def format_status_overview(self) -> str:
+        return "status-overview"
+
     def format_models(self) -> str:
         return "models"
 
@@ -238,6 +244,20 @@ def test_builtin_model_and_context_commands() -> None:
     result = registry.execute(engine, "/theme")
     assert result is not None
     assert result.message == "themes"
+
+
+def test_builtin_help_and_status_commands_use_user_facing_output() -> None:
+    registry = S4CommandRegistry()
+    register_builtin_commands(registry)
+    engine = _DummyEngine()
+
+    result = registry.execute(engine, "/help")
+    assert result is not None
+    assert result.message == "help"
+
+    result = registry.execute(engine, "/status")
+    assert result is not None
+    assert result.message == "status-overview"
 
     result = registry.execute(engine, "/theme list")
     assert result is not None

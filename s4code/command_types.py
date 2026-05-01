@@ -50,6 +50,9 @@ class S4Command:
     handler: CommandHandler
     aliases: tuple[str, ...] = ()
     usage: str = ""
+    category: str = "General"
+    keywords: tuple[str, ...] = ()
+    priority: int = 0
 
 
 def parse_command(raw_text: str) -> CommandInvocation | None:
@@ -69,4 +72,3 @@ def parse_command(raw_text: str) -> CommandInvocation | None:
         args=args,
         arg_text=arg_text,
     )
-

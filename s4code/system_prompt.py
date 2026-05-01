@@ -13,6 +13,8 @@ from .project import ProjectContext
 ensure_easyagent_environment()
 
 from agent.components.prompt_composer import DefaultPromptComposer
+from core.request_compiler import compile_prompt_blocks
+from core.runtime_reminders import BaseRuntimeReminderSource, RuntimeReminder
 from prompt import PromptBlock
 
 """
@@ -164,50 +166,186 @@ def discover_s4_prompt_sources(paths: S4Paths, project: ProjectContext) -> tuple
 
 
 def build_s4_system_prompt(*, paths: S4Paths, project: ProjectContext) -> str:
-    lines = [S4_FALLBACK_SYSTEM_PROMPT]
-    lines.extend(
-        [
-            "# S4.md 持久指令",
-            "- S4Code 通过 Markdown 文件提供持久化用户指令，而不是依赖通用的会话记忆提示词。",
-            "- 这些指令是当前系统提示词的一部分，应与更上层的系统约束一起解释。",
+    del paths, project
+    return S4_FALLBACK_SYSTEM_PROMPT.strip()
+
+
+class S4PersistentInstructionReminderSource(BaseRuntimeReminderSource):
+    @property
+    def name(self) -> str:
+        return "s4_persistent_instructions"
+
+    def __init__(self, *, paths: S4Paths, project: ProjectContext) -> None:
+        self._paths = paths
+        self._project = project
+
+    def build_runtime_reminders(self, agent: Any):
+        del agent
+        prompt_sources = discover_s4_prompt_sources(self._paths, self._project)
+        if not prompt_sources:
+            return []
+        lines = [
+            "以下内容来自当前会话加载的 `S4.md` 持久指令。",
+            "- 这些指令是产品层长期约束，不是普通历史消息。",
+            "- 当多份 `S4.md` 冲突时，优先采用更具体、离当前项目更近的文件。",
+            "- 如果某条 `S4.md` 与更高优先级系统规则冲突，以更高优先级规则为准。",
             "",
-            "# 当前环境",
-            f"- 项目根目录: `{project.project_root}`",
-            f"- 当前工作目录: `{project.cwd}`",
-            f"- Git 仓库: `{'是' if project.is_git_repo else '否'}`",
-            f"- 当前分支: `{project.branch or '-'}`",
         ]
-    )
-    prompt_sources = discover_s4_prompt_sources(paths, project)
-    if prompt_sources:
-        lines.extend(
-            [
-                "",
-                "## 已加载的 `S4.md` 指令",
-                "- 以下 `S4.md` 文件是用户编写的持久化指令。",
-                "- 当两条指令冲突时，优先采用更具体、更靠近当前项目的文件中的指令。",
-                "- 如果某条 `S4.md` 指令与更高优先级的系统约束冲突，以更高优先级约束为准。",
-            ]
-        )
         for source in prompt_sources:
             lines.append(f"### `{source.path}`")
             lines.append(source.content)
-    return "\n\n".join(lines).strip()
+            lines.append("")
+        return [
+            RuntimeReminder(
+                name="s4_md",
+                content="\n".join(lines).strip(),
+                order=100,
+                stable=True,
+                cacheable=True,
+            )
+        ]
+
+
+class S4EnvironmentReminderSource(BaseRuntimeReminderSource):
+    @property
+    def name(self) -> str:
+        return "s4_environment"
+
+    def __init__(self, *, project: ProjectContext) -> None:
+        self._project = project
+
+    def build_runtime_reminders(self, agent: Any):
+        del agent
+        return [
+            RuntimeReminder(
+                name="s4_environment",
+                content="\n".join(
+                    [
+                        "当前运行环境：",
+                        f"- 项目根目录: `{self._project.project_root}`",
+                        f"- 当前工作目录: `{self._project.cwd}`",
+                        f"- Git 仓库: `{'是' if self._project.is_git_repo else '否'}`",
+                        f"- 当前分支: `{self._project.branch or '-'}`",
+                    ]
+                ),
+                order=110,
+                stable=True,
+                cacheable=True,
+            )
+        ]
+
+
+class S4CurrentDateReminderSource(BaseRuntimeReminderSource):
+    @property
+    def name(self) -> str:
+        return "s4_current_date"
+
+    def build_runtime_reminders(self, agent: Any):
+        del agent
+        from datetime import datetime
+
+        return [
+            RuntimeReminder(
+                name="current_date",
+                content=(
+                    "As you answer the user's questions, you can use the following context:\n"
+                    "## currentDate\n"
+                    f"Today's date is {datetime.now().date().isoformat()}."
+                ),
+                order=120,
+                stable=False,
+                cacheable=False,
+            )
+        ]
+
+
+class S4DeferredToolsReminderSource(BaseRuntimeReminderSource):
+    @property
+    def name(self) -> str:
+        return "s4_deferred_tools"
+
+    def build_runtime_reminders(self, agent: Any):
+        registry = getattr(agent, "tool_registry", None)
+        config = getattr(agent, "config", None)
+        if registry is None or getattr(config, "tool_schema_mode", "full") != "deferred":
+            return []
+        deferred_names: list[str] = []
+        for spec in registry.list_tool_specs(stable=True):
+            if spec.metadata.get("internal_tool"):
+                continue
+            if spec.expose_in_deferred:
+                continue
+            deferred_names.append(spec.name)
+        if not deferred_names:
+            return []
+        lines = [
+            "以下 deferred tools 当前可以通过 `tool_schema_tool` 使用。",
+            "它们的完整 schema 还没有加载；直接调用会失败。",
+            "先调用 `tool_schema_tool`，并通过 `tool_names` 传入要展开的工具名；展开后再在后续回合调用目标工具。",
+            "",
+        ]
+        lines.extend(f"- {name}" for name in deferred_names)
+        return [
+            RuntimeReminder(
+                name="deferred_tools",
+                content="\n".join(lines),
+                order=130,
+                stable=True,
+                cacheable=True,
+            )
+        ]
+
+
+class S4SkillsReminderSource(BaseRuntimeReminderSource):
+    @property
+    def name(self) -> str:
+        return "s4_skills"
+
+    def build_runtime_reminders(self, agent: Any):
+        manager = getattr(agent, "skill_manager", None)
+        if manager is None:
+            return []
+        sections: list[str] = []
+        build_resident = getattr(manager, "build_resident_skills_prompt", None)
+        if callable(build_resident):
+            resident = str(build_resident(exclude_names={"memory"}) or "").strip()
+            if resident:
+                sections.append(resident)
+        policy = str(getattr(manager, "build_skill_policy_prompt", lambda: "")() or "").strip()
+        if policy:
+            sections.append(policy)
+        listing = str(getattr(manager, "build_skill_listing_prompt", lambda: "")() or "").strip()
+        if listing:
+            sections.append(listing)
+        if not sections:
+            return []
+        return [
+            RuntimeReminder(
+                name="skills",
+                content="\n\n".join(sections),
+                order=140,
+                stable=True,
+                cacheable=True,
+            )
+        ]
+
+
+def build_s4_runtime_reminder_sources(
+    *,
+    paths: S4Paths,
+    project: ProjectContext,
+) -> tuple[BaseRuntimeReminderSource, ...]:
+    return (
+        S4PersistentInstructionReminderSource(paths=paths, project=project),
+        S4EnvironmentReminderSource(project=project),
+        S4DeferredToolsReminderSource(),
+        S4SkillsReminderSource(),
+        S4CurrentDateReminderSource(),
+    )
 
 
 class S4PromptComposer(DefaultPromptComposer):
-    """S4Code prompt composer.
-
-    S4 的主系统提示词已经覆盖了 EasyAgent 默认 core prompt 里的可见性、
-    任务执行、安全、语气风格和输出效率规则；如果重复注入，会产生冲突、
-    语义漂移和额外 token 开销。
-
-    因此这里的策略是：
-    1. 只保留框架层必须的 tool_policy block。
-    2. 禁用 EasyAgent 通用 memory block，避免与 S4.md 的持久指令体系冲突。
-    3. 在 agent.system_prompt 缺失时，仍可基于 paths/project 动态重建完整
-       的 S4 中文系统提示词。
-    """
+    """S4Code prompt composer with runtime reminders."""
 
     def __init__(
         self,
@@ -220,14 +358,16 @@ class S4PromptComposer(DefaultPromptComposer):
         self._project = project
 
     def _resolve_s4_identity(self, agent: Any) -> str:
-        """获取 S4 身份 prompt，优先使用 agent.system_prompt，
-        缺失时尝试动态重建，最终 fallback 到静态常量。"""
         prompt = str(getattr(agent, "system_prompt", "") or "").strip()
         if prompt:
             return prompt
         if self._paths is not None and self._project is not None:
             return build_s4_system_prompt(paths=self._paths, project=self._project)
         return S4_FALLBACK_SYSTEM_PROMPT
+
+    def get_enhanced_prompt(self, agent: Any) -> str:
+        compiled = compile_prompt_blocks(self.get_system_prompt_blocks(agent))
+        return compiled.system_prompt or ""
 
     def build_core_prompt_blocks(
         self,
@@ -236,7 +376,6 @@ class S4PromptComposer(DefaultPromptComposer):
         start_order: int,
         include_tool_policy: bool,
     ) -> list[PromptBlock]:
-        """仅保留 tool_policy block。"""
         if not include_tool_policy:
             return []
         from prompt import build_tool_policy_section
@@ -258,15 +397,41 @@ class S4PromptComposer(DefaultPromptComposer):
             )
         ]
         blocks.extend(self.build_core_prompt_blocks(agent, start_order=100, include_tool_policy=include_tool_policy))
+        order = 160
         if include_tool_policy:
-            tool_block = self.build_tool_inventory_block(agent, order=160)
+            tool_block = self.build_tool_inventory_block(agent, order=order)
             if tool_block is not None:
                 blocks.append(tool_block)
-        blocks.extend(
-            self.build_shared_prompt_blocks(
-                agent,
-                start_order=200,
-                include_custom_prompt=False,
+                order = max(order + 10, tool_block.order + 10)
+
+        runtime_reminder_blocks = agent.build_runtime_reminder_prompt_blocks(start_order=order)
+        if runtime_reminder_blocks:
+            blocks.extend(runtime_reminder_blocks)
+            order = max(order, max(block.order for block in runtime_reminder_blocks) + 10)
+
+        memory_prompt = agent._build_memory_prompt()
+        if memory_prompt:
+            blocks.append(
+                PromptBlock(
+                    name="memory",
+                    content=memory_prompt,
+                    order=order,
+                    metadata={"cache_partition": "dynamic", "cacheable": False},
+                )
             )
-        )
+            order += 10
+
+        mailbox_prompt = agent._build_mailbox_prompt()
+        if mailbox_prompt:
+            blocks.append(
+                PromptBlock(
+                    name="mailbox",
+                    content=mailbox_prompt,
+                    order=order,
+                    metadata={"cache_partition": "dynamic", "cacheable": False},
+                )
+            )
+            order += 10
+
+        blocks.extend(self.get_extension_prompt_blocks(start_order=order))
         return blocks

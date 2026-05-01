@@ -38,9 +38,11 @@ def test_transcript_state_keeps_round_order() -> None:
         ("round", "Cycle 2"),
         ("thinking", "Model Thinking"),
         ("assistant", "Model Response"),
+        ("system", "Round Outcome"),
     ]
     assert state.cards[2].body == "I will read the parser."
-    assert state.cards[-1].body == "The bug is in empty input handling."
+    assert state.cards[6].body == "The bug is in empty input handling."
+    assert state.cards[7].body.startswith("Round 2 finished.")
     assert state.cards[0].body.startswith("Completed in ")
     assert state.cards[4].body.startswith("Completed in ")
 
@@ -101,6 +103,36 @@ def test_transcript_state_summarizes_tool_result() -> None:
     tool_card = _find_card(state, "tool", "Tool · Bash")
     assert tool_card.status == "done"
     assert "... 2 more line(s) hidden" in tool_card.body
+
+
+def test_transcript_state_formats_background_task_result_with_next_steps() -> None:
+    state = S4TranscriptState()
+    state.consume_event(
+        {
+            "type": "tool_call",
+            "tool_name": "Bash",
+            "tool_id": "tool-1",
+            "tool_args": {"command": "pytest -q", "run_in_background": True},
+        }
+    )
+    state.consume_event(
+        {
+            "type": "tool_result",
+            "tool_name": "Bash",
+            "tool_id": "tool-1",
+            "content": "任务 ID: task-1",
+            "structured_data": {
+                "task_id": "task-1",
+                "status": "running",
+                "command": "pytest -q",
+            },
+        }
+    )
+
+    tool_card = _find_card(state, "tool", "Tool · Bash")
+    assert "Started background task `task-1`." in tool_card.body
+    assert "/task output task-1" in tool_card.body
+    assert "/task stop task-1" in tool_card.body
 
 
 def test_transcript_state_preserves_file_diff_metadata() -> None:
@@ -359,7 +391,8 @@ def test_transcript_state_formats_pending_interaction_and_resolution() -> None:
     assert state.cards[0].title == "Ask User Question"
     assert state.cards[0].status == "pending"
     assert "1. Language" in state.cards[0].body
-    assert "Use /answer <text>" in state.cards[0].body
+    assert "The agent needs your answer before it can continue." in state.cards[0].body
+    assert "Use `/answer <text>` to continue." in state.cards[0].body
     assert "Python: Use Python tooling" in state.cards[0].body
 
     state.consume_event(
@@ -379,6 +412,7 @@ def test_transcript_state_merges_round_metrics_while_running_and_after_completio
 
     state = S4TranscriptState(clock=_clock)
     state.consume_event({"type": "round_start", "round": 1})
+    state.consume_event({"type": "text_delta", "delta": "working"})
     state.consume_event({"type": "tool_call", "tool_name": "FileEdit", "tool_id": "tool-1", "tool_args": {"file_path": "src/app.py"}})
     state.consume_event(
         {
@@ -402,26 +436,43 @@ def test_transcript_state_merges_round_metrics_while_running_and_after_completio
                 "tool_calls": 1,
                 "llm_duration_ms": 1200,
                 "tool_duration_ms": 450,
+                "input_tokens": 210,
+                "output_tokens": 111,
                 "total_tokens": 321,
                 "estimated_cost_usd": 0.0123,
+                "context_used_tokens": 1200,
+                "context_max_tokens": 24000,
+                "prompt_tokens_total": 180,
+                "prompt_tokens_cached": 72,
                 "files_changed": ["src/app.py"],
             },
         }
     )
 
     round_card = _find_card(state, "round", "Cycle 1")
+    assistant_card = _find_card(state, "assistant", "Model Response")
     assert "Elapsed: 0.0s" in round_card.body
     assert "Tools 1" in round_card.body
     assert "Model 1.2s" in round_card.body
     assert "Tool 0.5s" in round_card.body
-    assert "Tokens 321" in round_card.body
     assert "Files 1" in round_card.body
-    assert "Cost $0.0123" in round_card.body
+    assert "Used: FileEdit" in round_card.body
+    assert "Changed: src/app.py" in round_card.body
+    assert "Tokens 321" not in round_card.body
+    assert "Cost $0.0123" not in round_card.body
+    assert "Context:" not in round_card.body
+    assert "Cache:" not in round_card.body
+    assert assistant_card.metadata["footer_left"] == (
+        "Ctx 1,200/24,000  ·  In 210  ·  Out 111  ·  Total 321  ·  Cache 72/180  ·  Cost $0.0123"
+    )
 
     current_time = 52.0
     state.consume_event({"type": "final", "content": "done"})
 
     round_card = _find_card(state, "round", "Cycle 1")
+    assistant_card = _find_card(state, "assistant", "Model Response")
     assert round_card.body.startswith("Completed in 2.0s")
     assert "Model 1.2s" in round_card.body
     assert "Tool 0.5s" in round_card.body
+    assert "Changed: src/app.py" in round_card.body
+    assert assistant_card.metadata["footer_left"].endswith("Cost $0.0123")

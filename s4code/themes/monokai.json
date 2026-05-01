@@ -1,0 +1,29 @@
+{
+  "name": "monokai",
+  "layout": {
+    "background": "transparent",
+    "text": "#f8f8f2",
+    "muted": "#75715e",
+    "header_text": "#a6e22e",
+    "footer_text": "#75715e",
+    "transcript_border": "#f92672",
+    "sidebar_border": "#66d9ef",
+    "sidebar_text": "#f8f8f2",
+    "palette_border": "#fd971f",
+    "input_border": "#a6e22e",
+    "input_text": "#f8f8f2",
+    "separator": "#3e3d32"
+  },
+  "cards": {
+    "system": {"border": "#66d9ef", "title": "#66d9ef"},
+    "user": {"border": "#fd971f", "title": "#fd971f"},
+    "assistant": {"border": "#a6e22e", "title": "#a6e22e"},
+    "thinking": {"border": "#ae81ff", "title": "#ae81ff", "text": "#75715e"},
+    "tool": {"border": "#e6db74", "title": "#e6db74"},
+    "warning": {"border": "#fd971f", "title": "#fd971f"},
+    "error": {"border": "#f92672", "title": "#f92672"},
+    "round": {"border": "#3e3d32", "title": "#75715e", "text": "#75715e"},
+    "runtime": {"border": "#66d9ef", "title": "#66d9ef"},
+    "default": {"border": "#ae81ff", "title": "#f8f8f2"}
+  }
+}

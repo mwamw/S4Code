@@ -137,6 +137,16 @@ class S4TranscriptState:
             "output_tokens": 0,
             "total_tokens": 0,
             "estimated_cost_usd": None,
+            "context_used_tokens": None,
+            "context_max_tokens": None,
+            "context_remaining_tokens": None,
+            "context_usage_ratio": None,
+            "context_usage_percent": None,
+            "prompt_tokens_total": 0,
+            "prompt_tokens_cached": 0,
+            "prompt_tokens_uncached": 0,
+            "cache_hit_tokens": 0,
+            "cache_hit_ratio": None,
             "files_changed": [],
             "tools_used": [],
         }
@@ -216,9 +226,45 @@ class S4TranscriptState:
             card = self.find_card(round_state.content_card_id)
             if card is not None:
                 return card
-        card = self.append_card("assistant", "Model Response", "", status="streaming")
+        round_card = self.find_card(round_state.round_card_id)
+        metrics = self._round_metrics_for_card(round_card) if round_card is not None else self._new_round_metrics()
+        card = self.append_card(
+            "assistant",
+            "Model Response",
+            "",
+            status="streaming",
+            metadata={"round": round_state.number},
+        )
+        footer = self._format_message_metrics_footer(metrics)
+        if footer:
+            card.metadata["footer_left"] = footer
         round_state.content_card_id = card.card_id
         return card
+
+    def _find_round_message_card(self, round_number: int) -> Optional[TranscriptCard]:
+        target = int(round_number or 0)
+        if target <= 0:
+            return None
+        for card in reversed(self.cards):
+            if card.kind != "assistant":
+                continue
+            if int(card.metadata.get("round") or 0) == target:
+                return card
+        return None
+
+    def _sync_round_message_footer(self, round_number: int, metrics: dict[str, Any]) -> None:
+        card = self._find_round_message_card(round_number)
+        if card is None:
+            return
+        footer = self._format_message_metrics_footer(metrics)
+        current = str(card.metadata.get("footer_left") or "")
+        if footer:
+            if footer != current:
+                card.metadata["footer_left"] = footer
+                self._touch(card)
+        elif "footer_left" in card.metadata:
+            card.metadata.pop("footer_left", None)
+            self._touch(card)
 
     def consume_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
@@ -262,7 +308,12 @@ class S4TranscriptState:
                 f"Tool · {tool_name}",
                 self._format_tool_call_body(event.get("tool_args")),
                 status="running",
-                metadata={"tool_id": tool_id, "tool_name": tool_name},
+                metadata={
+                    "tool_id": tool_id,
+                    "tool_name": tool_name,
+                    "tool_args": dict(event.get("tool_args") or {}) if isinstance(event.get("tool_args"), dict) else {},
+                    "round": round_state.number,
+                },
             )
             self._tool_card_ids[tool_id] = card.card_id
             return
@@ -270,7 +321,7 @@ class S4TranscriptState:
             tool_name = str(event.get("tool_name") or "Tool")
             tool_id = str(event.get("tool_id") or "")
             existing = self._find_tool_card(tool_id) if tool_id else None
-            body = self._format_tool_result_body(event.get("content"))
+            body = self._format_tool_result_body(event)
             metadata = {
                 "tool_id": tool_id,
                 "tool_name": tool_name,
@@ -326,6 +377,7 @@ class S4TranscriptState:
                     metrics[key] = sorted(existing | incoming)
                 elif value is not None:
                     metrics[key] = value
+            self._sync_round_message_footer(round_number, metrics)
             if self._current_round is not None and self._current_round.number == round_number:
                 self._refresh_live_round_body()
             else:
@@ -397,6 +449,12 @@ class S4TranscriptState:
             content = str(event.get("content") or "").strip()
             if not content:
                 return
+            round_card = self._current_round_card()
+            round_number = None
+            metrics: dict[str, Any] = {}
+            if round_card is not None:
+                round_number = round_card.metadata.get("round")
+                metrics = dict(self._round_metrics_for_card(round_card))
             card = self._ensure_content_card()
             card.body = content
             card.status = None
@@ -408,6 +466,8 @@ class S4TranscriptState:
                 thinking_card.status = None
                 self._touch(thinking_card)
             self._finalize_current_round(outcome="completed")
+            if round_number is not None:
+                self._append_final_summary_cards(round_number=int(round_number), metrics=metrics, content=content)
             return
         if event_type == "interruption":
             self._finalize_current_round(outcome="pending")
@@ -437,7 +497,11 @@ class S4TranscriptState:
             )
             return
         if event_type == "system_notice":
-            self.append_card("system", "System", str(event.get("content") or ""))
+            self.append_card(
+                "system",
+                str(event.get("title") or "System"),
+                str(event.get("content") or ""),
+            )
             return
         if event_type == "error":
             self._finalize_current_round(outcome="error")
@@ -566,7 +630,24 @@ class S4TranscriptState:
             return "\n".join(lines)
         return self._summarize_scalar(tool_args, max_chars=180)
 
-    def _format_tool_result_body(self, content: Any) -> str:
+    def _format_tool_result_body(self, event: dict[str, Any]) -> str:
+        structured_data = event.get("structured_data")
+        if isinstance(structured_data, dict):
+            task_id = str(structured_data.get("task_id") or "").strip()
+            status = str(structured_data.get("status") or "").strip().lower()
+            if task_id and status in {"running", "queued", "waiting"}:
+                lines = [f"Started background task `{task_id}`."]
+                description = str(structured_data.get("description") or "").strip()
+                command = str(structured_data.get("command") or "").replace("\n", " ").strip()
+                if description:
+                    lines.append(f"Purpose: {self._summarize_scalar(description, max_chars=140)}")
+                elif command:
+                    lines.append(f"Command: {self._summarize_scalar(command, max_chars=140)}")
+                lines.append(f"Use `/task output {task_id}` to stream logs.")
+                lines.append(f"Use `/task stop {task_id}` to stop it.")
+                return "\n".join(lines)
+
+        content = event.get("content")
         text = str(content or "").strip()
         if not text:
             return "Completed with no textual output."
@@ -587,6 +668,14 @@ class S4TranscriptState:
         result_metadata = event.get("result_metadata")
         if isinstance(result_metadata, dict) and result_metadata:
             metadata["result_metadata"] = dict(result_metadata)
+        if isinstance(structured_data, dict):
+            task_id = str(structured_data.get("task_id") or "").strip()
+            if task_id:
+                metadata["background_task"] = {
+                    "task_id": task_id,
+                    "status": str(structured_data.get("status") or "").strip(),
+                    "command": str(structured_data.get("command") or "").strip(),
+                }
         error_type = str(event.get("error_type") or "").strip()
         if error_type:
             metadata["error_type"] = error_type
@@ -667,11 +756,12 @@ class S4TranscriptState:
             lines.extend(
                 [
                     "",
-                    (
-                        "Context: "
-                        f"used={context.get('used_tokens', '?')} "
-                        f"remaining={context.get('remaining_tokens', '?')} "
-                        f"max={context.get('max_tokens', '?')}"
+                    "Context: "
+                    + self._context_summary_text(
+                        used_tokens=context.get("used_tokens"),
+                        max_tokens=context.get("max_tokens"),
+                        remaining_tokens=context.get("remaining_tokens"),
+                        ratio=None,
                     ),
                 ]
             )
@@ -694,7 +784,7 @@ class S4TranscriptState:
         interaction_type = str(metadata.get("interaction_type") or "")
         if interaction_type == "ask_user_question":
             lines = [
-                "The agent needs a structured answer before it can continue.",
+                "The agent needs your answer before it can continue.",
                 "",
             ]
             questions = list(metadata.get("questions") or [])
@@ -718,21 +808,25 @@ class S4TranscriptState:
             source = str(metadata.get("source") or "").strip()
             if source:
                 lines.append(f"Source: {source}")
-            lines.append("Use /answer <text> to continue, or /deny [reason] to decline.")
+            lines.append("Next step:")
+            lines.append("- Use `/answer <text>` to continue.")
+            lines.append("- Use `/deny [reason]` to decline.")
             return "\n".join(lines).strip()
         if interaction_type == "enter_plan_mode":
-            lines = ["The agent requested to enter plan mode."]
+            lines = ["The agent wants to switch into planning mode before making changes."]
             reason = str(metadata.get("reason") or "").strip()
             if reason:
-                lines.append(f"Reason: {reason}")
+                lines.append(f"Why this helps: {reason}")
             allowed_actions = list(metadata.get("allowedActions") or [])
             if allowed_actions:
-                lines.append("Allowed actions:")
+                lines.append("What it wants to do:")
                 lines.extend(f"- {self._summarize_scalar(item, max_chars=120)}" for item in allowed_actions)
-            lines.append("Use /confirm to enter plan mode, or /deny [reason] to refuse.")
+            lines.append("Next step:")
+            lines.append("- Use `/confirm` to enter plan mode.")
+            lines.append("- Use `/deny [reason]` to refuse.")
             return "\n".join(lines)
         if interaction_type == "exit_plan_mode":
-            lines = ["The agent requested to leave plan mode and continue execution."]
+            lines = ["The agent is ready to leave planning mode and continue execution."]
             allowed_prompts = list(metadata.get("allowedPrompts") or [])
             if allowed_prompts:
                 lines.append("Requested permission categories:")
@@ -743,18 +837,49 @@ class S4TranscriptState:
                         lines.append(f"- {tool}: {prompt}")
                     else:
                         lines.append(f"- {tool}")
-            lines.append("Use /confirm to leave plan mode, or /deny [reason] to stay in plan mode.")
+            lines.append("Next step:")
+            lines.append("- Use `/confirm` to leave plan mode.")
+            lines.append("- Use `/deny [reason]` to stay in plan mode.")
             return "\n".join(lines)
-        lines = [str(event.get("content") or event.get("message") or "Execution paused.")]
+        lines = ["The agent is waiting for your approval before it continues."]
+        summary = str(event.get("content") or event.get("message") or "").strip()
+        if summary:
+            lines.extend(["", summary])
         tool_name = str(payload.get("tool_name") or event.get("tool_name") or "").strip()
         if tool_name:
             lines.append(f"Tool: {tool_name}")
+        reason = str(metadata.get("reason") or "").strip()
+        if reason:
+            lines.append(f"Why this needs approval: {reason}")
+        risk_line = self._pending_risk_summary(tool_name, payload.get("tool_args") or {})
+        if risk_line:
+            lines.append(risk_line)
         tool_args = payload.get("tool_args") or event.get("tool_args") or {}
         if isinstance(tool_args, dict) and tool_args:
-            lines.append("Arguments:")
+            lines.append("Requested arguments:")
             lines.append(self._format_tool_call_body(tool_args))
-        lines.append("Use /confirm [note] to continue, or /deny [reason] to cancel the tool.")
+        lines.append("Next step:")
+        lines.append("- Use `/confirm [note]` to continue.")
+        lines.append("- Use `/confirm remember` to allow a matching action for this session.")
+        lines.append("- Use `/deny [reason]` to cancel.")
         return "\n".join(line for line in lines if line).strip()
+
+    @staticmethod
+    def _pending_risk_summary(tool_name: str, tool_args: Any) -> str:
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+        command = str(tool_args.get("command") or "").strip().lower()
+        if tool_name == "Bash" and "git push" in command:
+            return "Risk: high | reversible=False | shared_state=True | overwrites_local_changes=False"
+        if tool_name == "ExitWorktree" and bool(tool_args.get("discard_changes")):
+            return "Risk: high | reversible=False | shared_state=False | overwrites_local_changes=True"
+        if tool_name in {"TaskStop", "AgentStop"} or "rewind" in command:
+            return "Risk: medium | reversible=False | shared_state=False | overwrites_local_changes=False"
+        if tool_name and ("edit" in tool_name.lower() or "write" in tool_name.lower()):
+            return "Risk: medium | reversible=True | shared_state=False | overwrites_local_changes=False"
+        if tool_name:
+            return "Risk: low | reversible=True | shared_state=False | overwrites_local_changes=False"
+        return ""
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -786,18 +911,9 @@ class S4TranscriptState:
         )
         if tool_duration_seconds > 0:
             items.append(f"Tool {self._format_duration(tool_duration_seconds)}")
-        total_tokens = int(metrics.get("total_tokens") or 0)
-        if total_tokens > 0:
-            items.append(f"Tokens {total_tokens}")
         files_changed = list(metrics.get("files_changed") or [])
         if files_changed:
             items.append(f"Files {len(files_changed)}")
-        estimated_cost = metrics.get("estimated_cost_usd")
-        if estimated_cost is not None:
-            try:
-                items.append(f"Cost ${float(estimated_cost):.4f}")
-            except Exception:
-                pass
         if tool_errors > 0:
             items.append(f"Errors {tool_errors}")
         if outcome == "pending":
@@ -810,9 +926,11 @@ class S4TranscriptState:
 
     def _format_active_round_body(self, started_at: float, *, now: float, metrics: Optional[dict[str, Any]] = None) -> str:
         lines = [f"Elapsed: {self._format_duration(now - started_at)}"]
-        metrics_line = self._format_round_metrics_line(metrics or {}, outcome="running")
+        metrics_payload = metrics or {}
+        metrics_line = self._format_round_metrics_line(metrics_payload, outcome="running")
         if metrics_line:
             lines.append(metrics_line)
+        lines.extend(self._format_round_details(metrics_payload))
         return "\n".join(lines)
 
     def _format_completed_round_body(
@@ -830,9 +948,150 @@ class S4TranscriptState:
             "interrupted": "Interrupted in",
         }.get(outcome, "Completed in")
         lines = [f"{label} {self._format_duration(finished_at - started_at)}"]
-        metrics_line = self._format_round_metrics_line(metrics or {}, outcome=outcome)
+        metrics_payload = metrics or {}
+        metrics_line = self._format_round_metrics_line(metrics_payload, outcome=outcome)
         if metrics_line:
             lines.append(metrics_line)
+        lines.extend(self._format_round_details(metrics_payload))
+        return "\n".join(lines)
+
+    def _format_round_details(self, metrics: dict[str, Any]) -> list[str]:
+        lines: list[str] = []
+        tools_used = [str(item).strip() for item in list(metrics.get("tools_used") or []) if str(item).strip()]
+        if tools_used:
+            lines.append("Used: " + ", ".join(tools_used[:6]))
+        files_changed = [str(item).strip() for item in list(metrics.get("files_changed") or []) if str(item).strip()]
+        if files_changed:
+            lines.append("Changed: " + ", ".join(files_changed[:5]))
+        return lines
+
+    @staticmethod
+    def _format_metric_int(value: Any) -> str:
+        try:
+            return f"{int(value):,}"
+        except Exception:
+            return "?"
+
+    def _format_message_metrics_footer(self, metrics: dict[str, Any]) -> str:
+        items: list[str] = []
+        context_used = metrics.get("context_used_tokens")
+        context_max = metrics.get("context_max_tokens")
+        if context_used is not None or context_max is not None:
+            items.append(
+                "Ctx "
+                f"{self._format_metric_int(context_used) if context_used is not None else '?'}"
+                "/"
+                f"{self._format_metric_int(context_max) if context_max is not None else '?'}"
+            )
+
+        input_tokens = int(metrics.get("input_tokens") or 0)
+        output_tokens = int(metrics.get("output_tokens") or 0)
+        total_tokens = int(metrics.get("total_tokens") or 0)
+        if input_tokens > 0:
+            items.append(f"In {self._format_metric_int(input_tokens)}")
+        if output_tokens > 0:
+            items.append(f"Out {self._format_metric_int(output_tokens)}")
+        if total_tokens > 0:
+            items.append(f"Total {self._format_metric_int(total_tokens)}")
+
+        prompt_total = int(metrics.get("prompt_tokens_total") or 0)
+        prompt_cached = int(metrics.get("prompt_tokens_cached") or 0)
+        cached_input = int(metrics.get("cached_input_tokens") or 0)
+        cache_tokens = max(prompt_cached, cached_input)
+        if cache_tokens > 0:
+            if prompt_total > 0:
+                items.append(
+                    f"Cache {self._format_metric_int(cache_tokens)}/{self._format_metric_int(prompt_total)}"
+                )
+            else:
+                items.append(f"Cache {self._format_metric_int(cache_tokens)}")
+
+        estimated_cost = metrics.get("estimated_cost_usd")
+        if estimated_cost is not None:
+            try:
+                items.append(f"Cost ${float(estimated_cost):.4f}")
+            except Exception:
+                pass
+        return "  ·  ".join(items)
+
+    @staticmethod
+    def _context_summary_text(
+        *,
+        used_tokens: Any,
+        max_tokens: Any,
+        remaining_tokens: Any,
+        ratio: Any,
+        percent_text: Optional[str] = None,
+    ) -> str:
+        if percent_text:
+            percent = percent_text
+        elif isinstance(ratio, (int, float)):
+            percent = f"{float(ratio) * 100:.0f}%"
+        else:
+            percent = "-"
+        return (
+            f"{percent} "
+            f"({used_tokens if used_tokens is not None else '?'} / {max_tokens if max_tokens is not None else '?'} used, "
+            f"{remaining_tokens if remaining_tokens is not None else '?'} remaining)"
+        )
+
+    def _append_final_summary_cards(self, *, round_number: int, metrics: dict[str, Any], content: str) -> None:
+        tools_used = [str(item).strip() for item in list(metrics.get("tools_used") or []) if str(item).strip()]
+        files_changed = [str(item).strip() for item in list(metrics.get("files_changed") or []) if str(item).strip()]
+        outcome_lines = [
+            f"Round {round_number} finished.",
+            f"Tools used: {', '.join(tools_used) if tools_used else 'none'}",
+            f"Files changed: {', '.join(files_changed) if files_changed else 'none'}",
+        ]
+        self.append_card(
+            "system",
+            "Round Outcome",
+            "\n".join(outcome_lines),
+            metadata={"round": round_number, "outcome_summary": True},
+        )
+        if files_changed:
+            self.append_card(
+                "system",
+                "Changed Files",
+                "\n".join(f"- {item}" for item in files_changed),
+                metadata={"round": round_number, "changed_files": files_changed},
+            )
+        verification = self._build_verification_summary(round_number)
+        if verification:
+            self.append_card(
+                "system",
+                "Verification",
+                verification,
+                metadata={"round": round_number, "verification": True},
+            )
+
+    def _build_verification_summary(self, round_number: int) -> str:
+        commands: list[str] = []
+        background_tasks: list[str] = []
+        for card in self.cards:
+            if card.kind != "tool":
+                continue
+            if int(card.metadata.get("round") or 0) != round_number:
+                continue
+            if str(card.metadata.get("tool_name") or "") != "Bash":
+                continue
+            tool_args = dict(card.metadata.get("tool_args") or {})
+            command = str(tool_args.get("command") or "").strip()
+            normalized = command.lower()
+            if any(token in normalized for token in ("pytest", " test", "cargo test", "npm test", "pnpm test", "go test", "uv run")):
+                commands.append(command or "test command")
+            background_task = card.metadata.get("background_task")
+            if isinstance(background_task, dict):
+                background_tasks.append(str(background_task.get("task_id") or ""))
+        if not commands and not background_tasks:
+            return ""
+        lines = []
+        if commands:
+            lines.append("Ran:")
+            lines.extend(f"- {command}" for command in commands[:4])
+        if background_tasks:
+            lines.append("Background work still running:")
+            lines.extend(f"- {task_id}" for task_id in background_tasks[:4] if task_id)
         return "\n".join(lines)
 
     def _finalize_current_round(self, *, outcome: str = "completed") -> None:

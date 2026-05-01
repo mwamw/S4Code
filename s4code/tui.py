@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -175,6 +176,7 @@ class S4TextualApp(App[None]):
         self._sidebar_dirty = True
         self._last_sidebar_content = ""
         self._last_sidebar_refresh_at = 0.0
+        self._recent_commands: list[str] = []
         self._diff_lexer_cache: dict[str, str] = {}
         self._theme = load_tui_theme(getattr(self.engine.settings.ui, "theme", "s4"))
 
@@ -362,6 +364,12 @@ class S4TextualApp(App[None]):
 
     async def _process_submission(self, text: str) -> None:
         try:
+            invocation = self.engine.command_registry.parse(text)
+            if invocation is not None:
+                self.engine.record_command_usage(invocation.name)
+                self._recent_commands = [item for item in self._recent_commands if item != invocation.name]
+                self._recent_commands.insert(0, invocation.name)
+                del self._recent_commands[12:]
             result = self.engine.command_registry.execute(self.engine, text)
             if result is None:
                 await self._run_query(text)
@@ -424,7 +432,12 @@ class S4TextualApp(App[None]):
 
     def _hydrate_transcript_from_engine(self, *, notice: Optional[str] = None) -> None:
         self._transcript_state.clear()
-        self._transcript_state.append_card("system", "System", "S4Code ready. Type /help for commands.")
+        welcome = self.engine.get_welcome_notice()
+        self._transcript_state.append_card(
+            str(welcome.get("kind") or "system"),
+            str(welcome.get("title") or "Welcome"),
+            str(welcome.get("body") or "").strip(),
+        )
         history_cards = self.engine.get_transcript_history_cards()
         if history_cards:
             self._transcript_state.append_card(
@@ -570,6 +583,7 @@ class S4TextualApp(App[None]):
         self._pending_focus_card_id = None
         self._pending_focus_card_top = False
         scroller = self.query_one("#transcript", VerticalScroll)
+        forced_follow = requested_force_scroll
         should_follow = requested_force_scroll or self._should_follow_transcript(scroller)
         previous_scroll_y = getattr(scroller, "scroll_y", 0)
         mount_wait = self._sync_transcript_widgets()
@@ -585,6 +599,7 @@ class S4TextualApp(App[None]):
                     self._restore_transcript_scroll_after_mount(
                         mount_wait,
                         should_follow=should_follow,
+                        forced_follow=forced_follow,
                         previous_scroll_y=previous_scroll_y,
                         target_card_id=target_card_id,
                         target_card_top=target_card_top,
@@ -597,6 +612,7 @@ class S4TextualApp(App[None]):
                 callback(
                     self._restore_transcript_scroll,
                     should_follow,
+                    forced_follow,
                     previous_scroll_y,
                     target_card_id,
                     target_card_top,
@@ -604,6 +620,7 @@ class S4TextualApp(App[None]):
             else:
                 self._restore_transcript_scroll(
                     should_follow,
+                    forced_follow,
                     previous_scroll_y,
                     target_card_id,
                     target_card_top,
@@ -611,6 +628,7 @@ class S4TextualApp(App[None]):
         except Exception:
             self._restore_transcript_scroll(
                 should_follow,
+                forced_follow,
                 previous_scroll_y,
                 target_card_id,
                 target_card_top,
@@ -628,6 +646,7 @@ class S4TextualApp(App[None]):
     def _restore_transcript_scroll(
         self,
         should_follow: bool,
+        forced_follow: bool,
         previous_scroll_y: float,
         target_card_id: str | None = None,
         target_card_top: bool = False,
@@ -637,6 +656,11 @@ class S4TextualApp(App[None]):
         except Exception:
             return
         try:
+            if not forced_follow and self._transcript_scroll_changed_since_snapshot(
+                scroller,
+                previous_scroll_y,
+            ):
+                return
             if should_follow:
                 target_widget = self._card_widgets.get(target_card_id or "")
                 if target_widget is not None:
@@ -661,6 +685,7 @@ class S4TextualApp(App[None]):
         mount_wait: Any,
         *,
         should_follow: bool,
+        forced_follow: bool,
         previous_scroll_y: float,
         target_card_id: str | None,
         target_card_top: bool,
@@ -674,10 +699,24 @@ class S4TextualApp(App[None]):
             return
         self._restore_transcript_scroll(
             should_follow,
+            forced_follow,
             previous_scroll_y,
             target_card_id,
             target_card_top,
         )
+
+    @staticmethod
+    def _transcript_scroll_changed_since_snapshot(
+        scroller: VerticalScroll,
+        previous_scroll_y: float,
+        *,
+        tolerance: float = 0.75,
+    ) -> bool:
+        try:
+            current_scroll_y = float(getattr(scroller, "scroll_y", 0) or 0)
+        except Exception:
+            return False
+        return abs(current_scroll_y - float(previous_scroll_y or 0)) > max(float(tolerance), 0.0)
 
     def _scroll_card_to_top(self, card_id: str | None) -> None:
         if not card_id:
@@ -698,6 +737,11 @@ class S4TextualApp(App[None]):
     def _latest_non_separator_card_id(self) -> str | None:
         for card in reversed(self._transcript_state.cards):
             if card.kind != "separator":
+                if card.kind == "system" and any(
+                    bool(card.metadata.get(key))
+                    for key in ("outcome_summary", "changed_files", "verification", "conclusion")
+                ):
+                    continue
                 return card.card_id
         return None
 
@@ -769,6 +813,8 @@ class S4TextualApp(App[None]):
     def _refresh_live_rounds(self) -> None:
         if self._busy and self._transcript_state.refresh_round_timers():
             self._request_transcript_render()
+        for notice in self.engine.poll_runtime_notices():
+            self._render_event(notice)
         live_sidebar = self._busy or self.engine.has_live_runtime_activity(force=False)
         if self._sidebar_dirty:
             self._refresh_sidebar(force=True)
@@ -796,8 +842,11 @@ class S4TextualApp(App[None]):
                 box=ROUNDED,
                 padding=(0, 1),
             )
+        body_renderable = self._render_compact_body(card) if compact else self._render_body(card)
+        footer_left = self._footer_left(card, compact=compact)
+        panel_content = Group(body_renderable, footer_left) if footer_left is not None else body_renderable
         return Panel(
-            self._render_compact_body(card) if compact else self._render_body(card),
+            panel_content,
             title=title,
             border_style=border_style,
             title_align="left",
@@ -806,6 +855,14 @@ class S4TextualApp(App[None]):
             box=ROUNDED,
             padding=(0, 1),
         )
+
+    def _footer_left(self, card: TranscriptCard, *, compact: bool) -> Text | None:
+        if compact:
+            return None
+        footer = str(card.metadata.get("footer_left") or "").strip()
+        if not footer:
+            return None
+        return Text(footer, style=self._theme_value("layout.muted", "#94a3b8"))
 
     def _checkpoint_subtitle(self, card: TranscriptCard) -> Text | None:
         checkpoints = card.metadata.get("checkpoints")
@@ -1227,7 +1284,7 @@ class S4TextualApp(App[None]):
     def _build_palette_entries(self, current_text: str) -> tuple[list[PaletteEntry], str]:
         text = str(current_text or "").strip()
         if text == "/":
-            commands = self.engine.command_registry.list_commands()
+            commands = self._sort_commands_for_palette(self.engine.command_registry.list_commands())
             return ([self._command_to_palette_entry(command) for command in commands], "commands:")
         invocation = self.engine.command_registry.parse(text)
         if invocation is None:
@@ -1599,7 +1656,7 @@ class S4TextualApp(App[None]):
 
         command_fragment = invocation.name
         if " " not in text[1:]:
-            matches = self.engine.command_registry.match_commands(command_fragment)
+            matches = self._sort_commands_for_palette(self.engine.command_registry.match_commands(command_fragment))
             return ([self._command_to_palette_entry(command) for command in matches], f"commands:{command_fragment}")
         return ([], f"noop:{text}")
 
@@ -1610,12 +1667,39 @@ class S4TextualApp(App[None]):
             insert_text += " "
         return PaletteEntry(
             label=f"/{command.name}{usage}",
-            description=command.description,
+            description=f"[{command.category}] {command.description}",
             insert_text=insert_text,
             execute_text=f"/{command.name}",
             mode="insert",
             aliases=tuple(command.aliases),
         )
+
+    def _sort_commands_for_palette(self, commands: list[Any]) -> list[Any]:
+        pending_active = self.engine.get_pending_interaction() is not None
+        background_active = any(
+            str(item.get("status") or "").lower() in {"running", "queued", "waiting"}
+            for item in self.engine.get_task_choices(limit=30)
+        )
+        recent_usage = {name: index for index, name in enumerate(self.engine.get_recent_command_usage())}
+
+        def _score(command: Any) -> tuple[int, int, int, str]:
+            name = str(command.name)
+            state_bonus = 0
+            if pending_active and name in {"confirm", "deny", "answer", "pending"}:
+                state_bonus = -1000
+            elif background_active and name in {"tasks", "task", "runtime"}:
+                state_bonus = -800
+            elif self.engine.was_restored and name in {"restore", "session", "pending", "diff"}:
+                state_bonus = -600
+            recent_bonus = recent_usage.get(name, 999)
+            return (
+                state_bonus - int(getattr(command, "priority", 0) or 0),
+                recent_bonus,
+                0 if getattr(command, "category", "") else 1,
+                name,
+            )
+
+        return sorted(commands, key=_score)
 
     def _build_session_palette_entries(self, fragment: str, *, prefix: str) -> list[PaletteEntry]:
         entries: list[PaletteEntry] = []
@@ -1923,6 +2007,88 @@ class S4TextualApp(App[None]):
     def _mark_sidebar_dirty(self) -> None:
         self._sidebar_dirty = True
 
+    def _build_sidebar_renderable(self, payload: dict[str, Any]) -> Any:
+        lines: list[Text] = []
+        title_style = self._theme_value("cards.system.title", "bold #e2e8f0")
+        body_style = self._theme_value("cards.system.text", "#cbd5e1")
+        muted_style = self._theme_value("layout.muted", "#94a3b8")
+
+        def _line(text: str, *, style: str = body_style) -> None:
+            lines.append(Text(text, style=style))
+
+        project = str(payload.get("project_name") or "-")
+        branch = str(payload.get("branch") or "-")
+        model = str(payload.get("model") or "-")
+        provider = str(payload.get("provider") or "-")
+        session_id = str(payload.get("session_id") or "-")
+        permissions = str(payload.get("permission_mode") or "-")
+        worktree = dict(payload.get("worktree") or {})
+        active_worktree = worktree.get("active") or {}
+        context = dict(payload.get("context") or {})
+        skills = dict(payload.get("skills") or {})
+        pending = dict(payload.get("pending") or {})
+        restore = dict(payload.get("restore") or {})
+        deferred = dict(payload.get("deferred_tools") or {})
+        mcp = dict(payload.get("mcp") or {})
+
+        _line(project, style=title_style)
+        _line(f"Branch: {branch}")
+        _line(f"Model: {model} via {provider}")
+        _line(f"Session: {session_id}")
+        _line(f"Permissions: {permissions}", style=muted_style)
+        if active_worktree:
+            _line(f"Worktree: {active_worktree.get('branch') or '-'}")
+            _line(str(active_worktree.get("path") or "-"), style=muted_style)
+        else:
+            _line("Worktree: none", style=muted_style)
+        lines.append(Text(""))
+        context_bar = str(context.get("usage_bar") or "[----------------]")
+        context_percent = str(context.get("usage_percent") or "-")
+        used_tokens = context.get("used_tokens")
+        max_tokens = context.get("max_tokens")
+        remaining_tokens = context.get("remaining_tokens")
+        _line(f"Context {context_bar} {context_percent}")
+        _line(
+            f"{used_tokens if used_tokens is not None else '?'} / {max_tokens if max_tokens is not None else '?'} used"
+            f" · {remaining_tokens if remaining_tokens is not None else '?'} remaining",
+            style=muted_style,
+        )
+        lines.append(Text(""))
+        active_skills = list(skills.get("active") or [])
+        queued_skills = list(skills.get("queued") or [])
+        _line("Skills", style=title_style)
+        _line("Active: " + (", ".join(active_skills[:3]) if active_skills else "none"), style=muted_style)
+        _line("Queued: " + (", ".join(queued_skills[:3]) if queued_skills else "none"), style=muted_style)
+        _line(
+            f"Deferred: {deferred.get('loaded', 0)} loaded · {deferred.get('pending_schema', 0)} waiting",
+            style=muted_style,
+        )
+        if mcp.get("enabled"):
+            _line(
+                "MCP: "
+                f"{mcp.get('connected', 0)} connected · {mcp.get('disabled', 0)} disabled · "
+                f"{mcp.get('unavailable', 0)} unavailable",
+                style=muted_style,
+            )
+        lines.append(Text(""))
+        _line("Background", style=title_style)
+        _line(
+            f"{payload.get('active_background_count', 0)} active · {payload.get('failed_background_count', 0)} failed",
+            style=muted_style,
+        )
+        for item in list(payload.get("background_tasks") or [])[:4]:
+            _line(f"- {item.get('task_id') or '-'} [{item.get('status') or '-'}]", style=muted_style)
+        if pending.get("active"):
+            lines.append(Text(""))
+            _line("Pending", style=title_style)
+            _line(f"{pending.get('title') or 'Approval required'}", style=body_style)
+            _line(f"Risk: {pending.get('risk_level') or 'unknown'}", style=muted_style)
+        if restore.get("summary"):
+            lines.append(Text(""))
+            _line("Continuity", style=title_style)
+            _line(str(restore.get("summary") or ""), style=muted_style)
+        return Group(*lines)
+
     def _refresh_sidebar(self, *, force: bool = False) -> None:
         sidebar = self.query_one("#sidebar", Static)
         if not bool(sidebar.display):
@@ -1930,13 +2096,23 @@ class S4TextualApp(App[None]):
         now = time.monotonic()
         if not force and (now - self._last_sidebar_refresh_at) < 0.75:
             return
-        content = self.engine.format_sidebar(force=force)
+        payload = self.engine.get_sidebar_payload(force=force)
+        content_key = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         self._last_sidebar_refresh_at = now
         self._sidebar_dirty = False
-        if content == self._last_sidebar_content:
+        if content_key == self._last_sidebar_content:
             return
-        self._last_sidebar_content = content
-        sidebar.update(content)
+        self._last_sidebar_content = content_key
+        sidebar.update(
+            Panel(
+                self._build_sidebar_renderable(payload),
+                title="Status",
+                title_align="left",
+                border_style=self._theme_value("layout.sidebar_border", "#475569"),
+                box=ROUNDED,
+                padding=(0, 1),
+            )
+        )
 
     def _apply_sidebar_visibility(self) -> None:
         sidebar = self.query_one("#sidebar", Static)

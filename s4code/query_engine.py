@@ -22,6 +22,7 @@ from .theme import list_bundled_themes
 
 from core.history import canonical_text_content, coerce_canonical_message
 from core.permissions import PermissionBehavior, PermissionRule
+from observability.recorder import _normalize_cache_accounting
 
 
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -37,7 +38,11 @@ def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[st
 def _extract_last_compaction_state(usage: dict[str, Any]) -> dict[str, Any]:
     compaction_raw = usage.get("last_history_compaction")
     if not isinstance(compaction_raw, dict):
-        compaction_raw = usage.get("compaction") or {}
+        container = usage.get("compaction")
+        if isinstance(container, dict) and isinstance(container.get("last"), dict):
+            compaction_raw = container.get("last") or {}
+        else:
+            compaction_raw = container or {}
     compaction = dict(compaction_raw or {})
     if "max_tokens" not in compaction and compaction.get("budget") is not None:
         compaction["max_tokens"] = compaction.get("budget")
@@ -69,6 +74,8 @@ class S4QueryEngine:
         self._checkpoints: list[dict[str, Any]] = []
         self._session_dirty = False
         self._runtime_cache: dict[str, tuple[float, Any]] = {}
+        self._last_background_notice_states: dict[str, str] = {}
+        self._last_command_usage: list[str] = []
 
         if session_id is not None:
             self._apply_session_record(self._require_session_record(session_id))
@@ -125,6 +132,244 @@ class S4QueryEngine:
         ]
         for key in stale:
             self._runtime_cache.pop(key, None)
+
+    def record_command_usage(self, command_name: str) -> None:
+        normalized = str(command_name or "").strip().lower()
+        if not normalized:
+            return
+        self._last_command_usage = [item for item in self._last_command_usage if item != normalized]
+        self._last_command_usage.insert(0, normalized)
+        del self._last_command_usage[12:]
+
+    def get_recent_command_usage(self) -> list[str]:
+        return list(self._last_command_usage)
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _ratio(numerator: Any, denominator: Any) -> Optional[float]:
+        left = S4QueryEngine._safe_float(numerator)
+        right = S4QueryEngine._safe_float(denominator)
+        if left is None or right is None or right <= 0:
+            return None
+        return max(min(left / right, 1.0), 0.0)
+
+    @staticmethod
+    def _format_percent(ratio: Any) -> str:
+        value = S4QueryEngine._safe_float(ratio)
+        if value is None:
+            return "-"
+        return f"{value * 100:.0f}%"
+
+    @staticmethod
+    def _format_ratio_bar(ratio: Any, *, width: int = 16) -> str:
+        value = S4QueryEngine._safe_float(ratio)
+        if value is None:
+            return "[" + ("-" * max(int(width), 1)) + "]"
+        bounded = max(min(value, 1.0), 0.0)
+        slots = max(int(width), 1)
+        filled = min(slots, int(round(bounded * slots)))
+        return "[" + ("#" * filled) + ("-" * (slots - filled)) + "]"
+
+    def _context_usage_summary(self, usage: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        payload = dict(usage or self.agent.get_context_usage() or {})
+        budget = dict(payload.get("budget") or {})
+        request_estimate = dict(payload.get("requestEstimate") or {})
+        token_breakdown = dict(payload.get("tokenBreakdown") or {})
+        history_payload = dict(payload.get("history") or {})
+        used_tokens = self._safe_int(payload.get("used_tokens"))
+        estimated_request_tokens = self._safe_int(payload.get("estimated_request_tokens"))
+        if estimated_request_tokens is None:
+            estimated_request_tokens = self._safe_int(request_estimate.get("estimatedRequestTokens"))
+        if used_tokens is None:
+            used_tokens = estimated_request_tokens
+        max_tokens = self._safe_int(payload.get("max_tokens"))
+        if max_tokens is None:
+            max_tokens = self._safe_int(budget.get("maxTokens"))
+        remaining_tokens = self._safe_int(payload.get("remaining_tokens"))
+        if remaining_tokens is None:
+            remaining_tokens = self._safe_int(budget.get("remainingTokens"))
+        request_layers = dict(payload.get("request_layers") or payload.get("requestLayers") or {})
+        history_budget_tokens = self._safe_int(payload.get("history_budget_tokens"))
+        if history_budget_tokens is None:
+            history_budget_tokens = self._safe_int(budget.get("historyBudgetTokens"))
+        history_tokens = self._safe_int(payload.get("history_tokens"))
+        if history_tokens is None:
+            history_tokens = self._safe_int(token_breakdown.get("historyTokens"))
+        system_tokens = self._safe_int(payload.get("system_tokens"))
+        if system_tokens is None:
+            system_tokens = self._safe_int(token_breakdown.get("systemTokens"))
+        tool_tokens = self._safe_int(payload.get("tool_tokens"))
+        if tool_tokens is None:
+            tool_tokens = self._safe_int(token_breakdown.get("toolTokens"))
+        reasoning_tokens = self._safe_int(payload.get("reasoning_tokens"))
+        if reasoning_tokens is None:
+            reasoning_tokens = self._safe_int(token_breakdown.get("reasoningTokens"))
+        ratio = self._ratio(used_tokens if used_tokens is not None else estimated_request_tokens, max_tokens)
+        compaction = _extract_last_compaction_state(payload)
+        cache_state = dict(payload.get("cache") or {})
+        return {
+            "used_tokens": used_tokens,
+            "max_tokens": max_tokens,
+            "remaining_tokens": remaining_tokens,
+            "estimated_request_tokens": estimated_request_tokens,
+            "usage_ratio": ratio,
+            "usage_percent": self._format_percent(ratio),
+            "usage_bar": self._format_ratio_bar(ratio),
+            "history_budget_tokens": history_budget_tokens,
+            "history_tokens": history_tokens,
+            "system_tokens": system_tokens,
+            "tool_tokens": tool_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "request_layers": request_layers,
+            "request_estimate_source": str(payload.get("request_estimate_source") or request_estimate.get("source") or ""),
+            "canonical_history_messages": self._safe_int(history_payload.get("canonicalMessages")),
+            "replay_history_messages": self._safe_int(history_payload.get("replayMessages")),
+            "pending_step_active": bool(history_payload.get("pendingStepActive") or payload.get("pending_step_active")),
+            "compaction": compaction,
+            "cache": cache_state,
+        }
+
+    @staticmethod
+    def _cache_summary_from_llm_items(llm_items: list[dict[str, Any]]) -> dict[str, Any]:
+        prompt_tokens_total = 0
+        prompt_tokens_uncached = 0
+        prompt_tokens_cached = 0
+        cached_input_tokens = 0
+        cache_read_tokens = 0
+        cache_creation_tokens = 0
+        for item in llm_items:
+            total_prompt, uncached_prompt, cached_prompt = _normalize_cache_accounting(item)
+            prompt_tokens_total += int(total_prompt or 0)
+            prompt_tokens_uncached += int(uncached_prompt or 0)
+            prompt_tokens_cached += int(cached_prompt or 0)
+            cached_input_tokens += int(item.get("cachedInputTokens") or 0)
+            cache_read_tokens += int(item.get("cacheReadTokens") or 0)
+            cache_creation_tokens += int(item.get("cacheCreationTokens") or 0)
+        cache_hit_ratio = None
+        if prompt_tokens_total > 0:
+            cache_hit_ratio = float(prompt_tokens_cached) / float(prompt_tokens_total)
+        return {
+            "prompt_tokens_total": prompt_tokens_total,
+            "prompt_tokens_uncached": prompt_tokens_uncached,
+            "prompt_tokens_cached": prompt_tokens_cached,
+            "cache_hit_tokens": prompt_tokens_cached,
+            "cache_hit_ratio": cache_hit_ratio,
+            "cached_input_tokens": cached_input_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+        }
+
+    def _format_context_meter_line(self, usage_summary: dict[str, Any]) -> str:
+        used_tokens = usage_summary.get("used_tokens")
+        max_tokens = usage_summary.get("max_tokens")
+        remaining_tokens = usage_summary.get("remaining_tokens")
+        return (
+            "Context: "
+            f"{usage_summary.get('usage_bar')} {usage_summary.get('usage_percent')} "
+            f"({used_tokens if used_tokens is not None else '?'} / {max_tokens if max_tokens is not None else '?'} used, "
+            f"{remaining_tokens if remaining_tokens is not None else '?'} remaining)"
+        )
+
+    def _permission_mode_label(self) -> str:
+        permission_mode = getattr(getattr(self.agent, "permission_context", None), "mode", None)
+        return str(getattr(permission_mode, "value", permission_mode) or "-")
+
+    def _permission_rule_count(self) -> int:
+        return int(self.get_permission_status_payload().get("ruleCount") or 0)
+
+    def _deferred_tool_summary(self) -> dict[str, int]:
+        total = 0
+        loaded = 0
+        immediate = 0
+        for spec in self.registry.list_tool_specs():
+            visibility_scope = str(getattr(spec, "visibility_scope", "resident") or "resident")
+            if visibility_scope == "resident":
+                immediate += 1
+            if bool(getattr(spec, "expose_in_deferred", False)) or visibility_scope != "resident":
+                total += 1
+                if visibility_scope != "resident":
+                    loaded += 1
+        return {
+            "total": total,
+            "loaded": loaded,
+            "pending_schema": max(total - loaded, 0),
+            "immediate": immediate,
+        }
+
+    def get_context_panel_payload(self) -> dict[str, Any]:
+        usage_summary = self._context_usage_summary()
+        compaction = dict(usage_summary.get("compaction") or {})
+        cache_state = dict(usage_summary.get("cache") or {})
+        return {
+            **usage_summary,
+            "last_compaction_changed": bool(compaction.get("was_compacted")),
+            "last_compaction_before": self._safe_int(compaction.get("tokens_before")),
+            "last_compaction_after": self._safe_int(compaction.get("tokens_after")),
+            "last_compaction_budget": self._safe_int(compaction.get("max_tokens")),
+            "cache_enabled": bool(cache_state.get("enabled")),
+            "cache_anchor_active": bool(cache_state.get("anchorActive")),
+            "cache_pending_anchor": bool(cache_state.get("pendingAnchorActive")),
+            "cache_last_usage": dict(cache_state.get("lastCacheUsage") or {}),
+            "cache_last_break": dict(cache_state.get("lastBreak") or {}),
+            "cache_provider_capability": dict(cache_state.get("providerCapability") or {}),
+        }
+
+    def get_sidebar_payload(self, *, force: bool = False) -> dict[str, Any]:
+        skills = self.get_skill_choices()
+        background_tasks = self._get_background_task_snapshots(limit=8, force=force)
+        active_background = [
+            item for item in background_tasks
+            if str(item.get("status") or "").lower() in {"running", "queued", "waiting"}
+        ]
+        failed_background = [
+            item for item in background_tasks
+            if str(item.get("status") or "").lower() in {"failed", "error"}
+        ]
+        deferred_tools = self._deferred_tool_summary()
+        context_panel = self.get_context_panel_payload()
+        restore = self.get_restore_continuity_payload()
+        pending = self.get_pending_risk_payload()
+        mcp = self.get_mcp_summary_payload()
+        return {
+            "project_name": self.project.project_name,
+            "branch": self.project.branch or "-",
+            "profile": self.settings.active_model_profile,
+            "model": getattr(self.agent.llm, "model", "-"),
+            "provider": getattr(self.agent.llm, "provider_name", "-"),
+            "session_id": self.session_id,
+            "permission_mode": self._permission_mode_label(),
+            "permission_rules": self._permission_rule_count(),
+            "worktree": self.get_worktree_status_payload(),
+            "skills": {
+                "active": [item["name"] for item in skills if item.get("active")],
+                "queued": [item["name"] for item in skills if item.get("pending")],
+            },
+            "deferred_tools": deferred_tools,
+            "mcp": mcp,
+            "background_tasks": background_tasks,
+            "active_background_count": len(active_background),
+            "failed_background_count": len(failed_background),
+            "context": context_panel,
+            "pending": pending,
+            "restore": restore,
+        }
 
     @property
     def was_restored(self) -> bool:
@@ -298,6 +543,9 @@ class S4QueryEngine:
         if not llm_items and not tool_items:
             return {}
 
+        cache_summary = self._cache_summary_from_llm_items(llm_items)
+        context_summary = self._context_usage_summary()
+
         return {
             "round": round_number,
             "llm_requests": len(llm_items),
@@ -308,6 +556,19 @@ class S4QueryEngine:
             "output_tokens": sum(int(item.get("outputTokens") or 0) for item in llm_items),
             "total_tokens": sum(int(item.get("totalTokens") or 0) for item in llm_items),
             "estimated_cost_usd": estimated_cost if saw_cost else None,
+            "context_used_tokens": context_summary.get("used_tokens"),
+            "context_max_tokens": context_summary.get("max_tokens"),
+            "context_remaining_tokens": context_summary.get("remaining_tokens"),
+            "context_usage_ratio": context_summary.get("usage_ratio"),
+            "context_usage_percent": context_summary.get("usage_percent"),
+            "prompt_tokens_total": cache_summary.get("prompt_tokens_total"),
+            "prompt_tokens_cached": cache_summary.get("prompt_tokens_cached"),
+            "prompt_tokens_uncached": cache_summary.get("prompt_tokens_uncached"),
+            "cache_hit_tokens": cache_summary.get("cache_hit_tokens"),
+            "cache_hit_ratio": cache_summary.get("cache_hit_ratio"),
+            "cached_input_tokens": cache_summary.get("cached_input_tokens"),
+            "cache_read_tokens": cache_summary.get("cache_read_tokens"),
+            "cache_creation_tokens": cache_summary.get("cache_creation_tokens"),
             "tools_used": sorted(
                 {
                     str(item.get("toolName") or "").strip()
@@ -1287,6 +1548,10 @@ class S4QueryEngine:
                     if runtime_hook is not None and runtime_hook.has_pending_compactions:
                         runtime_hook.flush_compaction_result(self.agent)
                     await queue.put(event)
+                    if event_type == "tool_result" and tool_name == "Bash":
+                        background_notice = self._background_task_notice_from_event(event)
+                        if background_notice is not None:
+                            await queue.put(background_notice)
                     if event_type in {"tool_result", "final", "interruption", "error"} and active_round > 0:
                         metrics = self._build_round_metrics(
                             round_number=active_round,
@@ -1350,12 +1615,140 @@ class S4QueryEngine:
             if compact:
                 self.title = compact[:72]
 
+    def get_welcome_notice(self) -> dict[str, str]:
+        permission_label = self._permission_mode_label()
+        skills = self.get_skill_choices()
+        active_skills = [item["name"] for item in skills if item["active"]]
+        pending_skills = [item["name"] for item in skills if item["pending"]]
+        startup_issues = list(self.bundle.startup_issues)
+        lines = [
+            f"Project: `{self.project.project_name}`",
+            f"Root: `{self.project.project_root}`",
+            f"Branch: `{self.project.branch or '-'}`",
+            f"Model: `{getattr(self.agent.llm, 'model', '-')}` via `{getattr(self.agent.llm, 'provider_name', '-')}`",
+            f"Session: `{self.session_id}`",
+            f"Permissions: `{permission_label}`",
+            "",
+            "Start here:",
+            "- Ask directly for a bug fix, code change, review, test run, or repo walkthrough.",
+            "- Use `/status` to inspect the current workspace and runtime state.",
+            "- Use `/help` for command guidance by task.",
+            "- Use `/session list` to restore an earlier session.",
+            "",
+            "Recommended first prompts:",
+            "- Fix the failing test in the current branch.",
+            "- Read this repo and explain the main flow before editing.",
+            "- Review the current diff and focus on regressions.",
+            "- Run the relevant tests for my last change.",
+            "- Explain the current git diff in plain English.",
+        ]
+        if not self.project.is_git_repo:
+            lines.append("- This folder is not a git repository, so `/diff`, branch status, and worktree features will be limited.")
+        if permission_label in {"plan", "default"}:
+            lines.append(f"- Permission mode is `{permission_label}`, so risky actions may pause for approval.")
+        if startup_issues:
+            lines.append("- Startup issues: " + "; ".join(startup_issues[:3]))
+        if active_skills:
+            lines.append(f"- Active skills: {', '.join(active_skills[:4])}")
+        if pending_skills:
+            lines.append(f"- Queued for next turn: {', '.join(pending_skills[:4])}")
+        return {
+            "kind": "system",
+            "title": "Welcome",
+            "body": "\n".join(lines),
+        }
+
     def format_help(self) -> str:
-        lines = ["Available commands:"]
+        grouped_commands: dict[str, list[str]] = {}
+        lines = [
+            "S4Code quick start",
+            "",
+            "Ask in plain language when you want S4Code to inspect code, make edits, run tests, review a diff, or explain a repository.",
+            "",
+            "Good first prompts:",
+            "- Find the bug in the current branch and fix it.",
+            "- Review the current diff and focus on regressions.",
+            "- Explain how this module works before changing it.",
+            "- Run the relevant tests for my last change.",
+            "",
+            "Task-oriented command map:",
+            "- Understand the workspace: `/status`, `/context`, `/tools`, `/skills`, `/worktree`",
+            "- Review or explain changes: `/diff`, `/review`, `/trace`",
+            "- Follow long-running work: `/tasks`, `/task output <id>`, `/task stop <id>`",
+            "- Restore continuity: `/session list`, `/session load <id>`, `/restore`, `/pending`",
+            "- Handle approvals: `/pending`, `/confirm`, `/deny`, `/answer`",
+            "",
+            "Command-oriented reference:",
+        ]
         for command in self.command_registry.list_commands():
             usage = f" {command.usage}" if command.usage else ""
             aliases = f" ({', '.join('/' + alias for alias in command.aliases)})" if command.aliases else ""
-            lines.append(f"/{command.name}{usage}{aliases}: {command.description}")
+            grouped_commands.setdefault(command.category, []).append(
+                f"- `/{command.name}{usage}`{aliases}: {command.description}"
+            )
+        for category in sorted(grouped_commands):
+            lines.append(f"{category}:")
+            lines.extend(grouped_commands[category])
+        return "\n".join(lines)
+
+    def format_status_overview(self) -> str:
+        permission_label = self._permission_mode_label()
+        skills = self.get_skill_choices()
+        active_skills = [item["name"] for item in skills if item["active"]]
+        queued_skills = [item["name"] for item in skills if item["pending"]]
+        worktree = self.get_worktree_status_payload()
+        background_tasks = self._get_background_task_snapshots(limit=10)
+        live_background = [
+            item for item in background_tasks
+            if str(item.get("status") or "").lower() in {"running", "queued", "waiting"}
+        ]
+        context_panel = self.get_context_panel_payload()
+        lines = [
+            "S4Code status",
+            f"- Project: {self.project.project_name}",
+            f"- Root: {self.project.project_root}",
+            f"- Branch: {self.project.branch or '-'}",
+            f"- Session: {self.session_id}",
+            f"- Model: {getattr(self.agent.llm, 'model', '-')}",
+            f"- Provider: {getattr(self.agent.llm, 'provider_name', '-')}",
+            f"- Permissions: {permission_label}",
+            f"- Tools: {len(self.registry.get_tool_names())}",
+            f"- Skills: {len(skills)} available, {len(active_skills)} active",
+            (
+                "- Worktree: "
+                + (
+                    f"{worktree['active']['branch'] or '-'} @ {worktree['active']['path']}"
+                    if worktree.get("active")
+                    else "none"
+                )
+            ),
+            f"- {self._format_context_meter_line(context_panel)}",
+            f"- Background tasks: {len(background_tasks)} total, {len(live_background)} active",
+        ]
+        if active_skills:
+            lines.append(f"- Active skills: {', '.join(active_skills[:6])}")
+        if queued_skills:
+            lines.append(f"- Queued for next turn: {', '.join(queued_skills[:6])}")
+        if context_panel.get("cache_enabled"):
+            lines.append(f"- Cache status: enabled (anchor active: {context_panel.get('cache_anchor_active')})")
+        if live_background:
+            lines.append("")
+            lines.append("Active background tasks:")
+            for item in live_background[:5]:
+                lines.append(
+                    f"- {item.get('task_id') or '-'} | {item.get('status') or '-'} | {item.get('command') or item.get('cwd') or '-'}"
+                )
+            lines.append("Use `/task output <id>` to inspect logs or `/task stop <id>` to stop one.")
+        lines.extend(
+            [
+                "",
+                "Next useful commands:",
+                "- `/help`",
+                "- `/diff`",
+                "- `/tasks`",
+                "- `/session list`",
+            ]
+        )
         return "\n".join(lines)
 
     def format_status(self) -> str:
@@ -1420,115 +1813,73 @@ class S4QueryEngine:
         return json.dumps(status, ensure_ascii=False, indent=2)
 
     def format_sidebar(self, *, force: bool = False) -> str:
-        permission_mode = getattr(getattr(self.agent, "permission_context", None), "mode", None).value
-        permission_status = self.get_permission_status_payload()
-        agent_mode = self.agent.get_execution_mode().value
-        handles = self.get_agent_choices(limit=5, force=force)
-        tasks = self.get_task_choices(limit=5, force=force)
-        background_tasks = self._get_background_task_snapshots(limit=5, force=force)
-        worktree = self.get_worktree_status_payload()
-        skills = self.get_skill_choices()
-        active_skills = [item["name"] for item in skills if item["active"]]
-        context_usage = self.agent.get_context_usage()
-        restore_report = self.get_restore_report()
-        mcp_summary = self.get_mcp_summary_payload()
-        restore_status = "-"
-        restore_issue_count = 0
-        if isinstance(restore_report, dict):
-            restore_status = str(restore_report.get("status") or "-")
-            restore_issue_count = len(list(restore_report.get("issues") or []))
-        mcp_line = "disabled"
-        if mcp_summary.get("enabled"):
-            configured = int(mcp_summary.get("configured") or 0)
-            if configured <= 0:
-                mcp_line = "none"
-            else:
-                parts = [
-                    f"{configured} configured",
-                    f"{int(mcp_summary.get('connected') or 0)} connected",
-                ]
-                disabled = int(mcp_summary.get("disabled") or 0)
-                unavailable = int(mcp_summary.get("unavailable") or 0)
-                if disabled:
-                    parts.append(f"{disabled} disabled")
-                if unavailable:
-                    parts.append(f"{unavailable} unavailable")
-                mcp_line = " | ".join(parts)
+        payload = self.get_sidebar_payload(force=force)
+        worktree = dict(payload.get("worktree") or {})
+        active_worktree = worktree.get("active") or {}
+        context_panel = dict(payload.get("context") or {})
+        pending = dict(payload.get("pending") or {})
+        restore = dict(payload.get("restore") or {})
+        deferred = dict(payload.get("deferred_tools") or {})
+        mcp = dict(payload.get("mcp") or {})
+        skills = dict(payload.get("skills") or {})
         lines = [
-            f"Project: {self.project.project_name}",
-            f"Branch: {self.project.branch or '-'}",
-            f"Profile: {self.settings.active_model_profile}",
-            f"Model: {getattr(self.agent.llm, 'model', '-')}",
-            f"Provider: {getattr(self.agent.llm, 'provider_name', '-')}",
-            f"Mode: {agent_mode}",
-            f"Permissions: {permission_mode} ({permission_status.get('ruleCount', 0)} rules)",
-            f"Session: {self.session_id}",
-            f"Checkpoints: {len(self._checkpoints)}",
-            f"Tools: {len(self.registry.get_tool_names())}",
-            f"MCP: {mcp_line}",
-            f"Restore: {restore_status} ({restore_issue_count} issue(s))",
+            f"Project: {payload.get('project_name')}",
+            f"Branch: {payload.get('branch')}",
+            f"Model: {payload.get('model')} via {payload.get('provider')}",
+            f"Session: {payload.get('session_id')}",
+            f"Permissions: {payload.get('permission_mode')} ({payload.get('permission_rules')} rules)",
+            (
+                "MCP: "
+                + (
+                    f"{mcp.get('configured', 0)} configured | {mcp.get('connected', 0)} connected | "
+                    f"{mcp.get('disabled', 0)} disabled | {mcp.get('unavailable', 0)} unavailable"
+                    if mcp.get("enabled")
+                    else "disabled"
+                )
+            ),
             (
                 "Worktree: "
                 + (
-                    f"{worktree['active']['branch'] or '-'} @ {worktree['active']['path']}"
-                    if worktree.get("active")
+                    f"{active_worktree.get('branch') or '-'} @ {active_worktree.get('path') or '-'}"
+                    if active_worktree
                     else "none"
                 )
             ),
-            f"Skills: {len(skills)} available / {len(active_skills)} active",
             "",
-            "Context:",
-            (
-                f"- used={context_usage.get('used_tokens', '?')} "
-                f"remaining={context_usage.get('remaining_tokens', '?')} "
-                f"max={context_usage.get('max_tokens', '?')}"
-            ),
+            self._format_context_meter_line(context_panel),
+            f"Deferred tools: {deferred.get('loaded', 0)} loaded now, {deferred.get('pending_schema', 0)} need schema load",
             "",
-            "Next Turn Skills:",
+            "Skills:",
         ]
-        if self._pending_turn_skills:
-            lines.extend(f"- {name}" for name in self._pending_turn_skills[:5])
-        else:
-            lines.append("- none")
-        lines.extend(
-            [
-                "",
-                "Active Skills:",
-            ]
-        )
+        active_skills = list(skills.get("active") or [])
+        queued_skills = list(skills.get("queued") or [])
         if active_skills:
-            lines.extend(f"- {name}" for name in active_skills[:5])
+            lines.append("- Active: " + ", ".join(active_skills[:4]))
         else:
-            lines.append("- none")
-        lines.extend(
-            [
-                "",
-                "Background Tasks:",
-            ]
-        )
-        if background_tasks:
-            for item in background_tasks:
-                lines.append(f"- {item['task_id']}: {item['status']}")
+            lines.append("- Active: none")
+        if queued_skills:
+            lines.append("- Next turn: " + ", ".join(queued_skills[:4]))
         else:
-            lines.append("- none")
-        lines.extend(
-            [
-                "",
-                "Recent Tasks:",
-            ]
-        )
-        if tasks:
-            for task in tasks[:5]:
-                lines.append(f"- {task['task_id']}: {task['title']} [{task['status']}]")
-        else:
-            lines.append("- none")
+            lines.append("- Next turn: none")
         lines.append("")
-        lines.append("Agents:")
-        if handles:
-            for handle in handles[:5]:
-                lines.append(f"- {handle['agent_id']}: {handle['status']}")
+        lines.append(
+            f"Background tasks: {payload.get('active_background_count', 0)} active, "
+            f"{payload.get('failed_background_count', 0)} failed"
+        )
+        for item in list(payload.get("background_tasks") or [])[:4]:
+            lines.append(f"- {item.get('task_id') or '-'}: {item.get('status') or '-'}")
+        if pending.get("active"):
+            lines.append("")
+            lines.append(
+                f"Pending: {pending.get('title') or 'Approval needed'} "
+                f"({pending.get('risk_level') or 'unknown'} risk)"
+            )
+        if restore.get("summary"):
+            lines.append("")
+            lines.append("Restore: " + str(restore.get("summary")))
         else:
-            lines.append("- none")
+            lines.append("")
+            lines.append("Restore: current session only")
         return "\n".join(lines)
 
     def toggle_sidebar(self, visible: Optional[bool] = None) -> str:
@@ -1539,17 +1890,22 @@ class S4QueryEngine:
         return "Sidebar shown." if self.sidebar_visible else "Sidebar hidden."
 
     def format_current_session(self) -> str:
-        return json.dumps(
-            {
-                "sessionId": self.session_id,
-                "title": self.title,
-                "projectRoot": str(self.project.project_root),
-                "forkedFromSessionId": self.forked_from_session_id,
-                "checkpoints": self.get_checkpoint_choices(),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+        lines = [
+            "Current session",
+            f"- Title: {self.title}",
+            f"- Session ID: {self.session_id}",
+            f"- Project: {self.project.project_name}",
+            f"- Root: {self.project.project_root}",
+            f"- Model: {getattr(self.agent.llm, 'model', '-')}",
+            f"- Permissions: {self._permission_mode_label()}",
+            f"- Forked from: {self.forked_from_session_id or 'none'}",
+            f"- Checkpoints: {len(self.get_checkpoint_choices())}",
+        ]
+        restore = self.get_restore_continuity_payload()
+        if restore.get("summary"):
+            lines.append(f"- Restore state: {restore.get('summary')}")
+        lines.extend(["", "Next step:", "- Use `/session list` to switch sessions.", "- Use `/session checkpoints` or `/rewind` to move through history."])
+        return "\n".join(lines)
 
     def get_model_choices(self) -> list[dict[str, Any]]:
         choices: list[dict[str, Any]] = []
@@ -1634,19 +1990,26 @@ class S4QueryEngine:
             return "No skills discovered."
         lines: list[str] = []
         for item in skills:
-            markers: list[str] = []
             if item["active"]:
-                markers.append("active")
-            if item["pending"]:
-                markers.append("next-turn")
-            if item["registered"] and not item["active"]:
-                markers.append("registered")
-            status = f" [{', '.join(markers)}]" if markers else ""
-            lines.append(
-                f"{item['name']}{status} | {item['exposure_mode']}/{item['execution_mode']} | "
-                f"{item['listing_description'] or item['description'] or '-'} | "
-                f"{item['source_path'] or item['source_type']}"
+                status = "Active now"
+            elif item["pending"]:
+                status = "Queued for next turn only"
+            elif item["registered"]:
+                status = "Loaded but idle"
+            else:
+                status = "Available on demand"
+            availability = (
+                "Stays loaded"
+                if item["exposure_mode"] == "resident"
+                else "Loads for one turn"
             )
+            lines.append(
+                f"- {item['name']}: {status}. {availability}. "
+                f"{item['listing_description'] or item['description'] or '-'}"
+            )
+            when_to_use = str(item.get("when_to_use") or "").strip()
+            if when_to_use:
+                lines.append(f"  Use it when: {when_to_use}")
         return "\n".join(lines)
 
     def get_worktree_status_payload(self) -> dict[str, Any]:
@@ -1688,15 +2051,17 @@ class S4QueryEngine:
     def format_worktree_status(self) -> str:
         payload = self.get_worktree_status_payload()
         if not payload.get("available"):
-            return "Worktree runtime is not available."
+            return "Worktree support is not available in this session."
         active = payload.get("active")
-        lines = [f"Managed worktrees: {len(list(payload.get('managed') or []))}"]
+        managed = list(payload.get("managed") or [])
+        lines = [f"Managed worktrees: {len(managed)}"]
         if active:
-            lines.append(f"Active path: {active.get('path') or '-'}")
-            lines.append(f"Active branch: {active.get('branch') or '-'}")
+            lines.append(f"Current worktree: {active.get('branch') or '-'} @ {active.get('path') or '-'}")
             lines.append(f"Original cwd: {active.get('original_cwd') or '-'}")
+            lines.append("Next step: use `/worktree exit keep` to leave it, or `/worktree exit remove discard` only if you want to throw local changes away.")
         else:
-            lines.append("Active worktree: none")
+            lines.append("Current worktree: none")
+            lines.append("Next step: use `/worktree enter <name>` to start an isolated coding branch.")
         return "\n".join(lines)
 
     def enter_worktree(self, name: Optional[str] = None) -> str:
@@ -1820,7 +2185,13 @@ class S4QueryEngine:
     def format_task_detail(self, task_id: str) -> str:
         try:
             task = self.bundle.task_service.get_task(task_id)
-            return json.dumps(task.model_dump(mode="json"), ensure_ascii=False, indent=2)
+            lines = [
+                f"Task `{task.task_id}`",
+                f"- Status: {task.status.value}",
+                f"- Title: {task.title}",
+                f"- Parent: {getattr(task, 'parent_task_id', None) or 'none'}",
+            ]
+            return "\n".join(lines)
         except Exception:
             pass
         manager = self._get_process_manager()
@@ -1830,21 +2201,21 @@ class S4QueryEngine:
             snapshot = manager.get_task(task_id)
         except Exception as exc:
             raise ValueError(f"Task not found: {task_id}") from exc
-        return json.dumps(
-            {
-                "taskId": getattr(snapshot, "task_id", ""),
-                "status": getattr(snapshot, "status", ""),
-                "cwd": getattr(snapshot, "cwd", ""),
-                "command": getattr(snapshot, "command", ""),
-                "returnCode": getattr(snapshot, "return_code", None),
-                "startedAt": getattr(snapshot, "started_at", None),
-                "finishedAt": getattr(snapshot, "finished_at", None),
-                "stdoutTail": self._tail_text(str(getattr(snapshot, "stdout", "") or ""), max_chars=4000),
-                "stderrTail": self._tail_text(str(getattr(snapshot, "stderr", "") or ""), max_chars=4000),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+        stdout_tail = self._tail_text(str(getattr(snapshot, "stdout", "") or ""), max_chars=400)
+        stderr_tail = self._tail_text(str(getattr(snapshot, "stderr", "") or ""), max_chars=400)
+        lines = [
+            f"Background task `{getattr(snapshot, 'task_id', task_id)}`",
+            f"- Status: {getattr(snapshot, 'status', '-')}",
+            f"- Command: {self._format_command_value(getattr(snapshot, 'command', '')) or '-'}",
+            f"- Working directory: {getattr(snapshot, 'cwd', '-') or '-'}",
+            f"- Return code: {getattr(snapshot, 'return_code', None)}",
+        ]
+        if stdout_tail.strip():
+            lines.append(f"- Stdout tail: {stdout_tail.replace(chr(10), ' ')}")
+        if stderr_tail.strip():
+            lines.append(f"- Stderr tail: {stderr_tail.replace(chr(10), ' ')}")
+        lines.append("Next step: use `/task output <id>` to stream more output or `/task stop <id>` to stop it.")
+        return "\n".join(lines)
 
     def format_task_output(self, task_id: str, *, block: bool = False, timeout_ms: Optional[int] = None) -> str:
         result = self._execute_registry_tool(
@@ -1874,9 +2245,10 @@ class S4QueryEngine:
         for item in sessions:
             marker = "*" if item.session_id == self.session_id else "-"
             updated = item.updated_at.isoformat(timespec="seconds") if item.updated_at is not None else "-"
+            project_name = Path(item.project_root).name if item.project_root else "-"
             lines.append(
-                f"{marker} {item.session_id} | {item.title} | {item.model or '-'} | "
-                f"{item.permission_mode or '-'} | {updated} | {item.project_root or '-'}"
+                f"{marker} {item.title or item.session_id} | project={project_name} | "
+                f"id={item.session_id} | updated={updated} | model={item.model or '-'} | permissions={item.permission_mode or '-'}"
             )
         return "\n".join(lines)
 
@@ -1889,19 +2261,24 @@ class S4QueryEngine:
             return "No tools registered."
         lines: list[str] = []
         for spec in specs:
-            flags: list[str] = []
-            if spec.read_only:
-                flags.append("read-only")
-            if spec.requires_confirmation:
-                flags.append("confirm")
+            if spec.visibility_scope == "resident":
+                availability = "Available now"
+            elif spec.visibility_scope == "runtime":
+                availability = "Loaded for the current runtime"
+            elif spec.visibility_scope == "turn":
+                availability = "Loaded for this turn only"
+            elif bool(getattr(spec, "expose_in_deferred", False)):
+                availability = "Available after loading its schema"
+            else:
+                availability = "Not exposed by default"
+            risk = "Read-only"
             if spec.destructive:
-                flags.append("destructive")
-            if spec.visibility_scope != "resident":
-                flags.append(spec.visibility_scope)
-            if spec.side_effect_level != "none":
-                flags.append(f"side={spec.side_effect_level}")
-            suffix = f" [{', '.join(flags)}]" if flags else ""
-            lines.append(f"{spec.name}{suffix}: {spec.description}")
+                risk = "High-risk change"
+            elif spec.requires_confirmation:
+                risk = "Needs approval"
+            elif spec.side_effect_level != "none":
+                risk = "Writes or changes state"
+            lines.append(f"- {spec.name}: {availability}. {risk}. {spec.description}")
         return "\n".join(lines)
 
     def format_models(self) -> str:
@@ -1920,7 +2297,88 @@ class S4QueryEngine:
         return "\n".join(lines)
 
     def format_context(self) -> str:
-        return json.dumps(self.agent.get_context_usage(), ensure_ascii=False, indent=2)
+        payload = self.get_context_panel_payload()
+        lines = [
+            "Context usage",
+            f"- {self._format_context_meter_line(payload)}",
+        ]
+        estimate = payload.get("estimated_request_tokens")
+        if estimate is not None:
+            lines.append(f"- Estimated request size: {estimate} token(s)")
+        breakdown_bits: list[str] = []
+        for label, key in (
+            ("history", "history_tokens"),
+            ("system", "system_tokens"),
+            ("tools", "tool_tokens"),
+            ("reasoning", "reasoning_tokens"),
+        ):
+            value = payload.get(key)
+            if value is not None:
+                breakdown_bits.append(f"{label}={value}")
+        if breakdown_bits:
+            lines.append(f"- Breakdown: {', '.join(breakdown_bits)}")
+        history_budget = payload.get("history_budget_tokens")
+        history_tokens = payload.get("history_tokens")
+        if history_budget is not None and history_tokens is not None:
+            lines.append(f"- History budget: {history_tokens} / {history_budget}")
+        canonical_messages = payload.get("canonical_history_messages")
+        replay_messages = payload.get("replay_history_messages")
+        if canonical_messages is not None or replay_messages is not None:
+            lines.append(
+                f"- Messages: canonical={canonical_messages if canonical_messages is not None else '?'}"
+                f", replay={replay_messages if replay_messages is not None else '?'}"
+            )
+        estimate_source = str(payload.get("request_estimate_source") or "").strip()
+        if estimate_source:
+            lines.append(f"- Estimate source: {estimate_source}")
+        compaction = dict(payload.get("compaction") or {})
+        if compaction:
+            if compaction.get("hook_blocked"):
+                lines.append(f"- Last compaction: blocked ({compaction.get('hook_message') or 'runtime hook'})")
+            elif compaction.get("was_compacted"):
+                lines.append(
+                    f"- Last compaction: {compaction.get('tokens_before', '?')} -> {compaction.get('tokens_after', '?')} "
+                    f"(budget {compaction.get('max_tokens', '?')})"
+                )
+            elif compaction.get("compaction_possible") is False:
+                lines.append("- Last compaction: not needed")
+        cache_state = dict(payload.get("cache") or {})
+        if cache_state:
+            if cache_state.get("enabled"):
+                lines.append(
+                    f"- Cache: enabled | anchor={bool(cache_state.get('anchorActive'))} | "
+                    f"pending={bool(cache_state.get('pendingAnchorActive'))}"
+                )
+            else:
+                lines.append("- Cache: disabled")
+            last_usage = dict(cache_state.get("lastCacheUsage") or {})
+            usage_bits: list[str] = []
+            for label, key in (
+                ("cachedInput", "cachedInputTokens"),
+                ("cacheRead", "cacheReadTokens"),
+                ("cacheCreate", "cacheCreationTokens"),
+            ):
+                value = self._safe_int(last_usage.get(key))
+                if value:
+                    usage_bits.append(f"{label}={value}")
+            if usage_bits:
+                lines.append(f"- Last cache usage: {', '.join(usage_bits)}")
+            last_break = dict(cache_state.get("lastBreak") or {})
+            if last_break:
+                reason = str(last_break.get("reason") or last_break.get("type") or "").strip()
+                field = str(last_break.get("field") or last_break.get("cache_field") or "").strip()
+                if reason or field:
+                    extra = f" ({field})" if field else ""
+                    lines.append(f"- Last cache break: {reason or 'changed'}{extra}")
+        lines.extend(
+            [
+                "",
+                "Next step:",
+                "- Use `/compact` if the context meter is getting tight.",
+                "- Use `/cost` to inspect cache hit rate and recent turn usage.",
+            ]
+        )
+        return "\n".join(lines)
 
     def get_restore_report(self) -> Optional[dict[str, Any]]:
         report = self.bundle.restore_report
@@ -1936,52 +2394,147 @@ class S4QueryEngine:
         return dict(report)
 
     def summarize_restore_report(self, *, detailed: bool = False) -> str:
-        report = self.get_restore_report()
-        if report is None:
+        payload = self.get_restore_continuity_payload()
+        if not payload:
             return ""
-        lines = [
-            f"Restore status: {report.get('status') or 'restored'}",
-            f"Execution context restored: {bool(report.get('executionContextRestored'))}",
-        ]
-        missing_tools = list(report.get("missingTools") or [])
-        missing_skills = list(report.get("missingSkills") or [])
-        issues = list(report.get("issues") or [])
-        if missing_tools:
-            lines.append(f"Missing tools: {', '.join(str(item) for item in missing_tools)}")
-        if missing_skills:
-            lines.append(f"Missing skills: {', '.join(str(item) for item in missing_skills)}")
-        if issues:
-            lines.append(f"Issues: {len(issues)}")
-        components = dict(report.get("components") or {})
-        degraded_components = [
-            f"{name}={payload.get('status') or 'unknown'}"
-            for name, payload in components.items()
-            if str(payload.get("status") or "restored") != "restored"
-        ]
-        if degraded_components:
-            lines.append(f"Components: {', '.join(degraded_components)}")
-        if detailed and issues:
-            for issue in issues[:5]:
-                severity = str(issue.get("severity") or "warning").upper()
-                component = str(issue.get("component") or "restore")
-                message = str(issue.get("message") or "").strip()
-                lines.append(f"- {severity} {component}: {message}")
-            hidden = len(issues) - 5
-            if hidden > 0:
-                lines.append(f"... {hidden} more restore issue(s)")
+        lines = [str(payload.get("summary") or "Session restored.")]
+        if payload.get("restored_items"):
+            lines.append("Restored: " + ", ".join(str(item) for item in payload["restored_items"][:6]))
+        if payload.get("missing_tools"):
+            lines.append("Missing tools: " + ", ".join(str(item) for item in payload["missing_tools"][:6]))
+        if payload.get("missing_skills"):
+            lines.append("Missing skills: " + ", ".join(str(item) for item in payload["missing_skills"][:6]))
+        if detailed and payload.get("issues"):
+            for issue in list(payload["issues"])[:5]:
+                if not isinstance(issue, dict):
+                    continue
+                lines.append(
+                    f"- {str(issue.get('severity') or 'warning').upper()} "
+                    f"{str(issue.get('component') or 'restore')}: {str(issue.get('message') or '').strip()}"
+                )
         return "\n".join(lines)
 
     def format_restore_report(self) -> str:
+        payload = self.get_restore_continuity_payload()
+        if not payload:
+            return "No restore report for the current session."
+        lines = [
+            "Session restore",
+            f"- {payload.get('summary')}",
+            f"- Execution context restored: {payload.get('execution_context_restored')}",
+            f"- Pending interaction restored: {payload.get('has_pending_interaction')}",
+            f"- Active background tasks restored: {payload.get('active_background_tasks')}",
+        ]
+        if payload.get("missing_tools"):
+            lines.append("- Missing tools: " + ", ".join(str(item) for item in payload["missing_tools"][:6]))
+        if payload.get("missing_skills"):
+            lines.append("- Missing skills: " + ", ".join(str(item) for item in payload["missing_skills"][:6]))
+        lines.extend(
+            [
+                "",
+                "Recommended next step:",
+                "- Use `/pending` if execution paused on a question or approval.",
+                "- Use `/tasks` if background work was restored.",
+                "- Use `/diff` or continue your last task if everything looks healthy.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def get_restore_continuity_payload(self) -> dict[str, Any]:
         report = self.get_restore_report()
         if report is None:
-            return "No restore report for the current session."
-        return json.dumps(report, ensure_ascii=False, indent=2)
+            return {}
+        missing_tools = list(report.get("missingTools") or [])
+        missing_skills = list(report.get("missingSkills") or [])
+        issues = list(report.get("issues") or [])
+        restored_items = list(report.get("restoredItems") or [])
+        active_background_tasks = len(
+            [
+                item for item in self._get_background_task_snapshots(limit=20)
+                if str(item.get("status") or "").lower() in {"running", "queued", "waiting"}
+            ]
+        )
+        has_pending = self.get_pending_interaction() is not None
+        status = str(report.get("status") or "restored")
+        if status == "restored" and not issues and not missing_tools and not missing_skills:
+            summary = "Everything important from the previous session is available."
+        elif status == "restored":
+            summary = "Most of the previous session is back, but some capabilities were not restored."
+        else:
+            summary = "The session was restored with gaps. Review the missing pieces before continuing."
+        return {
+            "status": status,
+            "summary": summary,
+            "execution_context_restored": bool(report.get("executionContextRestored")),
+            "restored_items": restored_items,
+            "missing_tools": missing_tools,
+            "missing_skills": missing_skills,
+            "issues": issues,
+            "has_pending_interaction": has_pending,
+            "active_background_tasks": active_background_tasks,
+        }
 
     def get_pending_interaction(self) -> Optional[dict[str, Any]]:
-        payload = self.agent.get_last_tool_interrupt()
+        getter = getattr(self.agent, "get_last_tool_interrupt", None)
+        if not callable(getter):
+            return None
+        payload = getter()
         if payload is None:
             return None
         return dict(payload)
+
+    def get_pending_risk_payload(self) -> dict[str, Any]:
+        payload = self.get_pending_interaction()
+        if payload is None:
+            return {"active": False}
+        metadata = dict(payload.get("metadata") or {})
+        interaction_type = str(metadata.get("interaction_type") or "confirmation")
+        tool_name = str(payload.get("tool_name") or "").strip()
+        tool_args = dict(payload.get("tool_args") or {})
+        command = str(tool_args.get("command") or "").strip().lower()
+        title = "Approval required"
+        risk_level = "low"
+        reversible = True
+        affects_shared_state = False
+        overwrites_local_changes = False
+        if interaction_type == "ask_user_question":
+            title = "Answer needed"
+        elif interaction_type in {"enter_plan_mode", "exit_plan_mode"}:
+            title = "Mode change pending"
+            risk_level = "medium"
+        if tool_name == "Bash" and "git push" in command:
+            title = "Git push approval"
+            risk_level = "high"
+            reversible = False
+            affects_shared_state = True
+        elif tool_name == "ExitWorktree" and bool(tool_args.get("discard_changes")):
+            title = "Discard worktree changes"
+            risk_level = "high"
+            reversible = False
+            overwrites_local_changes = True
+        elif tool_name in {"TaskStop", "AgentStop"}:
+            title = "Stop background work"
+            risk_level = "medium"
+            reversible = False
+        elif tool_name == "Rewind" or "rewind" in command:
+            title = "Session rewind"
+            risk_level = "high"
+            reversible = False
+            overwrites_local_changes = True
+        elif tool_name and ("edit" in tool_name.lower() or "write" in tool_name.lower()):
+            risk_level = "medium"
+        return {
+            "active": True,
+            "interaction_type": interaction_type,
+            "title": title,
+            "tool_name": tool_name or None,
+            "reason": str(metadata.get("reason") or "").strip() or None,
+            "risk_level": risk_level,
+            "reversible": reversible,
+            "affects_shared_state": affects_shared_state,
+            "overwrites_local_changes": overwrites_local_changes,
+            "remember_supported": interaction_type not in {"ask_user_question"},
+        }
 
     def format_pending_interaction(self) -> str:
         payload = self.get_pending_interaction()
@@ -1992,64 +2545,107 @@ class S4QueryEngine:
     def _format_pending_payload(self, payload: dict[str, Any]) -> str:
         metadata = dict(payload.get("metadata") or {})
         interaction_type = str(metadata.get("interaction_type") or "confirmation")
-        lines = [
-            f"status: {payload.get('status')}",
-            f"type: {interaction_type}",
-        ]
+        lines: list[str] = []
         tool_name = str(payload.get("tool_name") or "").strip()
-        if tool_name:
-            lines.append(f"tool: {tool_name}")
         message = str(payload.get("message") or "").strip()
-        if message:
-            lines.append(f"message: {message}")
+        risk_payload = self.get_pending_risk_payload()
 
         if interaction_type == "ask_user_question":
+            lines.append("The agent needs your answer before it can continue.")
+            if message:
+                lines.extend(["", message])
             questions = list(metadata.get("questions") or [])
             if questions:
                 lines.append("")
-                lines.append("questions:")
+                lines.append("Questions:")
                 for index, item in enumerate(questions, start=1):
                     header = str(item.get("header") or f"Question {index}").strip()
                     question = str(item.get("question") or "").strip()
-                    lines.append(f"  {index}. {header}")
+                    lines.append(f"{index}. {header}")
                     if question:
-                        lines.append(f"     {question}")
+                        lines.append(f"   {question}")
                     for option in list(item.get("options") or []):
                         label = str(option.get("label") or "").strip()
                         description = str(option.get("description") or "").strip()
-                        bullet = f"     - {label}" if label else "     - option"
+                        bullet = f"   - {label}" if label else "   - option"
                         if description:
                             bullet += f": {description}"
                         lines.append(bullet)
             lines.append("")
-            lines.append("reply with: /answer <text>")
-            lines.append("or cancel with: /deny [reason]")
+            lines.append("Next step:")
+            lines.append("- Reply with `/answer <text>`.")
+            lines.append("- Use `/deny [reason]` to cancel.")
             return "\n".join(lines)
 
-        if metadata.get("reason"):
-            lines.append(f"reason: {metadata.get('reason')}")
+        if interaction_type == "enter_plan_mode":
+            lines.append("The agent wants to switch into planning mode before making changes.")
+        elif interaction_type == "exit_plan_mode":
+            lines.append("The agent is ready to leave planning mode and continue execution.")
+        else:
+            lines.append("The agent is waiting for your approval before it continues.")
+        if message:
+            lines.extend(["", message])
+        if tool_name:
+            lines.append(f"Tool: {tool_name}")
+        reason = str(metadata.get("reason") or "").strip()
+        if reason:
+            lines.append(f"Why this needs approval: {reason}")
+        if risk_payload.get("active"):
+            lines.append(
+                "Risk: "
+                f"{risk_payload.get('risk_level', 'unknown')} | "
+                f"reversible={risk_payload.get('reversible')} | "
+                f"shared_state={risk_payload.get('affects_shared_state')} | "
+                f"overwrites_local_changes={risk_payload.get('overwrites_local_changes')}"
+            )
         allowed_actions = list(metadata.get("allowedActions") or [])
         if allowed_actions:
-            lines.append("allowed_actions:")
-            lines.extend(f"  - {item}" for item in allowed_actions)
+            lines.append("What it wants to do:")
+            lines.extend(f"- {item}" for item in allowed_actions)
         allowed_prompts = list(metadata.get("allowedPrompts") or [])
         if allowed_prompts:
-            lines.append("allowed_prompts:")
+            lines.append("Requested permission categories:")
             for item in allowed_prompts:
                 tool = str(item.get("tool") or "tool").strip()
                 prompt = str(item.get("prompt") or "").strip()
                 if prompt:
-                    lines.append(f"  - {tool}: {prompt}")
+                    lines.append(f"- {tool}: {prompt}")
                 else:
-                    lines.append(f"  - {tool}")
+                    lines.append(f"- {tool}")
         tool_args = payload.get("tool_args") or {}
         if isinstance(tool_args, dict) and tool_args:
-            lines.append("tool_args:")
+            lines.append("Requested arguments:")
             lines.append(json.dumps(tool_args, ensure_ascii=False, indent=2))
         lines.append("")
-        lines.append("confirm with: /confirm [note] or /confirm remember")
-        lines.append("deny with: /deny [reason] or /deny remember")
+        lines.append("Next step:")
+        lines.append("- Approve with `/confirm [note]`.")
+        lines.append("- Approve and remember a session rule with `/confirm remember`.")
+        lines.append("- Deny with `/deny [reason]`.")
+        lines.append("- Deny and remember a session rule with `/deny remember`.")
         return "\n".join(lines)
+
+    def _background_task_notice_from_event(self, event: dict[str, Any]) -> Optional[dict[str, str]]:
+        structured = event.get("structured_data")
+        if not isinstance(structured, dict):
+            return None
+        task_id = str(structured.get("task_id") or "").strip()
+        status = str(structured.get("status") or "").strip().lower()
+        if not task_id or status not in {"running", "queued", "waiting"}:
+            return None
+        command = self._format_command_value(structured.get("command")).replace("\n", " ").strip()
+        description = str(structured.get("description") or event.get("description") or "").strip()
+        lines = [f"Started background task `{task_id}`."]
+        if description:
+            lines.append(f"Purpose: {description}")
+        elif command:
+            lines.append(f"Command: {self._tail_text(command, max_chars=140)}")
+        lines.append("Use `/task output " + task_id + "` to stream logs.")
+        lines.append("Use `/task stop " + task_id + "` to stop it.")
+        return {
+            "type": "system_notice",
+            "title": "Background Task Started",
+            "content": "\n".join(lines),
+        }
 
     @staticmethod
     def _answer_requests_permission_remember(answer: str) -> bool:
@@ -2222,19 +2818,52 @@ class S4QueryEngine:
         self.ensure_autosave()
 
     def format_cost(self) -> str:
-        payload = {
-            "observability": self.agent.get_observability_summary(),
-            "recentEvents": self.agent.get_recent_observability_events(limit=10),
-            "traceSummary": self.agent.get_trace_summary(limit_turns=5),
-        }
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        summary = dict(self.agent.get_observability_summary() or {})
+        recent_turns = list(self.agent.get_trace_summary(limit_turns=5) or [])
+        lines = [
+            "Usage and cache",
+            f"- Total tokens: {summary.get('totalTokens', 0)}",
+            f"- Estimated cost: ${float(summary.get('estimatedCostUsd') or 0.0):.4f}" if summary.get("estimatedCostUsd") is not None else "- Estimated cost: unavailable",
+        ]
+        cache_ratio = self._safe_float(summary.get("cacheHitTokenRatioNormalized"))
+        if cache_ratio is not None:
+            lines.append(
+                f"- Cache hit rate: {self._format_percent(cache_ratio)} "
+                f"({summary.get('cacheHitTokens', 0)} cached prompt token(s))"
+            )
+        if summary.get("cacheBreaks") is not None:
+            lines.append(f"- Cache breaks: {summary.get('cacheBreaks', 0)}")
+        lines.append("")
+        lines.append("Recent turns:")
+        if recent_turns:
+            for item in recent_turns[:5]:
+                query = " ".join(str(item.get("query") or "").split())
+                short_query = query[:48] + "..." if len(query) > 48 else query
+                ratio_payload = self._cache_summary_from_llm_items([dict(item)])
+                ratio = ratio_payload.get("cache_hit_ratio")
+                cache_suffix = f" | cache {self._format_percent(ratio)}" if ratio is not None else ""
+                lines.append(
+                    f"- {short_query or '[no prompt]'} | tokens {item.get('totalTokens', 0)} | "
+                    f"tools {item.get('toolCalls', 0)}{cache_suffix}"
+                )
+        else:
+            lines.append("- No completed turns yet.")
+        return "\n".join(lines)
 
     def format_trace(self, *, limit_turns: int = 5) -> str:
-        return json.dumps(
-            self.agent.get_trace_summary(limit_turns=limit_turns),
-            ensure_ascii=False,
-            indent=2,
-        )
+        turns = list(self.agent.get_trace_summary(limit_turns=limit_turns) or [])
+        if not turns:
+            return "No recent turn summaries yet."
+        lines = ["Recent turns"]
+        for item in turns:
+            query = " ".join(str(item.get("query") or "").split())
+            short_query = query[:72] + "..." if len(query) > 72 else query
+            lines.append(
+                f"- {short_query or '[no prompt]'} | status={item.get('status') or 'completed'} | "
+                f"tokens={item.get('totalTokens', 0)} | tools={item.get('toolCalls', 0)} | "
+                f"llm={item.get('llmRequests', 0)}"
+            )
+        return "\n".join(lines)
 
     def format_recent_events(self, *, limit: int = 20, event_type: Optional[str] = None) -> str:
         return json.dumps(
@@ -2257,18 +2886,25 @@ class S4QueryEngine:
         background_tasks = self._get_background_task_snapshots(limit=limit)
         if not tasks and not background_tasks:
             return "No tasks yet."
+        active_statuses = {"running", "queued", "waiting", "open", "in_progress", "blocked"}
+        failed_statuses = {"failed", "error"}
+        def _priority(status: str) -> tuple[int, str]:
+            lowered = status.lower()
+            if lowered in active_statuses:
+                return (0, lowered)
+            if lowered in failed_statuses:
+                return (1, lowered)
+            return (2, lowered)
         lines: list[str] = []
         if tasks:
             lines.append("Structured Tasks:")
-            lines.extend(
-                f"- {task.task_id} | {task.status.value} | {task.title}"
-                for task in tasks
-            )
+            for task in sorted(tasks, key=lambda item: _priority(item.status.value)):
+                lines.append(f"- {task.task_id} | {task.status.value} | {task.title}")
         if background_tasks:
             if lines:
                 lines.append("")
             lines.append("Background Tasks:")
-            for item in background_tasks:
+            for item in sorted(background_tasks, key=lambda task: _priority(str(task.get("status") or ""))):
                 command = self._format_command_value(item.get("command")).replace("\n", " ").strip()
                 if len(command) > 120:
                     command = command[:117].rstrip() + "..."
@@ -2276,14 +2912,14 @@ class S4QueryEngine:
                 duration_text = f" | {float(duration):.1f}s" if isinstance(duration, (int, float)) else ""
                 lines.append(
                     f"- {item.get('task_id') or '-'} | {item.get('status') or '-'} | "
-                    f"rc={item.get('return_code')}{duration_text} | {command or item.get('cwd') or '-'}"
+                        f"rc={item.get('return_code')}{duration_text} | {command or item.get('cwd') or '-'}"
                 )
-                stdout_tail = str(item.get("stdout_tail") or "").strip()
-                stderr_tail = str(item.get("stderr_tail") or "").strip()
+                stdout_tail = str(item.get("stdout_tail") or "").strip().replace(chr(10), " ")
+                stderr_tail = str(item.get("stderr_tail") or "").strip().replace(chr(10), " ")
                 if stdout_tail:
-                    lines.append(f"  stdout: {self._tail_text(stdout_tail.replace(chr(10), ' '), max_chars=180)}")
+                    lines.append(f"  stdout: {self._tail_text(stdout_tail, max_chars=180)}")
                 if stderr_tail:
-                    lines.append(f"  stderr: {self._tail_text(stderr_tail.replace(chr(10), ' '), max_chars=180)}")
+                    lines.append(f"  stderr: {self._tail_text(stderr_tail, max_chars=180)}")
         return "\n".join(lines)
 
     def format_agents(self, *, limit: int = 20) -> str:
@@ -2755,7 +3391,7 @@ class S4QueryEngine:
         agents = list(payload.get("agents") or [])
         tasks = list(payload.get("tasks") or [])
         background_tasks = list(payload.get("background_tasks") or [])
-        context = dict(payload.get("context") or {})
+        context = self._context_usage_summary(dict(payload.get("context") or {}))
         active_worktree = worktree.get("active") or {}
         lines = [
             f"Runtime snapshot: {payload.get('generated_at') or '-'}",
@@ -2807,15 +3443,66 @@ class S4QueryEngine:
             lines.extend(
                 [
                     "",
-                    "Context:",
-                    (
-                        f"- used={context.get('used_tokens', '?')} "
-                        f"remaining={context.get('remaining_tokens', '?')} "
-                        f"max={context.get('max_tokens', '?')}"
-                    ),
+                    self._format_context_meter_line(context),
                 ]
             )
         return "\n".join(lines)
+
+    def poll_runtime_notices(self) -> list[dict[str, str]]:
+        snapshots = self._get_background_task_snapshots(limit=50, force=True)
+        if not self._last_background_notice_states:
+            self._last_background_notice_states = {
+                str(item.get("task_id") or ""): str(item.get("status") or "")
+                for item in snapshots
+                if str(item.get("task_id") or "")
+            }
+            return []
+        notices: list[dict[str, str]] = []
+        current_states: dict[str, str] = {}
+        for item in snapshots:
+            task_id = str(item.get("task_id") or "").strip()
+            if not task_id:
+                continue
+            status = str(item.get("status") or "").strip().lower()
+            current_states[task_id] = status
+            previous = str(self._last_background_notice_states.get(task_id) or "").strip().lower()
+            if not previous or previous == status:
+                continue
+            if status in {"completed", "failed", "error", "stopped"}:
+                command = self._format_command_value(item.get("command")).replace("\n", " ").strip()
+                stdout_tail = self._tail_text(str(item.get("stdout_tail") or "").replace("\n", " "), max_chars=180).strip()
+                stderr_tail = self._tail_text(str(item.get("stderr_tail") or "").replace("\n", " "), max_chars=180).strip()
+                headline = {
+                    "completed": "Background task finished successfully.",
+                    "failed": "Background task failed.",
+                    "error": "Background task failed.",
+                    "stopped": "Background task was stopped.",
+                }[status]
+                lines = [
+                    headline,
+                    f"Task: `{task_id}`",
+                    f"Command: {command or '-'}",
+                    f"Exit code: {item.get('return_code')}",
+                ]
+                if stdout_tail:
+                    lines.append(f"Stdout: {stdout_tail}")
+                if stderr_tail:
+                    lines.append(f"Stderr: {stderr_tail}")
+                if status == "completed":
+                    lines.append("Next step: inspect the result or continue with the next task.")
+                elif status == "stopped":
+                    lines.append("Next step: rerun it if you still need the work.")
+                else:
+                    lines.append("Next step: use `/task output <id>` for more logs, then retry or fix the failure.")
+                notices.append(
+                    {
+                        "type": "system_notice",
+                        "title": "Background Task Update",
+                        "content": "\n".join(lines),
+                    }
+                )
+        self._last_background_notice_states = current_states
+        return notices
 
     def format_mcp(self) -> str:
         payload = self.get_mcp_status_payload()
@@ -2881,6 +3568,32 @@ class S4QueryEngine:
 
     def get_startup_notices(self) -> list[dict[str, str]]:
         notices: list[dict[str, str]] = []
+        background_tasks = self._get_background_task_snapshots(limit=10)
+        self._last_background_notice_states = {
+            str(item.get("task_id") or ""): str(item.get("status") or "")
+            for item in background_tasks
+            if str(item.get("task_id") or "")
+        }
+        live_background = [
+            item for item in background_tasks
+            if str(item.get("status") or "").lower() in {"running", "queued", "waiting"}
+        ]
+        if live_background:
+            lines = [
+                f"Restored {len(live_background)} active background task(s).",
+            ]
+            for item in live_background[:5]:
+                lines.append(
+                    f"- {item.get('task_id') or '-'} | {item.get('status') or '-'} | {item.get('command') or item.get('cwd') or '-'}"
+                )
+            lines.append("Use /tasks to list them all, /task output <id> to stream logs, or /task stop <id> to stop one.")
+            notices.append(
+                {
+                    "kind": "system",
+                    "title": "Background Tasks",
+                    "body": "\n".join(lines),
+                }
+            )
         mcp_summary = self.get_mcp_summary_payload()
         if mcp_summary.get("enabled") and int(mcp_summary.get("configured") or 0) > 0:
             configured = int(mcp_summary.get("configured") or 0)
@@ -2919,6 +3632,7 @@ class S4QueryEngine:
                     "body": "\n".join(f"- {issue}" for issue in self.bundle.startup_issues),
                 }
             )
+        restore_payload = self.get_restore_continuity_payload()
         restore_summary = self.summarize_restore_report(detailed=True)
         restore_report = self.get_restore_report()
         if restore_summary and (
@@ -2938,7 +3652,12 @@ class S4QueryEngine:
                 {
                     "kind": kind,
                     "title": "Session Restored",
-                    "body": restore_summary,
+                    "body": restore_summary
+                    + (
+                        "\n\nRecommended next step: /pending, /tasks, /diff, or continue the last task."
+                        if restore_payload
+                        else ""
+                    ),
                 }
             )
         return notices

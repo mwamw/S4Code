@@ -5,6 +5,7 @@ import pytest
 
 pytest.importorskip("textual")
 
+from rich.console import Group
 from rich.markdown import Markdown
 from rich.text import Text
 from textual.containers import VerticalScroll
@@ -37,10 +38,31 @@ def test_tui_keeps_final_response_top_visible_after_invoke(tmp_path) -> None:
                 target_id = app._latest_non_separator_card_id()
                 assert target_id is not None
                 target_widget = app._card_widgets[target_id]
+                target_card = app._transcript_state.find_card(target_id)
 
                 assert float(scroll.max_scroll_y) > 0
                 assert float(scroll.scroll_y) < float(scroll.max_scroll_y)
+                assert target_card is not None
+                assert target_card.title == "Model Response"
                 assert int(target_widget.region.y) == 0
+        finally:
+            engine.close()
+
+    asyncio.run(_run())
+
+
+def test_tui_shows_welcome_card_with_project_context(tmp_path) -> None:
+    async def _run() -> None:
+        engine = S4QueryEngine(cwd=str(tmp_path))
+        app = S4TextualApp(engine)
+        try:
+            async with app.run_test() as pilot:
+                await pilot.pause(0.2)
+                first = app._transcript_state.cards[0]
+                assert first.title == "Welcome"
+                assert f"Project: `{engine.project.project_name}`" in first.body
+                assert "/help" in first.body
+                assert "/status" in first.body
         finally:
             engine.close()
 
@@ -53,13 +75,13 @@ def test_tui_skips_sidebar_refresh_when_sidebar_hidden(tmp_path) -> None:
         engine.sidebar_visible = False
         app = S4TextualApp(engine)
         calls = {"count": 0}
-        original = engine.format_sidebar
+        original = engine.get_sidebar_payload
 
-        def _wrapped(*, force: bool = False) -> str:
+        def _wrapped(*, force: bool = False):
             calls["count"] += 1
             return original(force=force)
 
-        engine.format_sidebar = _wrapped  # type: ignore[method-assign]
+        engine.get_sidebar_payload = _wrapped  # type: ignore[method-assign]
         try:
             async with app.run_test() as pilot:
                 await pilot.pause(0.2)
@@ -135,6 +157,27 @@ def test_tui_renders_plain_streaming_assistant_as_text(tmp_path) -> None:
         )
         renderable = app._render_body(card)
         assert isinstance(renderable, Text)
+    finally:
+        engine.close()
+
+
+def test_tui_renders_assistant_metrics_in_panel_footer(tmp_path) -> None:
+    engine = S4QueryEngine(cwd=str(tmp_path))
+    app = S4TextualApp(engine)
+    try:
+        card = TranscriptCard(
+            card_id="card-3",
+            kind="assistant",
+            title="Model Response",
+            body="Done.",
+            metadata={"footer_left": "Ctx 1,200/24,000  ·  In 210  ·  Out 111  ·  Total 321"},
+        )
+        panel = app._build_panel(card)
+        assert isinstance(panel.renderable, Group)
+        footer = panel.renderable.renderables[-1]
+        assert isinstance(footer, Text)
+        assert "Ctx 1,200/24,000" in footer.plain
+        assert "Total 321" in footer.plain
     finally:
         engine.close()
 
@@ -291,6 +334,54 @@ def test_tui_copy_command_scrolls_to_bottom(tmp_path) -> None:
                 await pilot.pause(0.2)
 
                 assert float(scroll.scroll_y) >= float(scroll.max_scroll_y)
+        finally:
+            engine.close()
+
+    asyncio.run(_run())
+
+
+def test_tui_streaming_render_respects_user_scroll_after_snapshot(tmp_path) -> None:
+    async def _run() -> None:
+        engine = S4QueryEngine(cwd=str(tmp_path))
+        app = S4TextualApp(engine)
+        try:
+            async with app.run_test() as pilot:
+                await pilot.pause(0.2)
+                for index in range(60):
+                    app._transcript_state.append_card("system", "System", f"Line {index}")
+                app._render_transcript()
+                await pilot.pause(0.2)
+
+                scroll = app.query_one("#transcript", VerticalScroll)
+                scroll.scroll_to(y=12, animate=False, immediate=True)
+                await pilot.pause(0.1)
+
+                captured: dict[str, object] = {}
+
+                def _defer(callback, *args) -> None:
+                    captured["callback"] = callback
+                    captured["args"] = args
+
+                app.call_after_refresh = _defer  # type: ignore[method-assign]
+                card = app._transcript_state.append_card("assistant", "Model Response", "streaming")
+                app._render_transcript()
+                await pilot.pause(0.1)
+                card.body = "streaming update"
+                app._transcript_state._touch(card)
+                app._flush_transcript_render()
+
+                scroll.scroll_to(y=3, animate=False, immediate=True)
+                await pilot.pause(0.1)
+
+                callback = captured.get("callback")
+                args = captured.get("args")
+                assert callback is not None
+                assert args is not None
+
+                callback(*args)
+                await pilot.pause(0.1)
+
+                assert float(scroll.scroll_y) <= 4.0
         finally:
             engine.close()
 

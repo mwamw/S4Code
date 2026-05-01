@@ -1,0 +1,29 @@
+{
+  "name": "nord",
+  "layout": {
+    "background": "transparent",
+    "text": "#eceff4",
+    "muted": "#d8dee9",
+    "header_text": "#88c0d0",
+    "footer_text": "#81a1c1",
+    "transcript_border": "#81a1c1",
+    "sidebar_border": "#88c0d0",
+    "sidebar_text": "#e5e9f0",
+    "palette_border": "#81a1c1",
+    "input_border": "#8fbcbb",
+    "input_text": "#eceff4",
+    "separator": "#4c566a"
+  },
+  "cards": {
+    "system": {"border": "#88c0d0", "title": "#88c0d0"},
+    "user": {"border": "#81a1c1", "title": "#81a1c1"},
+    "assistant": {"border": "#a3be8c", "title": "#a3be8c"},
+    "thinking": {"border": "#b48ead", "title": "#b48ead", "text": "#d8dee9"},
+    "tool": {"border": "#ebcb8b", "title": "#ebcb8b"},
+    "warning": {"border": "#d08770", "title": "#d08770"},
+    "error": {"border": "#bf616a", "title": "#bf616a"},
+    "round": {"border": "#4c566a", "title": "#d8dee9", "text": "#d8dee9"},
+    "runtime": {"border": "#88c0d0", "title": "#88c0d0"},
+    "default": {"border": "#81a1c1", "title": "#eceff4"}
+  }
+}

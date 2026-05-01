@@ -44,7 +44,11 @@ from .config import S4Settings
 from .paths import S4Paths, get_project_skills_paths, get_s4_repo_skills_path
 from .project import ProjectContext
 from .runtime_hooks import S4RuntimeNoticeHook
-from .system_prompt import S4PromptComposer, build_s4_system_prompt
+from .system_prompt import (
+    S4PromptComposer,
+    build_s4_runtime_reminder_sources,
+    build_s4_system_prompt,
+)
 
 
 @dataclass(slots=True)
@@ -415,6 +419,17 @@ def _attach_meta_skill(
         startup_issues.append(f"Meta skill initialization failed: {exc}")
 
 
+def _attach_runtime_reminders(
+    *,
+    agent: BasicAgent,
+    paths: S4Paths,
+    project: ProjectContext,
+) -> None:
+    agent.extend_runtime_reminder_sources(
+        list(build_s4_runtime_reminder_sources(paths=paths, project=project))
+    )
+
+
 def _restore_active_skills(
     *,
     agent: BasicAgent,
@@ -529,6 +544,7 @@ def build_agent_bundle(
         )
         agent.system_prompt = system_prompt
         agent.prompt_composer = S4PromptComposer(paths=paths, project=project)
+        _attach_runtime_reminders(agent=agent, paths=paths, project=project)
     else:
         agent = BasicAgent(
             name="S4Code",
@@ -560,6 +576,7 @@ def build_agent_bundle(
                 if value is not None
             },
         )
+        _attach_runtime_reminders(agent=agent, paths=paths, project=project)
 
     agent.skill_manager.bind_registry(skill_registry)
     _attach_meta_skill(

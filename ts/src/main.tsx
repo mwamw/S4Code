@@ -1,0 +1,87 @@
+import { render } from 'ink'
+import React from 'react'
+import { App } from './components/App'
+import { REPL } from './screens/REPL'
+import { setup } from './setup'
+
+function parseArgs(argv: string[]) {
+  let cwd = process.cwd()
+  let sessionId: string | null = null
+  let prompt: string | null = null
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index]
+    if ((token === '--cwd' || token === '-C') && argv[index + 1]) {
+      cwd = argv[index + 1]
+      index += 1
+      continue
+    }
+    if (token === '--resume' && argv[index + 1]) {
+      sessionId = argv[index + 1]
+      index += 1
+      continue
+    }
+    if ((token === '--prompt' || token === '-p') && argv[index + 1]) {
+      prompt = argv[index + 1]
+      index += 1
+    }
+  }
+
+  return { cwd, sessionId, prompt }
+}
+
+async function buildRuntime() {
+  const { cwd, sessionId } = parseArgs(process.argv.slice(2))
+  return setup({ cwd, sessionId })
+}
+
+async function runPromptMode(prompt: string): Promise<void> {
+  const runtime = await buildRuntime()
+  runtime.store.setState(prev => ({
+    ...prev,
+    runtime: {
+      ...prev.runtime,
+      renderMode: 'oneshot',
+    },
+  }))
+  try {
+    await runtime.engine.handleInput(prompt)
+    const cards = runtime.store.getState().transcript.cards
+    for (const card of cards) {
+      if (card.kind === 'assistant' || card.kind === 'system' || card.kind === 'error') {
+        process.stdout.write(`${card.title}\n${card.body}\n\n`)
+      }
+    }
+  } finally {
+    await runtime.engine.close()
+  }
+}
+
+async function runRepl(): Promise<void> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('Interactive REPL requires a TTY. Run S4Code in a real terminal, or use --prompt for one-shot execution.')
+  }
+  const runtime = await buildRuntime()
+  render(
+    <App initialState={runtime.store.getState()} store={runtime.store}>
+      <REPL engine={runtime.engine} />
+    </App>,
+  )
+}
+
+async function main(): Promise<void> {
+  try {
+    const { prompt } = parseArgs(process.argv.slice(2))
+    if (prompt) {
+      await runPromptMode(prompt)
+      return
+    }
+    await runRepl()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    process.stderr.write(`S4Code TS failed to start: ${message}\n`)
+    process.exitCode = 1
+  }
+}
+
+void main()

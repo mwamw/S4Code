@@ -1,0 +1,29 @@
+{
+  "name": "dracula",
+  "layout": {
+    "background": "transparent",
+    "text": "#f8f8f2",
+    "muted": "#6272a4",
+    "header_text": "#bd93f9",
+    "footer_text": "#6272a4",
+    "transcript_border": "#ff79c6",
+    "sidebar_border": "#8be9fd",
+    "sidebar_text": "#f8f8f2",
+    "palette_border": "#bd93f9",
+    "input_border": "#50fa7b",
+    "input_text": "#f8f8f2",
+    "separator": "#44475a"
+  },
+  "cards": {
+    "system": {"border": "#8be9fd", "title": "#8be9fd"},
+    "user": {"border": "#ff79c6", "title": "#ffb86c"},
+    "assistant": {"border": "#50fa7b", "title": "#50fa7b"},
+    "thinking": {"border": "#bd93f9", "title": "#bd93f9", "text": "#6272a4"},
+    "tool": {"border": "#f1fa8c", "title": "#f1fa8c"},
+    "warning": {"border": "#ffb86c", "title": "#ffb86c"},
+    "error": {"border": "#ff5555", "title": "#ff5555"},
+    "round": {"border": "#44475a", "title": "#6272a4", "text": "#6272a4"},
+    "runtime": {"border": "#8be9fd", "title": "#8be9fd"},
+    "default": {"border": "#bd93f9", "title": "#f8f8f2"}
+  }
+}
