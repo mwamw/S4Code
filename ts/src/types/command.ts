@@ -23,12 +23,12 @@ export type PromptCommand = CommandBase & {
 
 export type LocalCommand = CommandBase & {
   type: 'local'
-  run: (args: string, engine: QueryEngine) => Promise<void>
+  run: (args: string, engine: QueryEngine) => Promise<void | 'quit'>
 }
 
 export type LocalJSXCommand = CommandBase & {
   type: 'local-jsx'
-  run: (args: string, engine: QueryEngine) => Promise<void>
+  run: (args: string, engine: QueryEngine) => Promise<void | 'quit'>
 }
 
 export type Command = PromptCommand | LocalCommand | LocalJSXCommand

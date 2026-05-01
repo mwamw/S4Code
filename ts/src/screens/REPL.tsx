@@ -15,15 +15,19 @@ export function REPL(props: { engine: QueryEngine }) {
   useEffect(() => {
     const timer = setInterval(() => {
       if (!busy) {
-        void props.engine.pollRuntime()
+        void props.engine.pollRuntime().catch(() => undefined)
       }
     }, 1000)
-    return () => clearInterval(timer)
-  }, [props.engine, busy])
+    const unsubscribeQuit = props.engine.onQuit(exit)
+    return () => {
+      clearInterval(timer)
+      unsubscribeQuit()
+    }
+  }, [props.engine, busy, exit])
 
   useInput((value, key) => {
     if (key.ctrl && value === 'c') {
-      void props.engine.close().finally(exit)
+      void props.engine.quit()
     }
   })
 
@@ -33,8 +37,8 @@ export function REPL(props: { engine: QueryEngine }) {
         <TranscriptPane />
         <SidebarPane />
       </Box>
-      <ComposerPane engine={props.engine} />
       <FooterPane />
+      <ComposerPane engine={props.engine} onExit={exit} />
     </Box>
   )
 }

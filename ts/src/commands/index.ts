@@ -34,6 +34,16 @@ export function getCommands(): Command[] {
         await engine.showHelp()
       },
     },
+    {
+      type: 'local',
+      name: 'quit',
+      description: 'Exit S4Code.',
+      category: 'core',
+      aliases: ['exit', 'q'],
+      priority: 99,
+      immediate: true,
+      run: async () => 'quit',
+    },
     viewCommand('status', 'Show current workspace and runtime status.', 'status', undefined, { category: 'core', priority: 95 }),
     viewCommand('context', 'Show context usage and budget.', 'context', undefined, { category: 'runtime', aliases: ['ctx'], priority: 90 }),
     viewCommand('cost', 'Show usage, cost, and cache information.', 'cost', undefined, { category: 'runtime', priority: 50 }),
@@ -252,8 +262,17 @@ export function matchCommands(commands: Command[], text: string, recent: string[
   const filtered = raw
     ? commands.filter(command => {
         const names = [command.name, ...(command.aliases || [])]
-        return names.some(name => name.toLowerCase().startsWith(raw))
-          || (command.keywords || []).some(keyword => keyword.toLowerCase().startsWith(raw))
+        const primary = [...names, ...(command.keywords || [])].map(item => item.toLowerCase())
+        if (primary.some(item => item.startsWith(raw) || item.split(/\s+/).some(part => part.startsWith(raw)))) {
+          return true
+        }
+        if (raw.length < 2) {
+          return false
+        }
+        return [
+          command.description,
+          command.category || '',
+        ].map(item => item.toLowerCase()).some(item => item.includes(raw))
       })
     : commands
 
@@ -295,11 +314,15 @@ export function matchCommands(commands: Command[], text: string, recent: string[
   })
 }
 
-export async function runCommand(invocation: CommandInvocation, engine: QueryEngine): Promise<void> {
+export async function runCommand(invocation: CommandInvocation, engine: QueryEngine): Promise<void | 'quit'> {
   if (invocation.command.type === 'prompt') {
     const prompt = await (invocation.command as PromptCommand).getPrompt(invocation.args, engine)
     await engine.submitPrompt(prompt)
     return
   }
-  await (invocation.command as LocalCommand).run(invocation.args, engine)
+  const result = await (invocation.command as LocalCommand).run(invocation.args, engine)
+  if (result === 'quit') {
+    return engine.quit()
+  }
+  return undefined
 }

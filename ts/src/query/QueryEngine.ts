@@ -2,6 +2,7 @@ import type { AppState } from '../state/AppStateStore'
 import { appendCard, appendSeparator, appendStreamDelta, consumeBridgeEvent } from '../state/transcript'
 import { getCommands, matchCommands, parseCommand, runCommand } from '../commands'
 import type { BridgeClient } from '../runtime/bridgeClient'
+import { isBridgeClosedError } from '../runtime/bridgeClient'
 import type { Command } from '../types/command'
 import type { S4BridgeEvent } from '../types/bridge'
 
@@ -34,6 +35,8 @@ export class QueryEngine {
   private pendingAssistantText = ''
   private streamFlushTimer: ReturnType<typeof setTimeout> | null = null
   private readonly streamFlushMs = 75
+  private quitListeners = new Set<() => void>()
+  private closing = false
 
   constructor(config: QueryEngineConfig) {
     this.bridge = config.bridge
@@ -97,7 +100,21 @@ export class QueryEngine {
     this.setAppState(prev => consumeBridgeEvent(prev, event))
   }
 
-  async handleInput(text: string): Promise<void> {
+  onQuit(listener: () => void): () => void {
+    this.quitListeners.add(listener)
+    return () => this.quitListeners.delete(listener)
+  }
+
+  async quit(): Promise<'quit'> {
+    this.closing = true
+    await this.close()
+    for (const listener of this.quitListeners) {
+      listener()
+    }
+    return 'quit'
+  }
+
+  async handleInput(text: string): Promise<void | 'quit'> {
     const raw = text.trim()
     if (!raw) {
       return
@@ -106,8 +123,7 @@ export class QueryEngine {
       const invocation = parseCommand(this.commands, raw)
       if (invocation) {
         this.recordCommandUsage(invocation.command.name)
-        await runCommand(invocation, this)
-        return
+        return runCommand(invocation, this)
       }
       await this.submitPrompt(raw)
     } catch (error) {
@@ -299,7 +315,21 @@ export class QueryEngine {
   }
 
   async pollRuntime(): Promise<void> {
-    const result = await this.bridge.pollRuntimeNotices()
+    if (this.closing) {
+      return
+    }
+    let result: { notices: S4BridgeEvent[]; sidebar: AppState['sidebar'] }
+    try {
+      result = await this.bridge.pollRuntimeNotices()
+    } catch (error) {
+      if (this.closing || isBridgeClosedError(error)) {
+        return
+      }
+      throw error
+    }
+    if (this.closing) {
+      return
+    }
     this.setAppState(prev => {
       const currentSidebar = result.sidebar || prev.sidebar
       if ((result.notices || []).length === 0) {
@@ -423,6 +453,7 @@ export class QueryEngine {
   }
 
   async close(): Promise<void> {
+    this.closing = true
     try {
       this.flushStreamBuffer()
       await this.bridge.close()

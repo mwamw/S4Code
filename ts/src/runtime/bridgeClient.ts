@@ -18,9 +18,22 @@ type PendingRequest = {
   timeout?: ReturnType<typeof setTimeout>
 }
 
+class BridgeClosedError extends Error {
+  constructor() {
+    super('Bridge process is closed')
+    this.name = 'BridgeClosedError'
+  }
+}
+
+export function isBridgeClosedError(error: unknown): boolean {
+  return error instanceof BridgeClosedError
+    || (error instanceof Error && error.message === 'Bridge process is closed')
+}
+
 export class BridgeClient {
   private process: BridgeProcess
   private pending = new Map<string, PendingRequest>()
+  private closed = false
 
   constructor(process: BridgeProcess) {
     this.process = process
@@ -34,6 +47,16 @@ export class BridgeClient {
         clearTimeout(request.timeout)
       }
       request.reject(error)
+      this.pending.delete(requestId)
+    }
+  }
+
+  private resolvePendingAsClosed(): void {
+    for (const [requestId, request] of this.pending.entries()) {
+      if (request.timeout) {
+        clearTimeout(request.timeout)
+      }
+      request.resolve({ closed: true })
       this.pending.delete(requestId)
     }
   }
@@ -79,6 +102,9 @@ export class BridgeClient {
   }
 
   request<T>(method: string, params: Record<string, unknown> = {}, timeoutMs = 15000): Promise<T> {
+    if (this.closed) {
+      return Promise.reject(new BridgeClosedError())
+    }
     const requestId = randomUUID()
     return new Promise<T>((resolve, reject) => {
       const request: PendingRequest = {
@@ -169,14 +195,22 @@ export class BridgeClient {
   }
 
   pollRuntimeNotices(): Promise<{ notices: S4BridgeEvent[]; sidebar: SidebarPayload }> {
-    return this.request('poll_runtime_notices')
+    return this.request('poll_runtime_notices', {}, 3000)
   }
 
   close(): Promise<{ closed: boolean }> {
-    return this.request('shutdown')
+    if (this.closed) {
+      return Promise.resolve({ closed: true })
+    }
+    return this.request<{ closed: boolean }>('shutdown')
+      .finally(() => {
+        this.closed = true
+      })
   }
 
   terminate(): void {
+    this.closed = true
+    this.resolvePendingAsClosed()
     this.process.close()
   }
 }
