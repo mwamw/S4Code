@@ -66,6 +66,7 @@ export type SidebarPayload = {
   branch?: string
   model?: string
   provider?: string
+  profile?: string
   session_id?: string
   permission_mode?: string
   permission_rules?: number
@@ -120,4 +121,31 @@ export type PendingPayload = {
   affects_shared_state?: boolean
   overwrites_local_changes?: boolean
   remember_supported?: boolean
+}
+
+export type CommandPaletteEntryPayload = {
+  label: string
+  description: string
+  insert_text: string
+  execute_text: string
+  mode: 'insert' | 'execute'
+  aliases?: string[]
+}
+
+export type CommandPalettePayload = {
+  state_key: string
+  entries: CommandPaletteEntryPayload[]
+}
+
+export type ExecuteCommandPayload = {
+  handled: boolean
+  message?: string | null
+  should_query?: boolean
+  query?: string | null
+  exit_requested?: boolean
+  refresh_requested?: boolean
+  metadata?: Record<string, unknown>
+  session_id?: string
+  sidebar?: SidebarPayload
+  init?: InitPayload
 }

@@ -28,9 +28,12 @@ export type TaskEntry = {
 }
 
 export type PaletteEntry = {
-  name: string
+  label: string
   description: string
-  argumentHint?: string
+  insertText: string
+  executeText: string
+  mode: 'insert' | 'execute'
+  aliases?: string[]
 }
 
 export type AppState = {
@@ -99,6 +102,9 @@ export type AppState = {
     recentCommands: string[]
     entries: PaletteEntry[]
     selection: number
+    stateKey: string
+    loading: boolean
+    sourceText: string
   }
   ui: {
     sidebarVisible: boolean
@@ -169,6 +175,9 @@ export function getDefaultAppState(): AppState {
       recentCommands: [],
       entries: [],
       selection: 0,
+      stateKey: '',
+      loading: false,
+      sourceText: '',
     },
     ui: {
       sidebarVisible: false,

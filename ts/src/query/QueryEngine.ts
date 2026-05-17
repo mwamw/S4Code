@@ -4,7 +4,8 @@ import { getCommands, matchCommands, parseCommand, runCommand } from '../command
 import type { BridgeClient } from '../runtime/bridgeClient'
 import { isBridgeClosedError } from '../runtime/bridgeClient'
 import type { Command } from '../types/command'
-import type { S4BridgeEvent } from '../types/bridge'
+import type { CommandPaletteEntryPayload, S4BridgeEvent } from '../types/bridge'
+import type { PaletteEntry } from '../state/AppStateStore'
 
 function stableJson(value: unknown): string {
   return JSON.stringify(value) || 'null'
@@ -35,6 +36,10 @@ export class QueryEngine {
   private pendingAssistantText = ''
   private streamFlushTimer: ReturnType<typeof setTimeout> | null = null
   private readonly streamFlushMs = 75
+  private paletteTimer: ReturnType<typeof setTimeout> | null = null
+  private paletteRequestSeq = 0
+  private readonly paletteDebounceMs = 220
+  private paletteCache = new Map<string, { stateKey: string; entries: PaletteEntry[] }>()
   private quitListeners = new Set<() => void>()
   private closing = false
 
@@ -120,10 +125,8 @@ export class QueryEngine {
       return
     }
     try {
-      const invocation = parseCommand(this.commands, raw)
-      if (invocation) {
-        this.recordCommandUsage(invocation.command.name)
-        return runCommand(invocation, this)
+      if (raw.startsWith('/')) {
+        return this.executeSlashCommand(raw)
       }
       await this.submitPrompt(raw)
     } catch (error) {
@@ -137,6 +140,288 @@ export class QueryEngine {
           streaming: false,
         },
       }))
+    }
+  }
+
+  private normalizePaletteEntry(entry: CommandPaletteEntryPayload): PaletteEntry {
+    return {
+      label: String(entry.label || ''),
+      description: String(entry.description || ''),
+      insertText: String(entry.insert_text || ''),
+      executeText: String(entry.execute_text || ''),
+      mode: entry.mode === 'execute' ? 'execute' : 'insert',
+      aliases: Array.isArray(entry.aliases) ? entry.aliases.map(item => String(item)) : [],
+    }
+  }
+
+  private localPaletteFallback(input: string): { stateKey: string; entries: PaletteEntry[] } {
+    const state = this.getAppState()
+    const commands = matchCommands(this.commands, input, state.palette.recentCommands, state)
+    return {
+      stateKey: `local:${input}`,
+      entries: commands.map(command => ({
+        label: `/${command.name}${command.argumentHint ? ` ${command.argumentHint}` : ''}`,
+        description: command.description,
+        insertText: `/${command.name}${command.argumentHint ? ' ' : ''}`,
+        executeText: `/${command.name}`,
+        mode: command.argumentHint ? 'insert' : 'execute',
+        aliases: command.aliases || [],
+      })),
+    }
+  }
+
+  private shouldUseBackendPalette(input: string): boolean {
+    const body = String(input || '').trim().replace(/^\//, '').toLowerCase()
+    if (!body) {
+      return false
+    }
+    const root = body.split(/\s+/, 1)[0]
+    if (body === 'model') {
+      return true
+    }
+    if (['checkpoint', 'checkpoints', 'rewind'].includes(body)) {
+      return true
+    }
+    return new Set([
+      'agent',
+      'checkpoint',
+      'copy',
+      'mcp',
+      'model',
+      'permissions',
+      'plan',
+      'resume',
+      'rewind',
+      'session',
+      'skills',
+      'task',
+      'theme',
+      'worktree',
+    ]).has(root) && body.includes(' ')
+  }
+
+  private backendPaletteDelay(input: string): number {
+    const body = String(input || '').trim().replace(/^\//, '').toLowerCase()
+    const root = body.split(/\s+/, 1)[0]
+    return root === 'model' ? 0 : this.paletteDebounceMs
+  }
+
+  refreshPalette(input: string): void {
+    const text = String(input || '')
+    this.paletteRequestSeq += 1
+    const requestSeq = this.paletteRequestSeq
+    if (this.paletteTimer) {
+      clearTimeout(this.paletteTimer)
+      this.paletteTimer = null
+    }
+    if (!text.trim().startsWith('/')) {
+      this.setAppState(prev => ({
+        ...prev,
+        palette: {
+          ...prev.palette,
+          entries: [],
+          selection: 0,
+          stateKey: '',
+          loading: false,
+          sourceText: text,
+        },
+      }))
+      return
+    }
+
+    const fallback = this.localPaletteFallback(text)
+    const useBackend = this.shouldUseBackendPalette(text)
+    const cached = this.paletteCache.get(text)
+    if (cached) {
+      this.setAppState(prev => ({
+        ...prev,
+        palette: {
+          ...prev.palette,
+          entries: cached.entries,
+          selection: cached.stateKey === prev.palette.stateKey ? prev.palette.selection : 0,
+          stateKey: cached.stateKey,
+          loading: false,
+          sourceText: text,
+        },
+      }))
+    } else {
+      this.setAppState(prev => ({
+        ...prev,
+        palette: {
+          ...prev.palette,
+          entries: fallback.entries,
+          selection: fallback.stateKey === prev.palette.stateKey ? Math.min(prev.palette.selection, Math.max(fallback.entries.length - 1, 0)) : 0,
+          stateKey: fallback.stateKey,
+          loading: useBackend,
+          sourceText: text,
+        },
+      }))
+    }
+
+    if (!useBackend) {
+      return
+    }
+    this.paletteTimer = setTimeout(() => {
+      void this.loadPaletteNow(text, requestSeq)
+    }, this.backendPaletteDelay(text))
+  }
+
+  async loadPaletteNow(input: string, requestSeq = ++this.paletteRequestSeq): Promise<void> {
+    const text = String(input || '')
+    if (!text.trim().startsWith('/')) {
+      return
+    }
+    try {
+      const payload = await this.bridge.commandPalette(text)
+      if (requestSeq !== this.paletteRequestSeq || this.getAppState().ui.input !== text) {
+        return
+      }
+      const entries = (payload.entries || []).map(entry => this.normalizePaletteEntry(entry))
+      const stateKey = String(payload.state_key || '')
+      this.paletteCache.set(text, { stateKey, entries })
+      this.setAppState(prev => ({
+        ...prev,
+        palette: {
+          ...prev.palette,
+          entries,
+          selection: stateKey === prev.palette.stateKey ? Math.min(prev.palette.selection, Math.max(entries.length - 1, 0)) : 0,
+          stateKey,
+          loading: false,
+          sourceText: text,
+        },
+      }))
+    } catch {
+      if (requestSeq !== this.paletteRequestSeq || this.getAppState().ui.input !== text) {
+        return
+      }
+      const fallback = this.localPaletteFallback(text)
+      this.setAppState(prev => ({
+        ...prev,
+        palette: {
+          ...prev.palette,
+          entries: fallback.entries,
+          selection: 0,
+          stateKey: fallback.stateKey,
+          loading: false,
+          sourceText: text,
+        },
+      }))
+    }
+  }
+
+  async executeSlashCommand(text: string): Promise<void | 'quit'> {
+    const raw = text.trim()
+    if (/^\/(?:quit|exit|q)(?:\s|$)/i.test(raw)) {
+      return this.quit()
+    }
+    const localInvocation = parseCommand(this.commands, raw)
+    if (localInvocation?.command.name === 'quit') {
+      this.recordCommandUsage(localInvocation.command.name)
+      return runCommand(localInvocation, this)
+    }
+
+    const result = await this.bridge.executeCommand(raw)
+    if (!result.handled) {
+      await this.submitPrompt(raw)
+      return
+    }
+
+    const commandName = raw.slice(1).split(/\s+/, 1)[0]
+    this.recordCommandUsage(commandName)
+
+    const metadata = result.metadata || {}
+    this.applyLocalCommandSideEffects(raw, metadata)
+    const engineAction = String(metadata.engine_action || '')
+    if (engineAction === 'confirm_pending') {
+      await this.resolvePending('approve', String(metadata.answer || ''))
+      return
+    }
+    if (engineAction === 'deny_pending') {
+      await this.resolvePending('deny', String(metadata.answer || ''))
+      return
+    }
+    if (engineAction === 'answer_pending') {
+      await this.resolvePending('answer', String(metadata.answer || ''))
+      return
+    }
+
+    if (result.init) {
+      this.setAppState(() => this.buildStateFromInit(result.init!))
+    } else {
+      const sidebar = result.sidebar
+      if (result.message || sidebar) {
+        this.setAppState(prev => {
+          const withMessage = result.message
+            ? appendCard(prev, 'system', 'System', String(result.message), 'done')
+            : prev
+          return sidebar ? this.applySidebarPayload(withMessage, sidebar) : withMessage
+        })
+      } else {
+        await this.refreshSidebar(true)
+      }
+    }
+
+    if (result.should_query && result.query) {
+      await this.submitPrompt(result.query)
+    }
+
+    if (result.exit_requested) {
+      return this.quit()
+    }
+  }
+
+  private applyLocalCommandSideEffects(raw: string, metadata: Record<string, unknown>): void {
+    const commandName = raw.slice(1).split(/\s+/, 1)[0]?.toLowerCase() || ''
+    if (commandName === 'sidebar') {
+      const arg = raw.slice('/sidebar'.length).trim().toLowerCase()
+      this.setAppState(prev => ({
+        ...prev,
+        ui: {
+          ...prev.ui,
+          sidebarVisible: arg
+            ? ['show', 'on', 'open'].includes(arg)
+            : !prev.ui.sidebarVisible,
+        },
+      }))
+    }
+    if (commandName === 'theme') {
+      const target = raw.slice('/theme'.length).trim()
+      if (target && !['list', 'ls', 'show'].includes(target.toLowerCase())) {
+        this.setAppState(prev => ({
+          ...prev,
+          ui: {
+            ...prev.ui,
+            theme: target,
+          },
+        }))
+      }
+    }
+    if (String(metadata.ui_action || '') === 'copy_to_clipboard') {
+      this.copyTranscriptToTerminalClipboard(String(metadata.copy_target || 'transcript'))
+    }
+  }
+
+  private copyTranscriptToTerminalClipboard(target: string): void {
+    const state = this.getAppState()
+    const committed = state.transcript.committedCards || state.transcript.cards || []
+    const cards = target === 'last'
+      ? committed.slice(-1)
+      : committed
+    const text = cards
+      .filter(card => card.kind !== 'separator')
+      .map(card => `${card.title}\n${card.body}`.trim())
+      .filter(Boolean)
+      .join('\n\n')
+    if (!text) {
+      this.setAppState(prev => appendCard(prev, 'system', 'Copy', 'Nothing to copy.', 'done'))
+      return
+    }
+    try {
+      process.stdout.write(`\u001b]52;c;${Buffer.from(text, 'utf8').toString('base64')}\u0007`)
+      this.setAppState(prev => appendCard(prev, 'system', 'Copy', `Copied ${target === 'last' ? 'latest card' : 'transcript'} to the terminal clipboard.`, 'done'))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.setAppState(prev => appendCard(prev, 'error', 'Copy Failed', message, 'done'))
     }
   }
 
@@ -387,30 +672,44 @@ export class QueryEngine {
   async refreshSidebar(force = false): Promise<void> {
     const sidebar = await this.bridge.getSidebar(force)
     this.setAppState(prev => {
-      const next: AppState = {
-        ...prev,
-        sidebar,
-        context: sidebar.context || prev.context,
-        permissions: {
-          ...prev.permissions,
-          mode: String(sidebar.permission_mode || prev.permissions.mode),
-          rules: Number(sidebar.permission_rules || prev.permissions.rules),
-          pending: (sidebar.pending as typeof prev.permissions.pending) || prev.permissions.pending,
-        },
-        skills: {
-          active: [...(sidebar.skills?.active || [])],
-          queued: [...(sidebar.skills?.queued || [])],
-        },
-        mcp: {
-          enabled: Boolean(sidebar.mcp?.enabled),
-          configured: Number(sidebar.mcp?.configured || 0),
-          connected: Number(sidebar.mcp?.connected || 0),
-          disabled: Number(sidebar.mcp?.disabled || 0),
-          unavailable: Number(sidebar.mcp?.unavailable || 0),
-        },
-      }
+      const next = this.applySidebarPayload(prev, sidebar)
       return sidebarSnapshot(prev) === sidebarSnapshot(next) ? prev : next
     })
+  }
+
+  private applySidebarPayload(prev: AppState, sidebar: AppState['sidebar']): AppState {
+    return {
+      ...prev,
+      sidebar,
+      context: sidebar.context || prev.context,
+      permissions: {
+        ...prev.permissions,
+        mode: String(sidebar.permission_mode || prev.permissions.mode),
+        rules: Number(sidebar.permission_rules || prev.permissions.rules),
+        pending: (sidebar.pending as typeof prev.permissions.pending) || prev.permissions.pending,
+      },
+      model: {
+        ...prev.model,
+        model: String(sidebar.model || prev.model.model),
+        provider: String(sidebar.provider || prev.model.provider),
+        profile: String(sidebar.profile || prev.model.profile),
+      },
+      session: {
+        ...prev.session,
+        id: String(sidebar.session_id || prev.session.id),
+      },
+      skills: {
+        active: [...(sidebar.skills?.active || [])],
+        queued: [...(sidebar.skills?.queued || [])],
+      },
+      mcp: {
+        enabled: Boolean(sidebar.mcp?.enabled),
+        configured: Number(sidebar.mcp?.configured || 0),
+        connected: Number(sidebar.mcp?.connected || 0),
+        disabled: Number(sidebar.mcp?.disabled || 0),
+        unavailable: Number(sidebar.mcp?.unavailable || 0),
+      },
+    }
   }
 
   async pollRuntime(): Promise<void> {
@@ -509,7 +808,7 @@ export class QueryEngine {
       model: {
         model: init.model,
         provider: init.provider,
-        profile: 'default',
+        profile: String(init.sidebar.profile || 'default'),
       },
       permissions: {
         mode: init.permission_mode,
@@ -558,6 +857,10 @@ export class QueryEngine {
       await this.bridge.close()
     } finally {
       this.clearStreamTimer()
+      if (this.paletteTimer) {
+        clearTimeout(this.paletteTimer)
+        this.paletteTimer = null
+      }
       this.bridge.terminate()
     }
   }

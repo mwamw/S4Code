@@ -46,7 +46,10 @@ async function runPromptMode(prompt: string): Promise<void> {
     },
   }))
   try {
-    await runtime.engine.handleInput(prompt)
+    const result = await runtime.engine.handleInput(prompt)
+    if (result === 'quit') {
+      return
+    }
     const cards = runtime.store.getState().transcript.cards
     for (const card of cards) {
       if (card.kind === 'assistant' || card.kind === 'system' || card.kind === 'error') {

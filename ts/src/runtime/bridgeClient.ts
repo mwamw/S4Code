@@ -6,6 +6,8 @@ import type {
   BridgeEventEnvelope,
   BridgeResponseEnvelope,
   ContextPayload,
+  CommandPalettePayload,
+  ExecuteCommandPayload,
   InitPayload,
   PendingPayload,
   S4BridgeEvent,
@@ -211,6 +213,14 @@ export class BridgeClient {
 
   buildPrompt(kind: string, params: Record<string, unknown> = {}): Promise<{ prompt: string }> {
     return this.request('build_prompt', { kind, ...params })
+  }
+
+  commandPalette(text: string): Promise<CommandPalettePayload> {
+    return this.request('command_palette', { text }, 5000)
+  }
+
+  executeCommand(text: string): Promise<ExecuteCommandPayload> {
+    return this.request('execute_command', { text }, 0)
   }
 
   runAction(action: string, params: Record<string, unknown> = {}): Promise<{ text: string; init?: InitPayload }> {

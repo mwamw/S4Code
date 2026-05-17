@@ -11,6 +11,7 @@ export async function setup(options: { cwd: string; sessionId?: string | null; t
 }> {
   const process = new BridgeProcess(options.cwd, options.sessionId, {
     transientSession: Boolean(options.transientSession),
+    ignoreSessionModelOverrides: Boolean(options.sessionId),
   })
   const bridge = new BridgeClient(process)
   const store = createStore(getDefaultAppState())

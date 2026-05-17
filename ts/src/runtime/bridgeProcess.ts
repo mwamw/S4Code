@@ -21,15 +21,17 @@ export class BridgeProcess {
   private closed = false
   private readonly bridgeEnv: NodeJS.ProcessEnv
   private readonly transientSession: boolean
+  private ignoreSessionModelOverrides: boolean
 
   constructor(
     cwd: string,
     sessionId?: string | null,
-    options: { transientSession?: boolean } = {},
+    options: { transientSession?: boolean; ignoreSessionModelOverrides?: boolean } = {},
   ) {
     this.cwd = cwd
     this.sessionId = sessionId || null
     this.transientSession = Boolean(options.transientSession)
+    this.ignoreSessionModelOverrides = Boolean(options.ignoreSessionModelOverrides)
     this.python = process.env.S4CODE_PYTHON || this.findProjectPython() || 'python'
     this.bridgeEnv = {
       ...process.env,
@@ -103,7 +105,13 @@ export class BridgeProcess {
     if (this.transientSession) {
       args.push('--transient-session')
     }
+    if (this.ignoreSessionModelOverrides) {
+      args.push('--ignore-session-model-overrides')
+    }
     args.push('--request-json', JSON.stringify(request))
+    if (request.method === 'init') {
+      this.ignoreSessionModelOverrides = false
+    }
 
     const child = spawn(this.python, args, {
       cwd: this.cwd,

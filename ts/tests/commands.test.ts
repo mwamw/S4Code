@@ -38,6 +38,9 @@ describe('commands', () => {
       'worktree',
       'session list',
       'session checkpoints',
+      'checkpoint',
+      'checkpoints',
+      'rewind',
       'tasks',
       'task output',
       'pending',
@@ -71,8 +74,14 @@ describe('commands', () => {
   test('matchCommands shows nested choices after selecting a command group', () => {
     const state = getDefaultAppState()
 
+    expect(matchCommands(getCommands(), '/session', [], state).map(command => command.name)).toEqual(
+      expect.arrayContaining(['session list', 'session load', 'session checkpoints']),
+    )
     expect(matchCommands(getCommands(), '/session ', [], state).map(command => command.name)).toEqual(
       expect.arrayContaining(['session list', 'session load', 'session checkpoints']),
+    )
+    expect(matchCommands(getCommands(), '/mcp', [], state).map(command => command.name)).toEqual(
+      expect.arrayContaining(['mcp server', 'mcp tools', 'mcp resources', 'mcp refresh']),
     )
     expect(matchCommands(getCommands(), '/skills ', [], state).map(command => command.name)).toEqual(
       expect.arrayContaining(['skills queue', 'skills clear']),

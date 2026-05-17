@@ -191,6 +191,42 @@ export function getCommands(): Command[] {
     viewCommand('session tree', 'Show session fork and restore tree.', 'session_tree', undefined, { category: 'session', priority: 71 }),
     {
       type: 'local',
+      name: 'checkpoint',
+      description: 'Create a restorable conversation checkpoint.',
+      argumentHint: '[label]',
+      category: 'session',
+      priority: 72,
+      immediate: true,
+      run: async (args, engine) => {
+        await engine.executeSlashCommand(`/checkpoint ${args}`.trim())
+      },
+    },
+    {
+      type: 'local',
+      name: 'checkpoints',
+      description: 'List restorable conversation checkpoints.',
+      category: 'session',
+      aliases: ['checkpoint list'],
+      priority: 71,
+      run: async (_args, engine) => {
+        await engine.showView('session_checkpoints', '')
+      },
+    },
+    {
+      type: 'local',
+      name: 'rewind',
+      description: 'Rewind conversation history to a checkpoint.',
+      argumentHint: '<checkpoint-id|index|last>',
+      category: 'session',
+      priority: 70,
+      immediate: true,
+      isSensitive: true,
+      run: async (args, engine) => {
+        await engine.rewindSession(args)
+      },
+    },
+    {
+      type: 'local',
       name: 'session load',
       description: 'Load a saved session.',
       argumentHint: '<session-id>',
@@ -437,11 +473,17 @@ export function matchCommands(commands: Command[], text: string, recent: string[
   const rootToken = raw.split(/\s+/)[0] || ''
   const hasTrailingSpace = /\S\s+$/.test(withoutSlash)
   const rootExists = commands.some(command => command.name === rootToken && !isNestedCommand(command))
-  const secondLevelMode = Boolean(rootToken && rootExists && (hasTrailingSpace || raw.includes(' ')))
+  const rootHasNestedCommands = rootExists && hasNestedCommands(commands, rootToken)
+  const secondLevelMode = Boolean(rootToken && rootExists && (hasTrailingSpace || raw.includes(' ') || (raw === rootToken && rootHasNestedCommands)))
   const filtered = (() => {
     if (secondLevelMode) {
       const prefix = `${rootToken} `
-      return commands.filter(command => command.name.startsWith(prefix) && command.name.toLowerCase().startsWith(raw))
+      return commands.filter(command => {
+        if (!command.name.startsWith(prefix)) {
+          return false
+        }
+        return raw === rootToken || command.name.toLowerCase().startsWith(raw)
+      })
     }
     const topLevel = commands.filter(command => !isNestedCommand(command))
     if (!raw) {

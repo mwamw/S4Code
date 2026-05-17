@@ -4,33 +4,48 @@ import { CommandPalette } from './CommandPalette'
 import { PromptInput } from './PromptInput'
 import { useAppState, useSetAppState } from '../state/AppState'
 import type { QueryEngine } from '../query/QueryEngine'
-import { resolvePaletteSelection } from '../commands'
 
 export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }) {
   const busy = useAppState(state => state.runtime.busy)
   const input = useAppState(state => state.ui.input)
   const selectedIndex = useAppState(state => state.palette.selection)
+  const entries = useAppState(state => state.palette.entries)
+  const paletteLoading = useAppState(state => state.palette.loading)
+  const paletteSourceText = useAppState(state => state.palette.sourceText)
   const setAppState = useSetAppState()
-  const matches = props.engine.getPaletteCommands(input)
-  const paletteVisible = input.trim().startsWith('/') && matches.length > 0
-  const boundedSelection = Math.min(Math.max(selectedIndex, 0), Math.max(matches.length - 1, 0))
+  const entriesMatchInput = paletteSourceText === input
+  const visibleEntries = entriesMatchInput ? entries : []
+  const paletteVisible = input.trim().startsWith('/') && (visibleEntries.length > 0 || paletteLoading)
+  const boundedSelection = Math.min(Math.max(selectedIndex, 0), Math.max(visibleEntries.length - 1, 0))
+
+  const updateInput = (value: string, selection = 0) => {
+    setAppState(prev => ({
+      ...prev,
+      ui: {
+        ...prev.ui,
+        input: value,
+      },
+      palette: {
+        ...prev.palette,
+        selection,
+      },
+    }))
+    props.engine.refreshPalette(value)
+  }
 
   useInput((_value, key) => {
+    if (key.return && /^\/(?:quit|exit|q)(?:\s|$)/i.test(input.trim())) {
+      updateInput('')
+      void props.engine.quit().finally(() => {
+        props.onExit?.()
+      })
+      return
+    }
     if (!paletteVisible) {
       return
     }
     if (key.escape) {
-      setAppState(prev => ({
-        ...prev,
-        ui: {
-          ...prev.ui,
-          input: '',
-        },
-        palette: {
-          ...prev.palette,
-          selection: 0,
-        },
-      }))
+      updateInput('')
       return
     }
     if (key.pageUp) {
@@ -48,7 +63,7 @@ export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }
         ...prev,
         palette: {
           ...prev.palette,
-          selection: Math.min(matches.length - 1, boundedSelection + 10),
+          selection: Math.min(visibleEntries.length - 1, boundedSelection + 10),
         },
       }))
       return
@@ -68,87 +83,48 @@ export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }
         ...prev,
         palette: {
           ...prev.palette,
-          selection: Math.min(matches.length - 1, boundedSelection + 1),
+          selection: Math.min(visibleEntries.length - 1, boundedSelection + 1),
         },
       }))
       return
     }
     if (key.tab) {
-      const command = matches[boundedSelection]
-      if (!command) {
+      const entry = visibleEntries[boundedSelection]
+      if (!entry) {
         return
       }
-      const selection = resolvePaletteSelection(props.engine.commands, input, command)
-      if (!selection) {
-        return
-      }
-      setAppState(prev => ({
-        ...prev,
-        ui: {
-          ...prev.ui,
-          input: selection.text,
-        },
-        palette: {
-          ...prev.palette,
-          selection: 0,
-        },
-      }))
+      updateInput(entry.insertText)
     }
   })
 
   return (
     <>
-      <CommandPalette commands={matches} visible={paletteVisible} selectedIndex={boundedSelection} />
+      <CommandPalette entries={visibleEntries} visible={paletteVisible} selectedIndex={boundedSelection} loading={paletteLoading} />
       <PromptInput
         value={input}
         busy={busy}
         onChange={value => {
-          setAppState(prev => ({
-            ...prev,
-            ui: {
-              ...prev.ui,
-              input: value,
-            },
-            palette: {
-              ...prev.palette,
-              selection: 0,
-            },
-          }))
+          updateInput(value)
         }}
         onSubmit={value => {
           if (busy) {
             return
           }
-          const selectedCommand = matches[boundedSelection]
-          const selection = paletteVisible
-            ? resolvePaletteSelection(props.engine.commands, value, selectedCommand)
-            : null
-          if (selection?.action === 'insert') {
-            setAppState(prev => ({
-              ...prev,
-              ui: {
-                ...prev.ui,
-                input: selection.text,
-              },
-              palette: {
-                ...prev.palette,
-                selection: 0,
-              },
-            }))
+          const rawValue = value.trim()
+          if (/^\/(?:quit|exit|q)(?:\s|$)/i.test(rawValue)) {
+            updateInput('')
+            void props.engine.quit().finally(() => {
+              props.onExit?.()
+            })
             return
           }
-          const submitted = selection?.text || value
-          setAppState(prev => ({
-            ...prev,
-            ui: {
-              ...prev.ui,
-              input: '',
-            },
-            palette: {
-              ...prev.palette,
-              selection: 0,
-            },
-          }))
+          const selectedEntry = paletteVisible ? visibleEntries[boundedSelection] : undefined
+          if (selectedEntry?.mode === 'insert') {
+            updateInput(selectedEntry.insertText)
+            return
+          }
+          const submitted = selectedEntry?.executeText || value
+          updateInput('')
           void props.engine.handleInput(submitted).then(result => {
             if (result === 'quit') {
               props.onExit?.()
