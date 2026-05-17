@@ -56,12 +56,14 @@ class S4QueryEngine:
         cwd: str | Path | None = None,
         session_id: Optional[str] = None,
         session_overrides: Optional[dict[str, Any]] = None,
+        ignore_saved_model_overrides: bool = False,
     ) -> None:
         self.paths = get_s4_paths().ensure()
         self.session_manager = S4SessionManager(self.paths)
         self.command_registry = S4CommandRegistry()
         self._base_session_overrides = dict(session_overrides or {})
         self.session_overrides = dict(self._base_session_overrides)
+        self._ignore_saved_model_overrides = bool(ignore_saved_model_overrides)
         self.project = ProjectContext.detect(cwd)
         self.bundle: S4AgentBundle
         self.session_id = session_id or self.session_manager.new_session_id(self.project)
@@ -186,6 +188,24 @@ class S4QueryEngine:
         slots = max(int(width), 1)
         filled = min(slots, int(round(bounded * slots)))
         return "[" + ("#" * filled) + ("-" * (slots - filled)) + "]"
+
+    @staticmethod
+    def _strip_model_session_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+        sanitized = copy.deepcopy(dict(overrides or {}))
+        sanitized.pop("active_model_profile", None)
+        sanitized.pop("llm", None)
+        return sanitized
+
+    def _current_model_session_overrides(self) -> dict[str, Any]:
+        current = dict(getattr(self, "session_overrides", {}) or {})
+        model_overrides: dict[str, Any] = {}
+        if current.get("active_model_profile"):
+            model_overrides["active_model_profile"] = current.get("active_model_profile")
+        if isinstance(current.get("llm"), dict):
+            model_overrides["llm"] = copy.deepcopy(current.get("llm") or {})
+        elif not model_overrides and getattr(self, "settings", None) is not None:
+            model_overrides["active_model_profile"] = self.settings.active_model_profile
+        return model_overrides
 
     def _context_usage_summary(self, usage: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         payload = dict(usage or self.agent.get_context_usage() or {})
@@ -991,12 +1011,16 @@ class S4QueryEngine:
             self._closed = True
         return report
 
-    def _apply_session_record(self, record: dict[str, Any]) -> None:
+    def _apply_session_record(self, record: dict[str, Any], *, model_overrides: Optional[dict[str, Any]] = None) -> None:
         metadata = dict(record.get("metadata") or {})
         project_root = metadata.get("project_root") or str(self.project.project_root)
         self.project = ProjectContext.detect(project_root)
         stored_overrides = dict(metadata.get("session_overrides") or {})
+        if self._ignore_saved_model_overrides or model_overrides:
+            stored_overrides = self._strip_model_session_overrides(stored_overrides)
         self.session_overrides = _deep_merge_dicts(stored_overrides, self._base_session_overrides)
+        if model_overrides:
+            self.session_overrides = _deep_merge_dicts(self.session_overrides, model_overrides)
         restored_title = str(metadata.get("title") or "").strip()
         if restored_title:
             self.title = restored_title
@@ -1039,11 +1063,12 @@ class S4QueryEngine:
         )
 
     def resume_session(self, session_id: str) -> str:
+        current_model_overrides = self._current_model_session_overrides()
         if getattr(self, "bundle", None) is not None:
             self._close_bundle(mark_closed=False, record_report=False)
         self._restored_session = True
         self._pending_turn_skills.clear()
-        self._apply_session_record(self._require_session_record(session_id))
+        self._apply_session_record(self._require_session_record(session_id), model_overrides=current_model_overrides)
         self.settings = resolve_settings(
             self.paths,
             project_root=self.project.project_root,

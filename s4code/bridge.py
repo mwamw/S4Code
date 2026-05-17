@@ -11,6 +11,8 @@ import sys
 import traceback
 from typing import Any, Optional
 
+from .command_palette import S4CommandPaletteBuilder
+from .commands import register_builtin_commands
 from .query_engine import S4QueryEngine
 
 
@@ -32,16 +34,33 @@ class BridgeSession:
         cwd: str | Path,
         session_id: Optional[str] = None,
         transient_session: bool = False,
+        ignore_session_model_overrides: bool = False,
     ) -> None:
         self.cwd = Path(cwd).resolve()
         self._session_id = session_id
         self.transient_session = transient_session
-        self.engine = self._create_engine(session_id=session_id)
+        self.engine = self._create_engine(
+            session_id=session_id,
+            ignore_saved_model_overrides=ignore_session_model_overrides,
+        )
         if self.transient_session:
             self._disable_autosave()
 
-    def _create_engine(self, *, session_id: Optional[str]) -> S4QueryEngine:
-        return S4QueryEngine(cwd=self.cwd, session_id=session_id)
+    def _create_engine(
+        self,
+        *,
+        session_id: Optional[str],
+        session_overrides: Optional[dict[str, Any]] = None,
+        ignore_saved_model_overrides: bool = False,
+    ) -> S4QueryEngine:
+        engine = S4QueryEngine(
+            cwd=self.cwd,
+            session_id=session_id,
+            session_overrides=session_overrides,
+            ignore_saved_model_overrides=ignore_saved_model_overrides,
+        )
+        register_builtin_commands(engine.command_registry)
+        return engine
 
     def _disable_autosave(self) -> None:
         settings = getattr(self.engine, "settings", None)
@@ -55,10 +74,20 @@ class BridgeSession:
         except Exception:
             pass
 
-    def reset_engine(self, *, session_id: Optional[str]) -> None:
+    def _current_model_session_overrides(self) -> dict[str, Any]:
+        getter = getattr(self.engine, "_current_model_session_overrides", None)
+        if callable(getter):
+            try:
+                return dict(getter() or {})
+            except Exception:
+                return {}
+        return {}
+
+    def reset_engine(self, *, session_id: Optional[str], preserve_current_model: bool = False) -> None:
+        model_overrides = self._current_model_session_overrides() if preserve_current_model else None
         self.close()
         self._session_id = session_id
-        self.engine = self._create_engine(session_id=session_id)
+        self.engine = self._create_engine(session_id=session_id, session_overrides=model_overrides)
         if self.transient_session:
             self._disable_autosave()
 
@@ -184,7 +213,40 @@ class BridgeSession:
             if not callable(builder):
                 raise ValueError("review prompt builder is unavailable")
             return {"prompt": builder(target)}
+        if prompt_kind == "commit":
+            builder = getattr(self.engine, "build_commit_prompt", None)
+            if not callable(builder):
+                raise ValueError("commit prompt builder is unavailable")
+            return {"prompt": builder()}
         raise ValueError(f"Unknown prompt kind: {prompt_kind}")
+
+    def command_palette(self, text: str) -> dict[str, Any]:
+        return S4CommandPaletteBuilder(self.engine).build(text)
+
+    def execute_command(self, text: str) -> dict[str, Any]:
+        raw = str(text or "").strip()
+        if not raw.startswith("/"):
+            return {"handled": False}
+        invocation = self.engine.command_registry.parse(raw)
+        if invocation is not None:
+            self.engine.record_command_usage(invocation.name)
+        result = self.engine.command_registry.execute(self.engine, raw)
+        if result is None:
+            return {"handled": False}
+        payload: dict[str, Any] = {
+            "handled": True,
+            "message": result.message,
+            "should_query": result.should_query,
+            "query": result.query,
+            "exit_requested": result.exit_requested,
+            "refresh_requested": result.refresh_requested,
+            "metadata": dict(result.metadata or {}),
+            "session_id": self.engine.session_id,
+            "sidebar": self.engine.get_sidebar_payload(force=True),
+        }
+        if result.refresh_requested:
+            payload["init"] = self.init_payload()
+        return payload
 
     def run_action(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         engine = self.engine
@@ -193,7 +255,7 @@ class BridgeSession:
             session_id = str(params.get("session_id") or "").strip() or None
             if not session_id:
                 raise ValueError("load_session requires session_id")
-            self.reset_engine(session_id=session_id)
+            self.reset_engine(session_id=session_id, preserve_current_model=True)
             return {
                 "text": f"Loaded session {self.engine.session_id}.",
                 "init": self.init_payload(),
@@ -309,11 +371,13 @@ class BridgeServer:
         cwd: str | Path,
         session_id: Optional[str] = None,
         transient_session: bool = False,
+        ignore_session_model_overrides: bool = False,
     ) -> None:
         self.session = BridgeSession(
             cwd=cwd,
             session_id=session_id,
             transient_session=transient_session,
+            ignore_session_model_overrides=ignore_session_model_overrides,
         )
 
     def emit(self, request_id: str, payload: dict[str, Any]) -> None:
@@ -394,6 +458,10 @@ class BridgeServer:
             result = self.session.render_view(str(params.get("view") or ""), params)
         elif method == "build_prompt":
             result = self.session.build_prompt(str(params.get("kind") or ""), params)
+        elif method == "command_palette":
+            result = self.session.command_palette(str(params.get("text") or ""))
+        elif method == "execute_command":
+            result = self.session.execute_command(str(params.get("text") or ""))
         elif method == "action":
             result = self.session.run_action(str(params.get("action") or ""), params)
         elif method == "get_sidebar_payload":
@@ -430,6 +498,7 @@ def run_server(
     cwd: str | Path,
     session_id: Optional[str],
     transient_session: bool = False,
+    ignore_session_model_overrides: bool = False,
 ) -> int:
     server: BridgeServer | None = None
     loop = asyncio.new_event_loop()
@@ -440,6 +509,7 @@ def run_server(
                 cwd=cwd,
                 session_id=session_id,
                 transient_session=transient_session,
+                ignore_session_model_overrides=ignore_session_model_overrides,
             )
         except Exception as exc:
             _emit_response(
@@ -489,6 +559,7 @@ def run_single_request(
     session_id: Optional[str],
     request_json: str,
     transient_session: bool = False,
+    ignore_session_model_overrides: bool = False,
 ) -> int:
     server: BridgeServer | None = None
     request_id = ""
@@ -501,6 +572,7 @@ def run_single_request(
             cwd=cwd,
             session_id=session_id,
             transient_session=transient_session,
+            ignore_session_model_overrides=ignore_session_model_overrides,
         )
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -531,6 +603,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--cwd", default=".", help="Working directory")
     parser.add_argument("--session-id", default=None, help="Optional session id to resume")
     parser.add_argument("--transient-session", action="store_true", help="Do not persist a new one-shot session")
+    parser.add_argument("--ignore-session-model-overrides", action="store_true", help="Use current config model instead of the saved session model")
     parser.add_argument("--request-json", default=None, help="Optional one-shot request payload")
     args = parser.parse_args(argv)
     transient_session = bool(args.transient_session or os.environ.get("S4CODE_TRANSIENT_SESSION") == "1")
@@ -540,8 +613,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             session_id=args.session_id,
             request_json=args.request_json,
             transient_session=transient_session,
+            ignore_session_model_overrides=bool(args.ignore_session_model_overrides),
         )
-    return run_server(cwd=args.cwd, session_id=args.session_id, transient_session=transient_session)
+    return run_server(
+        cwd=args.cwd,
+        session_id=args.session_id,
+        transient_session=transient_session,
+        ignore_session_model_overrides=bool(args.ignore_session_model_overrides),
+    )
 
 
 if __name__ == "__main__":
