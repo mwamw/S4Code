@@ -4,6 +4,7 @@ import { CommandPalette } from './CommandPalette'
 import { PromptInput } from './PromptInput'
 import { useAppState, useSetAppState } from '../state/AppState'
 import type { QueryEngine } from '../query/QueryEngine'
+import { resolvePaletteSelection } from '../commands'
 
 export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }) {
   const busy = useAppState(state => state.runtime.busy)
@@ -77,11 +78,15 @@ export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }
       if (!command) {
         return
       }
+      const selection = resolvePaletteSelection(props.engine.commands, input, command)
+      if (!selection) {
+        return
+      }
       setAppState(prev => ({
         ...prev,
         ui: {
           ...prev.ui,
-          input: `/${command.name}${command.argumentHint && command.argumentHint.startsWith('<') ? ' ' : ''}`,
+          input: selection.text,
         },
         palette: {
           ...prev.palette,
@@ -114,14 +119,25 @@ export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }
           if (busy) {
             return
           }
-          const commandBody = value.trim().replace(/^\//, '')
-          const shouldUseSelection = paletteVisible
-            && matches[boundedSelection]
-            && !commandBody.includes(' ')
-            && commandBody !== matches[boundedSelection].name
-          const submitted = shouldUseSelection
-            ? `/${matches[boundedSelection].name}`
-            : value
+          const selectedCommand = matches[boundedSelection]
+          const selection = paletteVisible
+            ? resolvePaletteSelection(props.engine.commands, value, selectedCommand)
+            : null
+          if (selection?.action === 'insert') {
+            setAppState(prev => ({
+              ...prev,
+              ui: {
+                ...prev.ui,
+                input: selection.text,
+              },
+              palette: {
+                ...prev.palette,
+                selection: 0,
+              },
+            }))
+            return
+          }
+          const submitted = selection?.text || value
           setAppState(prev => ({
             ...prev,
             ui: {

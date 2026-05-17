@@ -258,6 +258,157 @@ function formatRoundOutcome(metrics: Record<string, unknown> | undefined): strin
   return lines.join('\n')
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function formatInterruptionBody(event: S4BridgeEvent): { title: string; body: string; pending: Record<string, unknown> } {
+  const payload = asRecord(event.payload)
+  const metadata = asRecord(payload.metadata)
+  const interactionType = String(metadata.interaction_type || 'confirmation')
+
+  if (interactionType === 'ask_user_question') {
+    const lines = [
+      'The agent needs your answer before it can continue.',
+      '',
+    ]
+    const message = String(payload.message || event.content || '').trim()
+    if (message) {
+      lines.push(message, '')
+    }
+    const questions = Array.isArray(metadata.questions) ? metadata.questions : []
+    if (questions.length > 0) {
+      lines.push('Questions:')
+      questions.forEach((rawQuestion, index) => {
+        const item = asRecord(rawQuestion)
+        const header = String(item.header || `Question ${index + 1}`).trim()
+        const question = String(item.question || '').trim()
+        lines.push(`${index + 1}. ${header}`)
+        if (question) {
+          lines.push(`   ${question}`)
+        }
+        const options = Array.isArray(item.options) ? item.options : []
+        for (const rawOption of options) {
+          const option = asRecord(rawOption)
+          const label = String(option.label || '').trim()
+          const description = String(option.description || '').trim()
+          lines.push(`   - ${label || 'option'}${description ? `: ${description}` : ''}`)
+        }
+      })
+      lines.push('')
+    }
+    const source = String(metadata.source || '').trim()
+    if (source) {
+      lines.push(`Source: ${source}`)
+    }
+    lines.push('Next step:')
+    lines.push('- Use `/answer <text>` to continue.')
+    lines.push('- Use `/deny [reason]` to decline.')
+    return {
+      title: 'Ask User Question',
+      body: lines.join('\n').trim(),
+      pending: {
+        active: true,
+        title: 'Answer needed',
+        interaction_type: interactionType,
+        remember_supported: false,
+      },
+    }
+  }
+
+  if (interactionType === 'enter_plan_mode') {
+    const lines = ['The agent wants to switch into planning mode before making changes.']
+    const reason = String(metadata.reason || '').trim()
+    if (reason) {
+      lines.push(`Why this helps: ${reason}`)
+    }
+    const allowedActions = Array.isArray(metadata.allowedActions) ? metadata.allowedActions : []
+    if (allowedActions.length > 0) {
+      lines.push('What it wants to do:')
+      for (const item of allowedActions) {
+        lines.push(`- ${summarizeScalar(item, 120)}`)
+      }
+    }
+    lines.push('Next step:')
+    lines.push('- Use `/confirm` to enter plan mode.')
+    lines.push('- Use `/deny [reason]` to refuse.')
+    return {
+      title: 'Enter Plan Mode Request',
+      body: lines.join('\n'),
+      pending: {
+        active: true,
+        title: 'Mode change pending',
+        interaction_type: interactionType,
+        risk_level: 'medium',
+      },
+    }
+  }
+
+  if (interactionType === 'exit_plan_mode') {
+    const lines = ['The agent is ready to leave planning mode and continue execution.']
+    const allowedPrompts = Array.isArray(metadata.allowedPrompts) ? metadata.allowedPrompts : []
+    if (allowedPrompts.length > 0) {
+      lines.push('Requested permission categories:')
+      for (const rawPrompt of allowedPrompts) {
+        const item = asRecord(rawPrompt)
+        const tool = String(item.tool || 'tool').trim()
+        const prompt = String(item.prompt || '').trim()
+        lines.push(prompt ? `- ${tool}: ${prompt}` : `- ${tool}`)
+      }
+    }
+    lines.push('Next step:')
+    lines.push('- Use `/confirm` to leave plan mode.')
+    lines.push('- Use `/deny [reason]` to stay in plan mode.')
+    return {
+      title: 'Exit Plan Mode Request',
+      body: lines.join('\n'),
+      pending: {
+        active: true,
+        title: 'Mode change pending',
+        interaction_type: interactionType,
+        risk_level: 'medium',
+      },
+    }
+  }
+
+  const toolName = String(payload.tool_name || event.tool_name || '').trim()
+  const lines = ['The agent is waiting for your approval before it continues.']
+  const content = String(event.content || payload.message || '').trim()
+  if (content) {
+    lines.push('', content)
+  }
+  if (toolName) {
+    lines.push(`Tool: ${toolName}`)
+  }
+  const reason = String(metadata.reason || '').trim()
+  if (reason) {
+    lines.push(`Why this needs approval: ${reason}`)
+  }
+  const toolArgs = asRecord(payload.tool_args)
+  if (Object.keys(toolArgs).length > 0) {
+    lines.push('Requested arguments:')
+    lines.push(summarizeToolArgs(toolArgs))
+  }
+  lines.push('Next step:')
+  lines.push('- Use `/confirm [note]` to continue.')
+  lines.push('- Use `/confirm remember` to allow a matching action for this session.')
+  lines.push('- Use `/deny [reason]` to cancel.')
+  return {
+    title: 'Pending Confirmation',
+    body: lines.join('\n'),
+    pending: {
+      active: true,
+      title: 'Approval required',
+      interaction_type: interactionType,
+      tool_name: toolName || null,
+      reason: reason || null,
+      remember_supported: true,
+    },
+  }
+}
+
 function maybeAppendSummaryCards(state: AppState): AppState {
   const metrics = state.transcript.lastRoundMetrics
   let nextState = appendCard(
@@ -627,18 +778,31 @@ export function consumeBridgeEvent(state: AppState, event: S4BridgeEvent): AppSt
       roundBody: 'Paused.',
       roundStatus: 'waiting',
     })
+    const formatted = formatInterruptionBody(event)
     return appendCard(
-      pausedState,
+      {
+        ...pausedState,
+        permissions: {
+          ...pausedState.permissions,
+          pending: formatted.pending,
+        },
+      },
       'warning',
-      'Pending Interaction',
-      String(event.content || ''),
+      formatted.title,
+      formatted.body,
       'waiting',
     )
   }
 
   if (eventType === 'interaction_resolved') {
     return appendCard(
-      state,
+      {
+        ...state,
+        permissions: {
+          ...state.permissions,
+          pending: { active: false },
+        },
+      },
       'system',
       'Interaction Resolved',
       String(event.content || ''),

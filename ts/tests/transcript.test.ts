@@ -60,8 +60,46 @@ describe('transcript state', () => {
     expect(state.transcript.committedCards.map(card => [card.kind, card.title, card.status])).toEqual([
       ['round', 'Cycle 1', 'waiting'],
       ['tool', 'Tool · Bash', 'done'],
-      ['warning', 'Pending Interaction', 'waiting'],
+      ['warning', 'Pending Confirmation', 'waiting'],
     ])
+  })
+
+  test('ask user question interruption renders the question card immediately', () => {
+    let state = getDefaultAppState()
+
+    state = consumeBridgeEvent(state, { type: 'round_start', round: 1 })
+    state = consumeBridgeEvent(state, {
+      type: 'interruption',
+      content: '需要用户回答 1 个结构化问题后才能继续执行。',
+      payload: {
+        message: '需要用户回答 1 个结构化问题后才能继续执行。',
+        metadata: {
+          interaction_type: 'ask_user_question',
+          source: 'AskUserQuestion',
+          questions: [
+            {
+              header: 'Language',
+              question: 'Choose one',
+              options: [
+                { label: 'Python', description: 'Use Python tooling' },
+                { label: 'Go', description: 'Use Go tooling' },
+              ],
+            },
+          ],
+        },
+      },
+    })
+
+    const warning = state.transcript.committedCards.find(card => card.kind === 'warning')
+    expect(warning?.title).toBe('Ask User Question')
+    expect(warning?.status).toBe('waiting')
+    expect(warning?.body).toContain('Questions:')
+    expect(warning?.body).toContain('1. Language')
+    expect(warning?.body).toContain('Choose one')
+    expect(warning?.body).toContain('Python: Use Python tooling')
+    expect(warning?.body).toContain('Use `/answer <text>` to continue.')
+    expect(state.permissions.pending?.active).toBe(true)
+    expect(state.permissions.pending?.title).toBe('Answer needed')
   })
 
   test('new rounds commit previous live transcript instead of dropping it', () => {

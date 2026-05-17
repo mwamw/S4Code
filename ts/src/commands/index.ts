@@ -408,24 +408,47 @@ export function parseCommand(commands: Command[], text: string): CommandInvocati
   }
 }
 
+function commandRoot(command: Command): string {
+  return command.name.trim().split(/\s+/)[0] || command.name
+}
+
+function isNestedCommand(command: Command): boolean {
+  return command.name.trim().includes(' ')
+}
+
+function startsCommandText(command: Command, raw: string): boolean {
+  const names = [command.name, ...(command.aliases || [])]
+  const primary = [...names, ...(command.keywords || [])].map(item => item.toLowerCase())
+  if (primary.some(item => item.startsWith(raw) || item.split(/\s+/).some(part => part.startsWith(raw)))) {
+    return true
+  }
+  if (raw.length < 2) {
+    return false
+  }
+  return [
+    command.description,
+    command.category || '',
+  ].map(item => item.toLowerCase()).some(item => item.includes(raw))
+}
+
 export function matchCommands(commands: Command[], text: string, recent: string[], state?: AppState): Command[] {
-  const raw = text.trim().replace(/^\//, '').toLowerCase()
-  const filtered = raw
-    ? commands.filter(command => {
-        const names = [command.name, ...(command.aliases || [])]
-        const primary = [...names, ...(command.keywords || [])].map(item => item.toLowerCase())
-        if (primary.some(item => item.startsWith(raw) || item.split(/\s+/).some(part => part.startsWith(raw)))) {
-          return true
-        }
-        if (raw.length < 2) {
-          return false
-        }
-        return [
-          command.description,
-          command.category || '',
-        ].map(item => item.toLowerCase()).some(item => item.includes(raw))
-      })
-    : commands
+  const withoutSlash = text.replace(/^\s*\//, '')
+  const raw = withoutSlash.trim().toLowerCase()
+  const rootToken = raw.split(/\s+/)[0] || ''
+  const hasTrailingSpace = /\S\s+$/.test(withoutSlash)
+  const rootExists = commands.some(command => command.name === rootToken && !isNestedCommand(command))
+  const secondLevelMode = Boolean(rootToken && rootExists && (hasTrailingSpace || raw.includes(' ')))
+  const filtered = (() => {
+    if (secondLevelMode) {
+      const prefix = `${rootToken} `
+      return commands.filter(command => command.name.startsWith(prefix) && command.name.toLowerCase().startsWith(raw))
+    }
+    const topLevel = commands.filter(command => !isNestedCommand(command))
+    if (!raw) {
+      return topLevel
+    }
+    return topLevel.filter(command => startsCommandText(command, raw))
+  })()
 
   return [...filtered].sort((left, right) => {
     const pendingActive = Boolean(state?.permissions.pending?.active)
@@ -461,8 +484,67 @@ export function matchCommands(commands: Command[], text: string, recent: string[
     if (priority !== 0) {
       return priority
     }
+    const leftRoot = commandRoot(left)
+    const rightRoot = commandRoot(right)
+    if (leftRoot !== rightRoot) {
+      return leftRoot.localeCompare(rightRoot)
+    }
     return left.name.localeCompare(right.name)
   })
+}
+
+export function hasNestedCommands(commands: Command[], commandName: string): boolean {
+  const normalized = commandName.trim().toLowerCase()
+  if (!normalized || normalized.includes(' ')) {
+    return false
+  }
+  return commands.some(command => command.name.toLowerCase().startsWith(`${normalized} `))
+}
+
+export function resolvePaletteSelection(
+  commands: Command[],
+  input: string,
+  selectedCommand: Command | undefined,
+): { action: 'insert' | 'submit'; text: string } | null {
+  if (!selectedCommand) {
+    return null
+  }
+  const commandBody = input.trim().replace(/^\//, '')
+  const selectedName = selectedCommand.name
+  const selectedNameLower = selectedName.toLowerCase()
+  const commandPrefix = commandBody.toLowerCase()
+
+  if (hasNestedCommands(commands, selectedName)) {
+    return {
+      action: 'insert',
+      text: `/${selectedName} `,
+    }
+  }
+
+  if (selectedCommand.argumentHint?.startsWith('<') && selectedNameLower === commandPrefix) {
+    return {
+      action: 'insert',
+      text: `/${selectedName} `,
+    }
+  }
+
+  if (selectedName !== commandBody && selectedNameLower.startsWith(commandPrefix)) {
+    if (selectedCommand.argumentHint?.startsWith('<')) {
+      return {
+        action: 'insert',
+        text: `/${selectedName} `,
+      }
+    }
+    return {
+      action: 'submit',
+      text: `/${selectedName}`,
+    }
+  }
+
+  return {
+    action: 'submit',
+    text: input,
+  }
 }
 
 export async function runCommand(invocation: CommandInvocation, engine: QueryEngine): Promise<void | 'quit'> {
