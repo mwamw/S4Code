@@ -1,0 +1,43 @@
+{
+  "name": "ember",
+  "layout": {
+    "background": "transparent",
+    "text": "#ffedd5",
+    "muted": "#fdba74",
+    "header_text": "#fff7ed",
+    "footer_text": "#fb923c",
+    "transcript_border": "#f97316",
+    "sidebar_border": "#9a3412",
+    "sidebar_text": "#fed7aa",
+    "palette_border": "#ea580c",
+    "input_border": "#fb923c",
+    "input_text": "#fff7ed",
+    "separator": "#7c2d12",
+    "checkpoint": "bold #facc15"
+  },
+  "cards": {
+    "system": {"border": "#fb923c", "title": "#ffedd5", "text": "#fed7aa"},
+    "user": {"border": "#facc15", "title": "#fef3c7", "text": "#fde68a"},
+    "assistant": {"border": "#f97316", "title": "#fff7ed", "text": "#ffedd5"},
+    "thinking": {"border": "#ef4444", "title": "#fee2e2", "text": "#fecaca"},
+    "tool": {"border": "#fdba74", "title": "#ffedd5", "text": "#fed7aa"},
+    "warning": {"border": "#fbbf24", "title": "#fef9c3", "text": "#fde68a"},
+    "error": {"border": "#f87171", "title": "#fee2e2", "text": "#fecaca"}
+  },
+  "palette": {
+    "selected_prefix": "bold #431407 on #fdba74",
+    "selected_label": "bold #431407 on #fdba74",
+    "selected_spacer": "on #fdba74",
+    "selected_description": "#7c2d12 on #fed7aa",
+    "selected_alias": "#9a3412 on #ffedd5",
+    "border": "#fb923c"
+  },
+  "diff": {
+    "add_prefix": "bold #bbf7d0 on #14532d",
+    "add_background": "#14532d",
+    "delete_prefix": "bold #fecaca on #7f1d1d",
+    "delete_background": "#7f1d1d",
+    "hunk_border": "#9a3412",
+    "file_label": "bold #fdba74"
+  }
+}

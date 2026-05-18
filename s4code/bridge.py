@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 import traceback
 from typing import Any, Optional
 
@@ -114,6 +115,7 @@ class BridgeSession:
             "provider": getattr(self.engine.agent.llm, "provider_name", "-"),
             "permission_mode": self._permission_mode(self.engine),
             "welcome": self.engine.get_welcome_notice(),
+            "history_cards": self.engine.get_transcript_history_cards(),
             "startup_notices": self.engine.get_startup_notices(),
             "sidebar": self.engine.get_sidebar_payload(force=True),
             "context": self.engine.get_context_panel_payload(),
@@ -235,6 +237,7 @@ class BridgeSession:
             return {"handled": False}
         payload: dict[str, Any] = {
             "handled": True,
+            "command_name": invocation.name if invocation is not None else None,
             "message": result.message,
             "should_query": result.should_query,
             "query": result.query,
@@ -372,7 +375,11 @@ class BridgeServer:
         session_id: Optional[str] = None,
         transient_session: bool = False,
         ignore_session_model_overrides: bool = False,
+        background_streams: bool = True,
     ) -> None:
+        self.background_streams = background_streams
+        self.active_streams: dict[str, asyncio.Task[None]] = {}
+        self.closed = False
         self.session = BridgeSession(
             cwd=cwd,
             session_id=session_id,
@@ -383,11 +390,21 @@ class BridgeServer:
     def emit(self, request_id: str, payload: dict[str, Any]) -> None:
         _emit_response(request_id, payload)
 
+    async def shutdown(self) -> None:
+        self.closed = True
+        for task in list(self.active_streams.values()):
+            if not task.done():
+                task.cancel()
+        if self.active_streams:
+            await asyncio.gather(*self.active_streams.values(), return_exceptions=True)
+        self.active_streams.clear()
+        self.session.close()
+
     async def _handle_stream_prompt(self, request_id: str, params: dict[str, Any]) -> None:
         prompt = params.get("prompt")
         if not isinstance(prompt, str):
             raise ValueError("submit_prompt requires prompt")
-        max_iter = int(params.get("max_iter") or 20)
+        max_iter = int(params.get("max_iter") or 50)
         async for event in self.session.engine.stream_prompt(prompt, max_iter=max_iter):
             self.emit(
                 request_id,
@@ -408,10 +425,80 @@ class BridgeServer:
             },
         )
 
+    async def _run_stream_task(self, request_id: str, handler, params: dict[str, Any]) -> None:
+        try:
+            await handler(request_id, params)
+        except asyncio.CancelledError:
+            self.emit(
+                request_id,
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "cancelled",
+                        "content": "Agent execution interrupted by Esc.",
+                    },
+                },
+            )
+            self.emit(
+                request_id,
+                {
+                    "type": "response",
+                    "ok": True,
+                    "result": {
+                        "done": False,
+                        "interrupted": True,
+                        "sidebar": self.session.engine.get_sidebar_payload(force=True),
+                    },
+                },
+            )
+        except Exception as exc:
+            self.emit(
+                request_id,
+                {
+                    "type": "response",
+                    "ok": False,
+                    "error": _error_payload(exc),
+                },
+            )
+        finally:
+            self.active_streams.pop(request_id, None)
+
+    def _start_stream_task(self, request_id: str, handler, params: dict[str, Any]) -> None:
+        if request_id in self.active_streams:
+            raise ValueError(f"Duplicate active stream request: {request_id}")
+        self.active_streams[request_id] = asyncio.create_task(
+            self._run_stream_task(request_id, handler, params)
+        )
+
+    async def interrupt(self, reason: str = "") -> dict[str, Any]:
+        active_tasks = [
+            task for task in self.active_streams.values()
+            if not task.done()
+        ]
+        if not active_tasks:
+            return {
+                "interrupted": False,
+                "active_streams": 0,
+                "sidebar": self.session.engine.get_sidebar_payload(force=True),
+            }
+        message = str(reason or "").strip() or "User interrupted the agent from the S4Code TS TUI."
+        try:
+            self.session.engine.request_stop(message)
+        except Exception:
+            pass
+        for task in active_tasks:
+            task.cancel()
+        await asyncio.gather(*active_tasks, return_exceptions=True)
+        return {
+            "interrupted": True,
+            "active_streams": len(active_tasks),
+            "sidebar": self.session.engine.get_sidebar_payload(force=True),
+        }
+
     async def _handle_resolve_pending(self, request_id: str, params: dict[str, Any]) -> None:
         action = str(params.get("action") or "").strip()
         answer = str(params.get("answer") or "")
-        max_iter = int(params.get("max_iter") or 20)
+        max_iter = int(params.get("max_iter") or 50)
         async for event in self.session.engine.stream_resolve_pending_interaction(
             action=action,
             answer=answer,
@@ -446,10 +533,16 @@ class BridgeServer:
             raise ValueError("params must be an object")
 
         if method == "submit_prompt":
-            await self._handle_stream_prompt(request_id, params)
+            if self.background_streams:
+                self._start_stream_task(request_id, self._handle_stream_prompt, params)
+            else:
+                await self._handle_stream_prompt(request_id, params)
             return
         if method == "resolve_pending":
-            await self._handle_resolve_pending(request_id, params)
+            if self.background_streams:
+                self._start_stream_task(request_id, self._handle_resolve_pending, params)
+            else:
+                await self._handle_resolve_pending(request_id, params)
             return
 
         if method == "init":
@@ -477,8 +570,10 @@ class BridgeServer:
                 "notices": self.session.engine.poll_runtime_notices(),
                 "sidebar": self.session.engine.get_sidebar_payload(force=True),
             }
+        elif method == "interrupt":
+            result = await self.interrupt(str(params.get("reason") or ""))
         elif method == "shutdown":
-            self.session.close()
+            await self.shutdown()
             result = {"closed": True}
         else:
             raise ValueError(f"Unknown method: {method}")
@@ -499,17 +594,18 @@ def run_server(
     session_id: Optional[str],
     transient_session: bool = False,
     ignore_session_model_overrides: bool = False,
+    request_file: str | Path | None = None,
 ) -> int:
     server: BridgeServer | None = None
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
+    async def _serve() -> int:
+        nonlocal server
         try:
             server = BridgeServer(
                 cwd=cwd,
                 session_id=session_id,
                 transient_session=transient_session,
                 ignore_session_model_overrides=ignore_session_model_overrides,
+                background_streams=True,
             )
         except Exception as exc:
             _emit_response(
@@ -521,36 +617,109 @@ def run_server(
                 },
             )
             return 1
-        while True:
-            line = sys.stdin.readline()
-            if not line:
-                break
-            raw = str(line).strip()
-            if not raw:
-                continue
-            request_id = ""
+        input_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def _enqueue(line: str | None) -> None:
+            loop.call_soon_threadsafe(input_queue.put_nowait, line)
+
+        def _read_stdin() -> None:
             try:
-                request = json.loads(raw)
-                if not isinstance(request, dict):
-                    raise ValueError("request must be an object")
-                request_id = str(request.get("request_id") or "").strip()
-                loop.run_until_complete(server.dispatch(request))
-            except Exception as exc:
-                _emit_response(
-                    request_id or "unknown",
-                    {
-                        "type": "response",
-                        "ok": False,
-                        "error": _error_payload(exc),
-                    },
-                )
-    finally:
-        if server is not None:
-            server.session.close()
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        asyncio.set_event_loop(None)
-        loop.close()
-    return 0
+                for line in sys.stdin:
+                    _enqueue(line)
+            finally:
+                _enqueue(None)
+
+        loop = asyncio.get_running_loop()
+        request_path = Path(request_file).expanduser().resolve() if request_file else None
+        file_position = 0
+        if not request_path:
+            threading.Thread(target=_read_stdin, daemon=True).start()
+
+        try:
+            while True:
+                if request_path:
+                    lines: list[str] = []
+                    try:
+                        if request_path.exists():
+                            with request_path.open("r", encoding="utf-8") as handle:
+                                handle.seek(file_position)
+                                lines = list(handle)
+                                file_position = handle.tell()
+                    except Exception as exc:
+                        lines = [
+                            json.dumps({
+                                "request_id": "unknown",
+                                "method": "__reader_error__",
+                                "params": {"error": f"{type(exc).__name__}: {exc}"},
+                            }) + "\n"
+                        ]
+                    if not lines:
+                        await asyncio.sleep(0.02)
+                        continue
+                    line = lines.pop(0)
+                    for pending_line in lines:
+                        input_queue.put_nowait(pending_line)
+                else:
+                    line = await input_queue.get()
+                if line is None:
+                    break
+                raw = str(line).strip()
+                if not raw:
+                    continue
+                request_id = ""
+                try:
+                    request = json.loads(raw)
+                    if not isinstance(request, dict):
+                        raise ValueError("request must be an object")
+                    request_id = str(request.get("request_id") or "").strip()
+                    if str(request.get("method") or "") == "__reader_error__":
+                        raise RuntimeError(str((request.get("params") or {}).get("error") or "request reader failed"))
+                    await server.dispatch(request)
+                    if server.closed:
+                        break
+                except Exception as exc:
+                    _emit_response(
+                        request_id or "unknown",
+                        {
+                            "type": "response",
+                            "ok": False,
+                            "error": _error_payload(exc),
+                        },
+                    )
+                while request_path and not input_queue.empty() and not server.closed:
+                    line = input_queue.get_nowait()
+                    if line is None:
+                        break
+                    raw = str(line).strip()
+                    if not raw:
+                        continue
+                    request_id = ""
+                    try:
+                        request = json.loads(raw)
+                        if not isinstance(request, dict):
+                            raise ValueError("request must be an object")
+                        request_id = str(request.get("request_id") or "").strip()
+                        if str(request.get("method") or "") == "__reader_error__":
+                            raise RuntimeError(str((request.get("params") or {}).get("error") or "request reader failed"))
+                        await server.dispatch(request)
+                        if server.closed:
+                            break
+                    except Exception as exc:
+                        _emit_response(
+                            request_id or "unknown",
+                            {
+                                "type": "response",
+                                "ok": False,
+                                "error": _error_payload(exc),
+                            },
+                        )
+                if server.closed:
+                    break
+            return 0
+        finally:
+            await server.shutdown()
+
+    return asyncio.run(_serve())
 
 
 def run_single_request(
@@ -573,6 +742,7 @@ def run_single_request(
             session_id=session_id,
             transient_session=transient_session,
             ignore_session_model_overrides=ignore_session_model_overrides,
+            background_streams=False,
         )
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -605,6 +775,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--transient-session", action="store_true", help="Do not persist a new one-shot session")
     parser.add_argument("--ignore-session-model-overrides", action="store_true", help="Use current config model instead of the saved session model")
     parser.add_argument("--request-json", default=None, help="Optional one-shot request payload")
+    parser.add_argument("--request-file", default=None, help="Optional NDJSON request file for persistent bridge mode")
     args = parser.parse_args(argv)
     transient_session = bool(args.transient_session or os.environ.get("S4CODE_TRANSIENT_SESSION") == "1")
     if args.request_json:
@@ -620,6 +791,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         session_id=args.session_id,
         transient_session=transient_session,
         ignore_session_model_overrides=bool(args.ignore_session_model_overrides),
+        request_file=args.request_file,
     )
 
 

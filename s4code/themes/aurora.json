@@ -1,0 +1,43 @@
+{
+  "name": "aurora",
+  "layout": {
+    "background": "transparent",
+    "text": "#e0f2fe",
+    "muted": "#93c5fd",
+    "header_text": "#f0f9ff",
+    "footer_text": "#a5b4fc",
+    "transcript_border": "#38bdf8",
+    "sidebar_border": "#6366f1",
+    "sidebar_text": "#c7d2fe",
+    "palette_border": "#22d3ee",
+    "input_border": "#67e8f9",
+    "input_text": "#f0f9ff",
+    "separator": "#312e81",
+    "checkpoint": "bold #fde68a"
+  },
+  "cards": {
+    "system": {"border": "#818cf8", "title": "#e0e7ff", "text": "#c7d2fe"},
+    "user": {"border": "#2dd4bf", "title": "#ccfbf1", "text": "#99f6e4"},
+    "assistant": {"border": "#38bdf8", "title": "#e0f2fe", "text": "#bae6fd"},
+    "thinking": {"border": "#c084fc", "title": "#f3e8ff", "text": "#e9d5ff"},
+    "tool": {"border": "#60a5fa", "title": "#dbeafe", "text": "#bfdbfe"},
+    "warning": {"border": "#facc15", "title": "#fef9c3", "text": "#fde68a"},
+    "error": {"border": "#fb7185", "title": "#ffe4e6", "text": "#fecdd3"}
+  },
+  "palette": {
+    "selected_prefix": "bold #082f49 on #67e8f9",
+    "selected_label": "bold #082f49 on #67e8f9",
+    "selected_spacer": "on #67e8f9",
+    "selected_description": "#1e1b4b on #bfdbfe",
+    "selected_alias": "#312e81 on #ddd6fe",
+    "border": "#67e8f9"
+  },
+  "diff": {
+    "add_prefix": "bold #99f6e4 on #134e4a",
+    "add_background": "#134e4a",
+    "delete_prefix": "bold #fecdd3 on #881337",
+    "delete_background": "#881337",
+    "hunk_border": "#312e81",
+    "file_label": "bold #bae6fd"
+  }
+}

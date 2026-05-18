@@ -100,7 +100,7 @@ class _LifecycleAgent(_DummyAgent):
         self.history: list[object] = []
         self.agent_runtime = None
 
-    def invoke(self, prompt: str, *, max_iter: int = 20) -> str:
+    def invoke(self, prompt: str, *, max_iter: int = 50) -> str:
         self.invocations.append(prompt)
         self.history.append({"role": "user", "content": prompt})
         self.history.append({"role": "assistant", "content": "invoked"})
@@ -1270,7 +1270,7 @@ def test_query_engine_mcp_startup_notice_and_sidebar_summary(
 
 
 class _StreamingLifecycleAgent(_LifecycleAgent):
-    async def astream_invoke_with_tool(self, prompt: str, *, max_iter: int = 20, **kwargs):
+    async def astream_invoke_with_tool(self, prompt: str, *, max_iter: int = 50, **kwargs):
         self.history.append({"role": "user", "content": prompt})
         yield {"type": "round_start", "round": 1}
         yield {

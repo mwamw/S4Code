@@ -1498,7 +1498,7 @@ class S4QueryEngine:
             )
         return "Compaction not needed."
 
-    def run_prompt(self, prompt: str, *, max_iter: int = 20) -> str:
+    def run_prompt(self, prompt: str, *, max_iter: int = 50) -> str:
         self._maybe_update_title(prompt)
         self.create_checkpoint("before prompt", reason="before_prompt")
         selected_turn_skills = self._consume_pending_turn_skills()
@@ -1515,7 +1515,7 @@ class S4QueryEngine:
         finally:
             self._cleanup_turn_skills(activated_skills)
 
-    async def stream_prompt(self, prompt: str, *, max_iter: int = 20) -> AsyncGenerator[dict[str, Any], None]:
+    async def stream_prompt(self, prompt: str, *, max_iter: int = 50) -> AsyncGenerator[dict[str, Any], None]:
         self._maybe_update_title(prompt)
         queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
         sentinel = object()
@@ -2801,7 +2801,7 @@ class S4QueryEngine:
         *,
         action: str,
         answer: str = "",
-        max_iter: int = 20,
+        max_iter: int = 50,
     ) -> AsyncGenerator[dict[str, Any], None]:
         payload = self.get_pending_interaction()
         if payload is None:

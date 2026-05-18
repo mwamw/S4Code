@@ -1,0 +1,43 @@
+{
+  "name": "forest",
+  "layout": {
+    "background": "transparent",
+    "text": "#dcfce7",
+    "muted": "#86efac",
+    "header_text": "#f0fdf4",
+    "footer_text": "#86efac",
+    "transcript_border": "#22c55e",
+    "sidebar_border": "#166534",
+    "sidebar_text": "#bbf7d0",
+    "palette_border": "#16a34a",
+    "input_border": "#4ade80",
+    "input_text": "#f0fdf4",
+    "separator": "#14532d",
+    "checkpoint": "bold #bef264"
+  },
+  "cards": {
+    "system": {"border": "#84cc16", "title": "#ecfccb", "text": "#d9f99d"},
+    "user": {"border": "#22c55e", "title": "#dcfce7", "text": "#bbf7d0"},
+    "assistant": {"border": "#4ade80", "title": "#f0fdf4", "text": "#dcfce7"},
+    "thinking": {"border": "#14b8a6", "title": "#ccfbf1", "text": "#99f6e4"},
+    "tool": {"border": "#a3e635", "title": "#ecfccb", "text": "#d9f99d"},
+    "warning": {"border": "#facc15", "title": "#fef9c3", "text": "#fde68a"},
+    "error": {"border": "#f87171", "title": "#fee2e2", "text": "#fecaca"}
+  },
+  "palette": {
+    "selected_prefix": "bold #052e16 on #86efac",
+    "selected_label": "bold #052e16 on #86efac",
+    "selected_spacer": "on #86efac",
+    "selected_description": "#14532d on #bbf7d0",
+    "selected_alias": "#166534 on #dcfce7",
+    "border": "#4ade80"
+  },
+  "diff": {
+    "add_prefix": "bold #bbf7d0 on #052e16",
+    "add_background": "#052e16",
+    "delete_prefix": "bold #fecaca on #3f1111",
+    "delete_background": "#3f1111",
+    "hunk_border": "#166534",
+    "file_label": "bold #bbf7d0"
+  }
+}
