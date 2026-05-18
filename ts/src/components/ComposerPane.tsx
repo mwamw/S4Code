@@ -34,11 +34,8 @@ export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }
   }
 
   useInput((_value, key) => {
-    if (key.return && /^\/(?:quit|exit|q)(?:\s|$)/i.test(input.trim())) {
-      updateInput('')
-      void props.engine.quit().finally(() => {
-        props.onExit?.()
-      })
+    if (key.escape && busy) {
+      void props.engine.interrupt()
       return
     }
     if (!paletteVisible) {
@@ -108,14 +105,6 @@ export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }
         }}
         onSubmit={value => {
           if (busy) {
-            return
-          }
-          const rawValue = value.trim()
-          if (/^\/(?:quit|exit|q)(?:\s|$)/i.test(rawValue)) {
-            updateInput('')
-            void props.engine.quit().finally(() => {
-              props.onExit?.()
-            })
             return
           }
           const selectedEntry = paletteVisible ? visibleEntries[boundedSelection] : undefined

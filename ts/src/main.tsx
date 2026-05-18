@@ -9,6 +9,7 @@ function parseArgs(argv: string[]) {
   let cwd = process.cwd()
   let sessionId: string | null = null
   let prompt: string | null = null
+  const positionals: string[] = []
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]
@@ -25,6 +26,23 @@ function parseArgs(argv: string[]) {
     if ((token === '--prompt' || token === '-p') && argv[index + 1]) {
       prompt = argv[index + 1]
       index += 1
+      continue
+    }
+    positionals.push(token)
+  }
+
+  if (!prompt && positionals.length > 0) {
+    const [command, subcommand, ...rest] = positionals
+    if (command === 'review') {
+      prompt = `/review ${[subcommand, ...rest].filter(Boolean).join(' ')}`.trim()
+    } else if (command === 'commit') {
+      prompt = '/commit'
+    } else if (command === 'config') {
+      prompt = '/config'
+    } else if (command === 'doctor') {
+      prompt = '/doctor'
+    } else if (command === 'session' && subcommand === 'list') {
+      prompt = '/session list'
     }
   }
 

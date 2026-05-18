@@ -50,6 +50,13 @@ export type InitPayload = {
     title?: string
     body?: string
   }
+  history_cards?: Array<{
+    kind?: string
+    title?: string
+    body?: string
+    status?: string
+    metadata?: Record<string, unknown>
+  }>
   startup_notices: Array<{
     kind?: string
     title?: string
@@ -139,6 +146,7 @@ export type CommandPalettePayload = {
 
 export type ExecuteCommandPayload = {
   handled: boolean
+  command_name?: string | null
   message?: string | null
   should_query?: boolean
   query?: string | null

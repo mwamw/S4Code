@@ -1,27 +1,25 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { BridgeEnvelope, BridgeRequest } from '../types/bridge'
-
-type ActiveChild = {
-  child: ChildProcessWithoutNullStreams
-  requestId: string
-  sawResponse: boolean
-  stdoutBuffer: string
-  stderrChunks: string[]
-}
 
 export class BridgeProcess {
   private readonly cwd: string
+  private readonly repoRoot: string
   private readonly python: string
   private sessionId: string | null
   private listeners = new Set<(payload: BridgeEnvelope) => void>()
   private errorListeners = new Set<(error: Error) => void>()
-  private activeChildren = new Map<string, ActiveChild>()
   private closed = false
   private readonly bridgeEnv: NodeJS.ProcessEnv
   private readonly transientSession: boolean
   private ignoreSessionModelOverrides: boolean
+  private child: ChildProcessWithoutNullStreams | null = null
+  private stdoutBuffer = ''
+  private stderrChunks: string[] = []
+  private requestFile: string | null = null
 
   constructor(
     cwd: string,
@@ -29,20 +27,22 @@ export class BridgeProcess {
     options: { transientSession?: boolean; ignoreSessionModelOverrides?: boolean } = {},
   ) {
     this.cwd = cwd
+    this.repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
     this.sessionId = sessionId || null
     this.transientSession = Boolean(options.transientSession)
     this.ignoreSessionModelOverrides = Boolean(options.ignoreSessionModelOverrides)
-    this.python = process.env.S4CODE_PYTHON || this.findProjectPython() || 'python'
+    this.python = process.env.S4CODE_PYTHON || this.findS4Python() || 'python'
     this.bridgeEnv = {
       ...process.env,
+      PYTHONPATH: [this.repoRoot, process.env.PYTHONPATH].filter(Boolean).join(':'),
       S4CODE_TRANSIENT_SESSION: this.transientSession ? '1' : process.env.S4CODE_TRANSIENT_SESSION,
     }
   }
 
-  private findProjectPython(): string | null {
+  private findS4Python(): string | null {
     const candidates = [
-      join(this.cwd, '.venv', 'bin', 'python'),
-      join(this.cwd, 'venv', 'bin', 'python'),
+      join(this.repoRoot, '.venv', 'bin', 'python'),
+      join(this.repoRoot, 'venv', 'bin', 'python'),
     ]
     return candidates.find(candidate => existsSync(candidate)) || null
   }
@@ -63,16 +63,13 @@ export class BridgeProcess {
     }
   }
 
-  private handleStdoutLine(active: ActiveChild, rawLine: string): void {
+  private handleStdoutLine(rawLine: string): void {
     const raw = rawLine.trim()
     if (!raw) {
       return
     }
     try {
       const payload = JSON.parse(raw) as BridgeEnvelope
-      if (payload.type === 'response') {
-        active.sawResponse = true
-      }
       for (const listener of this.listeners) {
         listener(payload)
       }
@@ -82,19 +79,22 @@ export class BridgeProcess {
     }
   }
 
-  private flushStdout(active: ActiveChild): void {
+  private flushStdout(): void {
     while (true) {
-      const newlineIndex = active.stdoutBuffer.indexOf('\n')
+      const newlineIndex = this.stdoutBuffer.indexOf('\n')
       if (newlineIndex < 0) {
         return
       }
-      const line = active.stdoutBuffer.slice(0, newlineIndex)
-      active.stdoutBuffer = active.stdoutBuffer.slice(newlineIndex + 1)
-      this.handleStdoutLine(active, line)
+      const line = this.stdoutBuffer.slice(0, newlineIndex)
+      this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1)
+      this.handleStdoutLine(line)
     }
   }
 
-  send(request: BridgeRequest): void {
+  private ensureChild(): ChildProcessWithoutNullStreams {
+    if (this.child && !this.child.killed) {
+      return this.child
+    }
     if (this.closed) {
       throw new Error('Bridge process is closed')
     }
@@ -108,10 +108,9 @@ export class BridgeProcess {
     if (this.ignoreSessionModelOverrides) {
       args.push('--ignore-session-model-overrides')
     }
-    args.push('--request-json', JSON.stringify(request))
-    if (request.method === 'init') {
-      this.ignoreSessionModelOverrides = false
-    }
+    this.requestFile = join(mkdtempSync(join(tmpdir(), 's4code-bridge-')), 'requests.ndjson')
+    writeFileSync(this.requestFile, '')
+    args.push('--request-file', this.requestFile)
 
     const child = spawn(this.python, args, {
       cwd: this.cwd,
@@ -120,50 +119,59 @@ export class BridgeProcess {
     })
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
-
-    const active: ActiveChild = {
-      child,
-      requestId: request.request_id,
-      sawResponse: false,
-      stdoutBuffer: '',
-      stderrChunks: [],
-    }
-    this.activeChildren.set(request.request_id, active)
+    this.stdoutBuffer = ''
+    this.stderrChunks = []
+    this.child = child
 
     child.stdout.on('data', chunk => {
-      active.stdoutBuffer += String(chunk || '')
-      this.flushStdout(active)
+      this.stdoutBuffer += String(chunk || '')
+      this.flushStdout()
     })
     child.stderr.on('data', chunk => {
       const text = String(chunk || '')
       if (!text) {
         return
       }
-      active.stderrChunks.push(text)
-      if (active.stderrChunks.length > 20) {
-        active.stderrChunks.shift()
+      this.stderrChunks.push(text)
+      if (this.stderrChunks.length > 20) {
+        this.stderrChunks.shift()
       }
     })
     child.on('error', error => {
-      this.activeChildren.delete(active.requestId)
+      this.child = null
       this.emitError(error)
     })
     child.on('exit', (code, signal) => {
-      this.activeChildren.delete(active.requestId)
-      if (active.stdoutBuffer.trim()) {
-        this.handleStdoutLine(active, active.stdoutBuffer)
-        active.stdoutBuffer = ''
+      if (this.stdoutBuffer.trim()) {
+        this.handleStdoutLine(this.stdoutBuffer)
+        this.stdoutBuffer = ''
       }
+      this.child = null
       if (this.closed) {
         return
       }
-      if (code === 0 && active.sawResponse) {
+      if (code === 0) {
         return
       }
-      const stderr = active.stderrChunks.join('').trim()
+      const stderr = this.stderrChunks.join('').trim()
       const detail = stderr ? ` stderr: ${stderr}` : ''
-      this.emitError(new Error(`Bridge request failed before a complete response (code=${String(code)}, signal=${String(signal)})${detail}`))
+      this.emitError(new Error(`Bridge process exited (code=${String(code)}, signal=${String(signal)})${detail}`))
     })
+    return child
+  }
+
+  send(request: BridgeRequest): void {
+    if (this.closed) {
+      throw new Error('Bridge process is closed')
+    }
+    this.ensureChild()
+    if (!this.requestFile) {
+      throw new Error('Bridge request file is unavailable')
+    }
+    appendFileSync(this.requestFile, `${JSON.stringify(request)}\n`)
+    if (request.method === 'init') {
+      this.ignoreSessionModelOverrides = false
+    }
   }
 
   subscribe(listener: (payload: BridgeEnvelope) => void): () => void {
@@ -178,9 +186,17 @@ export class BridgeProcess {
 
   close(): void {
     this.closed = true
-    for (const active of this.activeChildren.values()) {
-      active.child.kill()
+    if (this.child && !this.child.killed) {
+      this.child.kill()
     }
-    this.activeChildren.clear()
+    this.child = null
+    if (this.requestFile) {
+      try {
+        rmSync(dirname(this.requestFile), { recursive: true, force: true })
+      } catch {
+        // Best-effort temp cleanup.
+      }
+      this.requestFile = null
+    }
   }
 }

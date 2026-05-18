@@ -21,6 +21,24 @@ function viewCommand(
   }
 }
 
+function slashCommand(
+  name: string,
+  description: string,
+  argumentHint?: string,
+  extra: Partial<LocalCommand> = {},
+): LocalCommand {
+  return {
+    type: 'local',
+    name,
+    description,
+    argumentHint,
+    ...extra,
+    run: async (args, engine) => {
+      return engine.executeSlashCommand(`/${name}${args.trim() ? ` ${args.trim()}` : ''}`)
+    },
+  }
+}
+
 export function getCommands(): Command[] {
   return [
     {
@@ -36,10 +54,20 @@ export function getCommands(): Command[] {
     },
     {
       type: 'local',
+      name: 'exit',
+      description: 'Exit S4Code.',
+      category: 'core',
+      aliases: ['quit', 'q'],
+      priority: 99,
+      immediate: true,
+      run: async () => 'quit',
+    },
+    {
+      type: 'local',
       name: 'quit',
       description: 'Exit S4Code.',
       category: 'core',
-      aliases: ['exit', 'q'],
+      aliases: ['q'],
       priority: 99,
       immediate: true,
       run: async () => 'quit',
@@ -49,6 +77,14 @@ export function getCommands(): Command[] {
     viewCommand('cost', 'Show usage, cost, and cache information.', 'cost', undefined, { category: 'runtime', priority: 50 }),
     viewCommand('trace', 'Show recent turn summaries.', 'trace', undefined, { category: 'debug', priority: 20 }),
     viewCommand('tools', 'Show available tools and their availability.', 'tools', undefined, { category: 'runtime', priority: 70 }),
+    slashCommand('config', 'Show the resolved S4Code config.', undefined, { category: 'runtime', priority: 45 }),
+    slashCommand('theme', 'List or switch the active theme.', '[list|theme-name]', { category: 'runtime', priority: 45 }),
+    slashCommand('themes', 'List or switch the active theme.', '[list|theme-name]', { category: 'runtime', aliases: ['theme'], priority: 45 }),
+    slashCommand('plan', 'Enter or exit plan mode.', '[on|off]', { category: 'approval', priority: 61 }),
+    slashCommand('copy', 'Copy transcript or latest card.', '[transcript|last]', { category: 'runtime', priority: 30 }),
+    slashCommand('sidebar', 'Show or hide the sidebar.', '[show|hide]', { category: 'runtime', priority: 30 }),
+    slashCommand('files', 'List project files.', '[path]', { category: 'workspace', priority: 60 }),
+    slashCommand('hooks', 'List installed hooks and guardrails.', undefined, { category: 'debug', priority: 15 }),
     viewCommand('skills', 'Show active and queued skills.', 'skills', undefined, { category: 'runtime', priority: 75 }),
     {
       type: 'local',
@@ -189,6 +225,8 @@ export function getCommands(): Command[] {
     viewCommand('session checkpoints', 'List restorable checkpoints.', 'session_checkpoints', undefined, { category: 'session', priority: 71 }),
     viewCommand('session timeline', 'Show checkpoint and trace timeline.', 'session_timeline', undefined, { category: 'session', priority: 71 }),
     viewCommand('session tree', 'Show session fork and restore tree.', 'session_tree', undefined, { category: 'session', priority: 71 }),
+    slashCommand('resume', 'Resume a saved session or list sessions.', '[session-id]', { category: 'session', priority: 70 }),
+    viewCommand('timeline', 'Show checkpoint and trace timeline.', 'session_timeline', undefined, { category: 'session', priority: 71 }),
     {
       type: 'local',
       name: 'checkpoint',
@@ -392,6 +430,19 @@ export function getCommands(): Command[] {
         const { prompt } = await engine.bridge.buildPrompt('review', {
           target: args.trim() || undefined,
         })
+        return prompt
+      },
+    },
+    {
+      type: 'prompt',
+      name: 'commit',
+      description: 'Draft a commit proposal from the current diff.',
+      kind: 'workflow',
+      category: 'workspace',
+      priority: 79,
+      progressMessage: 'Drafting commit proposal',
+      getPrompt: async (_args, engine) => {
+        const { prompt } = await engine.bridge.buildPrompt('commit')
         return prompt
       },
     },

@@ -239,6 +239,10 @@ export class BridgeClient {
     return this.stream('resolve_pending', { action, answer }, onEvent)
   }
 
+  interrupt(reason = 'User pressed Esc in the S4Code TS TUI.'): Promise<{ interrupted: boolean; active_streams: number; sidebar: SidebarPayload }> {
+    return this.request('interrupt', { reason }, 0)
+  }
+
   getSidebar(force = false): Promise<SidebarPayload> {
     return this.request('get_sidebar_payload', { force })
   }
@@ -255,14 +259,18 @@ export class BridgeClient {
     return this.request('poll_runtime_notices', {}, 3000)
   }
 
-  close(): Promise<{ closed: boolean }> {
+  async close(): Promise<{ closed: boolean }> {
     if (this.closed) {
-      return Promise.resolve({ closed: true })
+      return { closed: true }
     }
-    this.closed = true
-    this.resolvePendingAsClosed()
-    this.process.close()
-    return Promise.resolve({ closed: true })
+    try {
+      await this.request('shutdown', {}, 50).catch(() => ({ closed: true }))
+    } finally {
+      this.closed = true
+      this.resolvePendingAsClosed()
+      this.process.close()
+    }
+    return { closed: true }
   }
 
   terminate(): void {

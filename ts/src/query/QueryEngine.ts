@@ -1,6 +1,6 @@
-import type { AppState } from '../state/AppStateStore'
+import type { AppState, TranscriptCardKind } from '../state/AppStateStore'
 import { appendCard, appendSeparator, appendStreamDelta, consumeBridgeEvent } from '../state/transcript'
-import { getCommands, matchCommands, parseCommand, runCommand } from '../commands'
+import { getCommands, matchCommands } from '../commands'
 import type { BridgeClient } from '../runtime/bridgeClient'
 import { isBridgeClosedError } from '../runtime/bridgeClient'
 import type { Command } from '../types/command'
@@ -171,39 +171,11 @@ export class QueryEngine {
   }
 
   private shouldUseBackendPalette(input: string): boolean {
-    const body = String(input || '').trim().replace(/^\//, '').toLowerCase()
-    if (!body) {
-      return false
-    }
-    const root = body.split(/\s+/, 1)[0]
-    if (body === 'model') {
-      return true
-    }
-    if (['checkpoint', 'checkpoints', 'rewind'].includes(body)) {
-      return true
-    }
-    return new Set([
-      'agent',
-      'checkpoint',
-      'copy',
-      'mcp',
-      'model',
-      'permissions',
-      'plan',
-      'resume',
-      'rewind',
-      'session',
-      'skills',
-      'task',
-      'theme',
-      'worktree',
-    ]).has(root) && body.includes(' ')
+    return String(input || '').trim().startsWith('/')
   }
 
   private backendPaletteDelay(input: string): number {
-    const body = String(input || '').trim().replace(/^\//, '').toLowerCase()
-    const root = body.split(/\s+/, 1)[0]
-    return root === 'model' ? 0 : this.paletteDebounceMs
+    return String(input || '').trim() === '/' ? 0 : this.paletteDebounceMs
   }
 
   refreshPalette(input: string): void {
@@ -311,22 +283,13 @@ export class QueryEngine {
 
   async executeSlashCommand(text: string): Promise<void | 'quit'> {
     const raw = text.trim()
-    if (/^\/(?:quit|exit|q)(?:\s|$)/i.test(raw)) {
-      return this.quit()
-    }
-    const localInvocation = parseCommand(this.commands, raw)
-    if (localInvocation?.command.name === 'quit') {
-      this.recordCommandUsage(localInvocation.command.name)
-      return runCommand(localInvocation, this)
-    }
-
     const result = await this.bridge.executeCommand(raw)
     if (!result.handled) {
       await this.submitPrompt(raw)
       return
     }
 
-    const commandName = raw.slice(1).split(/\s+/, 1)[0]
+    const commandName = String(result.command_name || raw.slice(1).split(/\s+/, 1)[0])
     this.recordCommandUsage(commandName)
 
     const metadata = result.metadata || {}
@@ -634,6 +597,36 @@ export class QueryEngine {
     }
   }
 
+  async interrupt(reason = 'User pressed Esc in the S4Code TS TUI.'): Promise<void> {
+    try {
+      const result = await this.bridge.interrupt(reason)
+      this.setAppState(prev => {
+        const withNotice = result.interrupted
+          ? consumeBridgeEvent(prev, { type: 'cancelled', content: 'Agent execution interrupted by Esc.' })
+          : prev
+        const withSidebar = result.sidebar ? this.applySidebarPayload(withNotice, result.sidebar) : withNotice
+        return {
+          ...withSidebar,
+          runtime: {
+            ...withSidebar.runtime,
+            busy: false,
+            streaming: false,
+          },
+        }
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.setAppState(prev => ({
+        ...appendCard(prev, 'error', 'Interrupt Failed', message, 'done'),
+        runtime: {
+          ...prev.runtime,
+          busy: false,
+          streaming: false,
+        },
+      }))
+    }
+  }
+
   async submitPrompt(prompt: string): Promise<void> {
     this.setAppState(prev => ({
       ...appendCard(prev, 'user', 'You', prompt, 'done'),
@@ -789,6 +782,7 @@ export class QueryEngine {
     pending: AppState['permissions']['pending']
     welcome: { kind?: string; title?: string; body?: string }
     startup_notices: Array<{ kind?: string; title?: string; body?: string }>
+    history_cards?: Array<{ kind?: string; title?: string; body?: string; status?: string; metadata?: Record<string, unknown> }>
   }): AppState {
     let state: AppState = {
       ...this.getAppState(),
@@ -844,10 +838,46 @@ export class QueryEngine {
       },
     }
     state = appendCard(state, 'system', init.welcome.title || 'Welcome', init.welcome.body || '', 'done')
+    const historyCards = init.history_cards || []
+    if (historyCards.length > 0) {
+      state = appendCard(
+        state,
+        'system',
+        'Restored Transcript',
+        `Loaded ${historyCards.length} history message(s) from session ${init.session_id}.`,
+        'done',
+      )
+      for (const card of historyCards) {
+        const kind = this.normalizeTranscriptKind(card.kind)
+        state = appendCard(
+          state,
+          kind,
+          card.title || 'History',
+          card.body || '',
+          card.status,
+          card.metadata,
+        )
+      }
+    }
     for (const notice of init.startup_notices) {
       state = appendCard(state, 'system', notice.title || 'Notice', notice.body || '', 'done')
     }
+    if (init.pending?.active) {
+      state = consumeBridgeEvent(state, {
+        type: 'interruption',
+        content: init.pending.reason || 'A pending interaction was restored with this session.',
+        payload: init.pending,
+      })
+    }
     return state
+  }
+
+  private normalizeTranscriptKind(kind: unknown): TranscriptCardKind {
+    const normalized = String(kind || 'system')
+    if (['system', 'user', 'assistant', 'thinking', 'tool', 'round', 'separator', 'warning', 'error'].includes(normalized)) {
+      return normalized as TranscriptCardKind
+    }
+    return 'system'
   }
 
   async close(): Promise<void> {
