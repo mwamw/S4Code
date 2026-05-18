@@ -21,6 +21,10 @@ function sidebarSnapshot(state: AppState): string {
   })
 }
 
+function isQuitInput(value: string): boolean {
+  return ['/exit', '/quit', '/q'].includes(value.trim().toLowerCase())
+}
+
 export type QueryEngineConfig = {
   bridge: BridgeClient
   getAppState: () => AppState
@@ -123,6 +127,9 @@ export class QueryEngine {
     const raw = text.trim()
     if (!raw) {
       return
+    }
+    if (isQuitInput(raw)) {
+      return this.quit()
     }
     try {
       if (raw.startsWith('/')) {
@@ -309,7 +316,12 @@ export class QueryEngine {
     }
 
     if (result.init) {
-      this.setAppState(() => this.buildStateFromInit(result.init!))
+      this.setAppState(() => {
+        const hydrated = this.buildStateFromInit(result.init!)
+        return result.message
+          ? appendCard(hydrated, 'system', 'System', String(result.message), 'done')
+          : hydrated
+      })
     } else {
       const sidebar = result.sidebar
       if (result.message || sidebar) {

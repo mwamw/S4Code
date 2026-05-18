@@ -530,6 +530,13 @@ function cardsEqual(left: TranscriptCard, right: TranscriptCard): boolean {
     && left.metadata === right.metadata
 }
 
+function statusLabel(status: string | undefined): string {
+  if (!status || status === 'done') {
+    return ''
+  }
+  return ` [${status.toUpperCase()}]`
+}
+
 export const Card = React.memo(function Card(props: { card: TranscriptCard; separatorWidth: number }) {
   const { card, separatorWidth } = props
   if (card.kind === 'separator') {
@@ -544,7 +551,7 @@ export const Card = React.memo(function Card(props: { card: TranscriptCard; sepa
     <Box flexDirection="column" marginBottom={1}>
       <Text color={cardColor(card.kind)}>
         {card.title}
-        {card.status ? ` [${card.status.toUpperCase()}]` : ''}
+        {statusLabel(card.status)}
       </Text>
       {renderBody(card)}
       {typeof card.metadata?.footer_left === 'string' && card.metadata.footer_left.trim() ? (

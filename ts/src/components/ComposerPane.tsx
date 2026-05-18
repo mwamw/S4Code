@@ -5,6 +5,10 @@ import { PromptInput } from './PromptInput'
 import { useAppState, useSetAppState } from '../state/AppState'
 import type { QueryEngine } from '../query/QueryEngine'
 
+function isQuitInput(value: string): boolean {
+  return ['/exit', '/quit', '/q'].includes(value.trim().toLowerCase())
+}
+
 export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }) {
   const busy = useAppState(state => state.runtime.busy)
   const input = useAppState(state => state.ui.input)
@@ -104,6 +108,13 @@ export function ComposerPane(props: { engine: QueryEngine; onExit?: () => void }
           updateInput(value)
         }}
         onSubmit={value => {
+          if (isQuitInput(value)) {
+            updateInput('')
+            void props.engine.quit().then(() => {
+              props.onExit?.()
+            })
+            return
+          }
           if (busy) {
             return
           }

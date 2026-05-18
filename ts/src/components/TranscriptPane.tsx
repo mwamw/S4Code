@@ -1,6 +1,7 @@
 import React from 'react'
 import { Box, Text } from 'ink'
 import { useAppState } from '../state/AppState'
+import { getVisibleTranscriptCards } from '../state/transcript'
 import { TranscriptView } from './TranscriptView'
 import type { TranscriptCard } from '../state/AppStateStore'
 
@@ -26,26 +27,12 @@ function equalCards(left: TranscriptCard[], right: TranscriptCard[]): boolean {
 }
 
 export function TranscriptPane() {
-  const committedCards = useAppState(state => {
-    return state.transcript.committedCards || state.transcript.cards || []
-  }, equalCards)
-
-  const liveCards = useAppState(state => {
-    return [
-      state.transcript.liveRoundCard,
-      state.transcript.liveThinkingCard,
-      state.transcript.liveAssistantCard,
-      ...Object.values(state.transcript.liveToolCards || {}),
-    ].filter((card): card is TranscriptCard => Boolean(card))
-  }, equalCards)
+  const cards = useAppState(state => getVisibleTranscriptCards(state.transcript), equalCards)
 
   return (
     <Box flexDirection="column" flexGrow={1} marginRight={1}>
-      <TranscriptView cards={committedCards} />
-      {committedCards.length === 0 && <Text bold color="cyan">S4Code</Text>}
-      <Box flexDirection="column">
-        <TranscriptView cards={liveCards} />
-      </Box>
+      <TranscriptView cards={cards} />
+      {cards.length === 0 && <Text bold color="cyan">S4Code</Text>}
     </Box>
   )
 }
