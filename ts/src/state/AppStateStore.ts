@@ -7,6 +7,7 @@ export type TranscriptCardKind =
   | 'thinking'
   | 'tool'
   | 'round'
+  | 'runtime'
   | 'separator'
   | 'warning'
   | 'error'

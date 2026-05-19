@@ -75,6 +75,60 @@ function updateCommittedCard(
   return withCommittedCards(state, cards)
 }
 
+function updateTranscriptCard(
+  state: AppState,
+  cardId: string | undefined,
+  updater: (card: TranscriptCard) => TranscriptCard,
+): AppState {
+  if (!cardId) {
+    return state
+  }
+  let changed = false
+  const committedCards = (state.transcript.committedCards || state.transcript.cards || []).map(card => {
+    if (card.id !== cardId) {
+      return card
+    }
+    changed = true
+    return updater(card)
+  })
+  const updateLiveCard = (card: TranscriptCard | undefined): TranscriptCard | undefined => {
+    if (!card || card.id !== cardId) {
+      return card
+    }
+    changed = true
+    return updater(card)
+  }
+  const liveToolCards: Record<string, TranscriptCard> = {}
+  let toolCardsChanged = false
+  for (const [toolId, card] of Object.entries(state.transcript.liveToolCards || {})) {
+    if (card.id === cardId) {
+      changed = true
+      toolCardsChanged = true
+      liveToolCards[toolId] = updater(card)
+    } else {
+      liveToolCards[toolId] = card
+    }
+  }
+  const liveRoundCard = updateLiveCard(state.transcript.liveRoundCard)
+  const liveThinkingCard = updateLiveCard(state.transcript.liveThinkingCard)
+  const liveAssistantCard = updateLiveCard(state.transcript.liveAssistantCard)
+  if (!changed) {
+    return state
+  }
+  return {
+    ...state,
+    transcript: {
+      ...state.transcript,
+      committedCards,
+      cards: committedCards,
+      liveRoundCard,
+      liveThinkingCard,
+      liveAssistantCard,
+      liveToolCards: toolCardsChanged ? liveToolCards : state.transcript.liveToolCards,
+    },
+  }
+}
+
 function summarizeScalar(value: unknown, maxChars = 180): string {
   if (value === null || value === undefined) {
     return ''
@@ -93,6 +147,174 @@ function summarizeScalar(value: unknown, maxChars = 180): string {
 
 function nextSyntheticToolId(prefix: 'tool-call' | 'tool-result'): string {
   return `${prefix}-${nextCardId + 1}`
+}
+
+function nowSeconds(): number {
+  return Date.now() / 1000
+}
+
+function numberValue(value: unknown, fallback = 0): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function formatDuration(seconds: number): string {
+  const safeSeconds = Math.max(Number(seconds) || 0, 0)
+  if (safeSeconds < 60) {
+    return `${safeSeconds.toFixed(1)}s`
+  }
+  const minutes = Math.floor(safeSeconds / 60)
+  const remainder = safeSeconds % 60
+  if (minutes < 60) {
+    return `${minutes}m ${remainder.toFixed(1).padStart(4, '0')}s`
+  }
+  const hours = Math.floor(minutes / 60)
+  const minuteRemainder = minutes % 60
+  return `${hours}h ${String(minuteRemainder).padStart(2, '0')}m ${remainder.toFixed(1).padStart(4, '0')}s`
+}
+
+function formatMetricInt(value: unknown): string {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? Math.trunc(parsed).toLocaleString('en-US') : '?'
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map(item => String(item).trim()).filter(Boolean)
+    : []
+}
+
+function mergeMetrics(current: Record<string, unknown> | undefined, incoming: Record<string, unknown> | undefined): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...(current || {}) }
+  for (const [key, value] of Object.entries(incoming || {})) {
+    if (value === null || value === undefined) {
+      continue
+    }
+    if (key === 'files_changed' || key === 'tools_used') {
+      merged[key] = Array.from(new Set([...stringList(merged[key]), ...stringList(value)])).sort()
+      continue
+    }
+    merged[key] = value
+  }
+  return merged
+}
+
+function metricsFromRoundCard(card: TranscriptCard | undefined): Record<string, unknown> {
+  const metrics = card?.metadata?.metrics
+  return metrics && typeof metrics === 'object' && !Array.isArray(metrics)
+    ? metrics as Record<string, unknown>
+    : {}
+}
+
+function formatRoundMetricsLine(metrics: Record<string, unknown>, outcome: string): string {
+  const items: string[] = []
+  const toolCalls = Math.trunc(numberValue(metrics.tool_calls))
+  const runningTools = Math.trunc(numberValue(metrics.running_tools))
+  const toolErrors = Math.trunc(numberValue(metrics.tool_errors))
+  if (toolCalls > 0) {
+    items.push(outcome === 'running' && runningTools > 0 ? `Tools ${toolCalls} (${runningTools} running)` : `Tools ${toolCalls}`)
+  }
+  const modelSeconds = numberValue(metrics.llm_duration_ms) / 1000
+  if (modelSeconds > 0) {
+    items.push(`Model ${formatDuration(modelSeconds)}`)
+  }
+  const toolSeconds = Math.max(numberValue(metrics.tool_duration_ms) / 1000, numberValue(metrics.local_tool_seconds))
+  if (toolSeconds > 0) {
+    items.push(`Tool ${formatDuration(toolSeconds)}`)
+  }
+  const filesChanged = stringList(metrics.files_changed)
+  if (filesChanged.length > 0) {
+    items.push(`Files ${filesChanged.length}`)
+  }
+  if (toolErrors > 0) {
+    items.push(`Errors ${toolErrors}`)
+  }
+  if (outcome === 'pending') {
+    items.push('Waiting')
+  } else if (outcome === 'error') {
+    items.push('Errored')
+  } else if (outcome === 'interrupted') {
+    items.push('Interrupted')
+  }
+  return items.join(' | ')
+}
+
+function formatRoundDetails(metrics: Record<string, unknown>): string[] {
+  const lines: string[] = []
+  const toolsUsed = stringList(metrics.tools_used)
+  if (toolsUsed.length > 0) {
+    lines.push(`Used: ${toolsUsed.slice(0, 6).join(', ')}`)
+  }
+  const filesChanged = stringList(metrics.files_changed)
+  if (filesChanged.length > 0) {
+    lines.push(`Changed: ${filesChanged.slice(0, 5).join(', ')}`)
+  }
+  return lines
+}
+
+function formatActiveRoundBody(startedAt: number, metrics: Record<string, unknown>, now = nowSeconds()): string {
+  const lines = [`Elapsed: ${formatDuration(now - startedAt)}`]
+  const metricsLine = formatRoundMetricsLine(metrics, 'running')
+  if (metricsLine) {
+    lines.push(metricsLine)
+  }
+  lines.push(...formatRoundDetails(metrics))
+  return lines.join('\n')
+}
+
+function formatCompletedRoundBody(
+  startedAt: number,
+  finishedAt: number,
+  metrics: Record<string, unknown>,
+  outcome = 'completed',
+): string {
+  const label = {
+    completed: 'Completed in',
+    pending: 'Paused after',
+    error: 'Errored after',
+    interrupted: 'Interrupted in',
+  }[outcome] || 'Completed in'
+  const lines = [`${label} ${formatDuration(finishedAt - startedAt)}`]
+  const metricsLine = formatRoundMetricsLine(metrics, outcome)
+  if (metricsLine) {
+    lines.push(metricsLine)
+  }
+  lines.push(...formatRoundDetails(metrics))
+  return lines.join('\n')
+}
+
+function formatMessageMetricsFooter(metrics: Record<string, unknown>): string {
+  const items: string[] = []
+  if (metrics.context_used_tokens !== undefined || metrics.context_max_tokens !== undefined) {
+    items.push(`Ctx ${metrics.context_used_tokens !== undefined ? formatMetricInt(metrics.context_used_tokens) : '?'}/${metrics.context_max_tokens !== undefined ? formatMetricInt(metrics.context_max_tokens) : '?'}`)
+  }
+  const inputTokens = Math.trunc(numberValue(metrics.input_tokens))
+  const outputTokens = Math.trunc(numberValue(metrics.output_tokens))
+  const totalTokens = Math.trunc(numberValue(metrics.total_tokens))
+  if (inputTokens > 0) {
+    items.push(`In ${formatMetricInt(inputTokens)}`)
+  }
+  if (outputTokens > 0) {
+    items.push(`Out ${formatMetricInt(outputTokens)}`)
+  }
+  if (totalTokens > 0) {
+    items.push(`Total ${formatMetricInt(totalTokens)}`)
+  }
+  const promptTotal = Math.trunc(numberValue(metrics.prompt_tokens_total))
+  const cacheTokens = Math.max(
+    Math.trunc(numberValue(metrics.prompt_tokens_cached)),
+    Math.trunc(numberValue(metrics.cached_input_tokens)),
+  )
+  if (cacheTokens > 0) {
+    items.push(promptTotal > 0 ? `Cache ${formatMetricInt(cacheTokens)}/${formatMetricInt(promptTotal)}` : `Cache ${formatMetricInt(cacheTokens)}`)
+  }
+  if (metrics.estimated_cost_usd !== undefined && metrics.estimated_cost_usd !== null) {
+    const cost = Number(metrics.estimated_cost_usd)
+    if (Number.isFinite(cost)) {
+      items.push(`Cost $${cost.toFixed(4)}`)
+    }
+  }
+  return items.join('  ·  ')
 }
 
 function summarizeToolArgs(toolArgs: unknown): string {
@@ -409,6 +631,125 @@ function formatInterruptionBody(event: S4BridgeEvent): { title: string; body: st
   }
 }
 
+function formatRuntimeSnapshot(snapshot: unknown): string {
+  if (!snapshot || typeof snapshot !== 'object') {
+    return 'Runtime snapshot unavailable.'
+  }
+  const payload = snapshot as Record<string, unknown>
+  const session = asRecord(payload.session)
+  const worktree = asRecord(payload.worktree)
+  const activeWorktree = asRecord(worktree.active)
+  const agents = Array.isArray(payload.agents) ? payload.agents : []
+  const tasks = Array.isArray(payload.tasks) ? payload.tasks : []
+  const backgroundTasks = Array.isArray(payload.background_tasks) ? payload.background_tasks : []
+  const context = asRecord(payload.context)
+  const lines = [
+    `Updated: ${payload.generated_at || '-'}`,
+    `Session: ${session.session_id || '-'} | checkpoints=${session.checkpoints || 0}`,
+    '',
+    'Worktree:',
+  ]
+  lines.push(
+    Object.keys(activeWorktree).length > 0
+      ? `- ${activeWorktree.branch || '-'} @ ${activeWorktree.path || '-'}`
+      : '- none',
+  )
+  lines.push('', 'Agents:')
+  if (agents.length > 0) {
+    for (const item of agents.slice(0, 6)) {
+      const agent = asRecord(item)
+      lines.push(`- ${agent.agent_id || '-'} | ${agent.status || '-'} | ${agent.name || '-'}`)
+    }
+  } else {
+    lines.push('- none')
+  }
+  lines.push('', 'Tasks:')
+  if (tasks.length > 0 || backgroundTasks.length > 0) {
+    for (const item of tasks.slice(0, 6)) {
+      const task = asRecord(item)
+      lines.push(`- ${task.task_id || '-'} | ${task.status || '-'} | ${task.title || '-'}`)
+    }
+    for (const item of backgroundTasks.slice(0, 6)) {
+      const task = asRecord(item)
+      const command = summarizeScalar(String(task.command || '').replace(/\n/g, ' '), 100) || String(task.cwd || '-')
+      const duration = Number(task.duration_seconds)
+      const durationText = Number.isFinite(duration) ? ` | ${duration.toFixed(1)}s` : ''
+      lines.push(`- ${task.task_id || '-'} | ${task.status || '-'} | rc=${task.return_code}${durationText} | ${command}`)
+      const stdoutTail = String(task.stdout_tail || '').trim()
+      const stderrTail = String(task.stderr_tail || '').trim()
+      if (stdoutTail) {
+        lines.push(`  stdout: ${summarizeScalar(stdoutTail, 160)}`)
+      }
+      if (stderrTail) {
+        lines.push(`  stderr: ${summarizeScalar(stderrTail, 160)}`)
+      }
+    }
+  } else {
+    lines.push('- none')
+  }
+  if (Object.keys(context).length > 0) {
+    lines.push(
+      '',
+      `Context: ${context.usage_percent || '-'} (${context.used_tokens ?? '?'} / ${context.max_tokens ?? '?'} used, ${context.remaining_tokens ?? '?'} remaining)`,
+    )
+  }
+  return lines.join('\n')
+}
+
+function checkpointAnnotation(checkpoint: Record<string, unknown>): Record<string, unknown> {
+  return {
+    checkpoint_id: String(checkpoint.checkpoint_id || '').trim(),
+    label: String(checkpoint.label || '').trim(),
+    reason: String(checkpoint.reason || '').trim(),
+    history_messages: checkpoint.history_messages || 0,
+    created_at: String(checkpoint.created_at || '').trim(),
+  }
+}
+
+function canAnnotateCheckpoint(card: TranscriptCard): boolean {
+  return !['separator', 'round', 'runtime'].includes(card.kind)
+}
+
+function findCheckpointTarget(cards: TranscriptCard[], checkpoint: Record<string, unknown>): TranscriptCard | undefined {
+  const reason = String(checkpoint.reason || '')
+  let preferredKinds: string[]
+  if (reason === 'before_prompt') {
+    preferredKinds = ['user']
+  } else if (reason === 'interruption') {
+    preferredKinds = ['warning', 'assistant', 'user']
+  } else if (reason === 'after_prompt') {
+    preferredKinds = ['assistant', 'warning', 'error', 'user']
+  } else {
+    preferredKinds = ['assistant', 'warning', 'system', 'user', 'error', 'tool']
+  }
+  for (const card of [...cards].reverse()) {
+    if (preferredKinds.includes(card.kind) && canAnnotateCheckpoint(card)) {
+      return card
+    }
+  }
+  return [...cards].reverse().find(canAnnotateCheckpoint)
+}
+
+function addCheckpointToCard(card: TranscriptCard, checkpoint: Record<string, unknown>): TranscriptCard {
+  const current = Array.isArray(card.metadata?.checkpoints) ? card.metadata?.checkpoints : []
+  const checkpointId = String(checkpoint.checkpoint_id || '')
+  if (checkpointId && current.some(item => asRecord(item).checkpoint_id === checkpointId)) {
+    return card
+  }
+  return {
+    ...card,
+    metadata: {
+      ...(card.metadata || {}),
+      checkpoints: [...current, { ...checkpoint }],
+    },
+  }
+}
+
+function applyCheckpoint(state: AppState, checkpoint: Record<string, unknown>): AppState {
+  const target = findCheckpointTarget(getVisibleTranscriptCards(state.transcript), checkpoint)
+  return target ? updateTranscriptCard(state, target.id, card => addCheckpointToCard(card, checkpoint)) : state
+}
+
 function maybeAppendSummaryCards(state: AppState): AppState {
   const metrics = state.transcript.lastRoundMetrics
   let nextState = appendCard(
@@ -479,17 +820,18 @@ export function appendStreamDelta(
   if (!thinking && !assistant) {
     return state
   }
+  const roundMetadata = state.runtime.currentRound ? { round: state.runtime.currentRound } : undefined
 
   const liveThinkingCard = thinking
     ? {
-        ...(state.transcript.liveThinkingCard || newCard('thinking', 'Model Thinking', '', 'streaming')),
+        ...(state.transcript.liveThinkingCard || newCard('thinking', 'Model Thinking', '', 'streaming', roundMetadata)),
         body: `${state.transcript.liveThinkingCard?.body || ''}${thinking}`,
         status: 'streaming',
       }
     : state.transcript.liveThinkingCard
   const liveAssistantCard = assistant
     ? {
-        ...(state.transcript.liveAssistantCard || newCard('assistant', 'Model Response', '', 'streaming')),
+        ...(state.transcript.liveAssistantCard || newCard('assistant', 'Model Response', '', 'streaming', roundMetadata)),
         body: `${state.transcript.liveAssistantCard?.body || ''}${assistant}`,
         status: 'streaming',
       }
@@ -525,14 +867,31 @@ function liveCardsForCommit(
     finalContent?: string
     roundBody?: string
     roundStatus?: string
+    roundOutcome?: string
   } = {},
 ): TranscriptCard[] {
   const result: TranscriptCard[] = []
+  const roundMetrics = mergeMetrics(metricsFromRoundCard(state.transcript.liveRoundCard), state.transcript.lastRoundMetrics)
+  const assistantFooter = formatMessageMetricsFooter(roundMetrics)
   if (state.transcript.liveRoundCard) {
+    const startedAt = numberValue(state.transcript.liveRoundCard.metadata?.started_at)
+    const finishedAt = nowSeconds()
+    const outcome = options.roundOutcome || (options.roundStatus === 'waiting' ? 'pending' : 'completed')
+    const roundBody = options.roundBody
+      || (startedAt > 0 ? formatCompletedRoundBody(startedAt, finishedAt, roundMetrics, outcome) : 'Completed.')
     result.push({
       ...state.transcript.liveRoundCard,
-      body: options.roundBody || 'Completed.',
+      body: roundBody,
       status: options.roundStatus || 'done',
+      metadata: {
+        ...(state.transcript.liveRoundCard.metadata || {}),
+        metrics: roundMetrics,
+        ...(startedAt > 0 ? {
+          finished_at: finishedAt,
+          duration_seconds: Math.max(finishedAt - startedAt, 0),
+        } : {}),
+        outcome,
+      },
     })
   }
   if (state.transcript.liveThinkingCard) {
@@ -546,9 +905,16 @@ function liveCardsForCommit(
       ...state.transcript.liveAssistantCard,
       body: options.finalContent || state.transcript.liveAssistantCard.body,
       status: 'done',
+      metadata: {
+        ...(state.transcript.liveAssistantCard.metadata || {}),
+        ...(assistantFooter ? { footer_left: assistantFooter } : {}),
+      },
     })
   } else if (options.finalContent?.trim()) {
-    result.push(newCard('assistant', 'Model Response', options.finalContent, 'done'))
+    result.push(newCard('assistant', 'Model Response', options.finalContent, 'done', {
+      ...(state.runtime.currentRound ? { round: state.runtime.currentRound } : {}),
+      ...(assistantFooter ? { footer_left: assistantFooter } : {}),
+    }))
   }
   for (const toolCard of Object.values(state.transcript.liveToolCards || {})) {
     result.push({
@@ -565,6 +931,7 @@ function commitLiveTranscript(
     finalContent?: string
     roundBody?: string
     roundStatus?: string
+    roundOutcome?: string
   } = {},
 ): AppState {
   if (!hasLiveTranscript(state)) {
@@ -600,12 +967,128 @@ function clearLiveTranscript(state: AppState): AppState {
   }
 }
 
+function roundNumberForState(state: AppState): number {
+  return Number(state.runtime.currentRound || state.transcript.liveRoundCard?.metadata?.round || 0) || 0
+}
+
+function findRoundCard(state: AppState, round: number): TranscriptCard | undefined {
+  return [...getVisibleTranscriptCards(state.transcript)]
+    .reverse()
+    .find(card => card.kind === 'round' && Number(card.metadata?.round || 0) === round)
+}
+
+function applyAssistantFooter(state: AppState, round: number, metrics: Record<string, unknown>): AppState {
+  const footer = formatMessageMetricsFooter(metrics)
+  if (!footer) {
+    return state
+  }
+  let nextState = state
+  for (const card of getVisibleTranscriptCards(nextState.transcript)) {
+    if (card.kind !== 'assistant' || Number(card.metadata?.round || 0) !== round) {
+      continue
+    }
+    nextState = updateTranscriptCard(nextState, card.id, current => ({
+      ...current,
+      metadata: {
+        ...(current.metadata || {}),
+        footer_left: footer,
+      },
+    }))
+  }
+  return nextState
+}
+
+function applyRoundMetrics(
+  state: AppState,
+  round: number,
+  incomingMetrics: Record<string, unknown>,
+): AppState {
+  if (round <= 0) {
+    return {
+      ...state,
+      transcript: {
+        ...state.transcript,
+        lastRoundMetrics: mergeMetrics(state.transcript.lastRoundMetrics, incomingMetrics),
+      },
+    }
+  }
+  const roundCard = findRoundCard(state, round)
+  const mergedMetrics = mergeMetrics(metricsFromRoundCard(roundCard), incomingMetrics)
+  let nextState = roundCard
+    ? updateTranscriptCard(state, roundCard.id, card => {
+        const startedAt = numberValue(card.metadata?.started_at)
+        const finishedAt = numberValue(card.metadata?.finished_at, startedAt)
+        const outcome = String(card.metadata?.outcome || (card.status === 'running' ? 'running' : 'completed'))
+        const body = outcome === 'running' && startedAt > 0
+          ? formatActiveRoundBody(startedAt, mergedMetrics)
+          : startedAt > 0
+            ? formatCompletedRoundBody(startedAt, finishedAt || nowSeconds(), mergedMetrics, outcome)
+            : card.body
+        return {
+          ...card,
+          body,
+          metadata: {
+            ...(card.metadata || {}),
+            metrics: mergedMetrics,
+          },
+        }
+      })
+    : state
+  nextState = applyAssistantFooter(nextState, round, mergedMetrics)
+  return {
+    ...nextState,
+    transcript: {
+      ...nextState.transcript,
+      lastRoundMetrics: mergedMetrics,
+    },
+  }
+}
+
+function activeRoundMetrics(state: AppState): Record<string, unknown> {
+  return metricsFromRoundCard(findRoundCard(state, roundNumberForState(state)))
+}
+
+export function refreshActiveRoundElapsed(state: AppState, now = nowSeconds()): AppState {
+  const liveRoundCard = state.transcript.liveRoundCard
+  if (!liveRoundCard || liveRoundCard.kind !== 'round' || liveRoundCard.status !== 'running') {
+    return state
+  }
+  if (String(liveRoundCard.metadata?.outcome || 'running') !== 'running') {
+    return state
+  }
+  const startedAt = numberValue(liveRoundCard.metadata?.started_at)
+  if (startedAt <= 0) {
+    return state
+  }
+  const body = formatActiveRoundBody(startedAt, metricsFromRoundCard(liveRoundCard), now)
+  if (body === liveRoundCard.body) {
+    return state
+  }
+  return {
+    ...state,
+    transcript: {
+      ...state.transcript,
+      liveRoundCard: {
+        ...liveRoundCard,
+        body,
+      },
+    },
+  }
+}
+
 export function consumeBridgeEvent(state: AppState, event: S4BridgeEvent): AppState {
   const eventType = String(event.type || '')
 
   if (eventType === 'round_start') {
     const round = Number(event.round || 0) || 1
-    const card = newCard('round', `Cycle ${round}`, 'Running...', 'running', { round })
+    const startedAt = nowSeconds()
+    const metrics: Record<string, unknown> = {}
+    const card = newCard('round', `Cycle ${round}`, formatActiveRoundBody(startedAt, metrics), 'running', {
+      round,
+      started_at: startedAt,
+      metrics,
+      outcome: 'running',
+    })
     const baseState = commitLiveTranscript(state)
     return {
       ...baseState,
@@ -641,13 +1124,14 @@ export function consumeBridgeEvent(state: AppState, event: S4BridgeEvent): AppSt
     const toolName = String(event.tool_name || 'Tool')
     const toolId = String(event.tool_id || '').trim() || nextSyntheticToolId('tool-call')
     const body = summarizeToolArgs(event.tool_args)
+    const round = roundNumberForState(state)
     const card = newCard('tool', `Tool · ${toolName}`, body || 'Running...', 'running', {
       tool_name: toolName,
       tool_id: toolId,
       tool_args: (event.tool_args as Record<string, unknown> | undefined) || {},
-      round: state.runtime.currentRound || undefined,
+      round: round || undefined,
     })
-    return {
+    const nextState = {
       ...state,
       transcript: {
         ...state.transcript,
@@ -661,6 +1145,13 @@ export function consumeBridgeEvent(state: AppState, event: S4BridgeEvent): AppSt
         },
       },
     }
+    const metrics = activeRoundMetrics(state)
+    return applyRoundMetrics(nextState, round, {
+      ...metrics,
+      tool_calls: numberValue(metrics.tool_calls) + 1,
+      running_tools: numberValue(metrics.running_tools) + 1,
+      tools_used: Array.from(new Set([...stringList(metrics.tools_used), toolName])).sort(),
+    })
   }
 
   if (eventType === 'tool_result') {
@@ -742,23 +1233,66 @@ export function consumeBridgeEvent(state: AppState, event: S4BridgeEvent): AppSt
         },
       }
     }
+    const round = Number(currentToolCard?.metadata?.round || state.runtime.currentRound || 0) || 0
+    if (round > 0) {
+      const metrics = activeRoundMetrics(nextState)
+      const diffPayload = metadata.diff && typeof metadata.diff === 'object'
+        ? metadata.diff as Record<string, unknown>
+        : null
+      const changedFile = String(diffPayload?.relative_path || diffPayload?.file_path || '').trim()
+      return applyRoundMetrics(nextState, round, {
+        ...metrics,
+        running_tools: Math.max(numberValue(metrics.running_tools) - 1, 0),
+        tool_errors: status === 'error' ? numberValue(metrics.tool_errors) + 1 : numberValue(metrics.tool_errors),
+        tool_pending: status === 'pending' ? numberValue(metrics.tool_pending) + 1 : numberValue(metrics.tool_pending),
+        tools_used: Array.from(new Set([...stringList(metrics.tools_used), toolName])).sort(),
+        files_changed: changedFile
+          ? Array.from(new Set([...stringList(metrics.files_changed), changedFile])).sort()
+          : stringList(metrics.files_changed),
+      })
+    }
     return nextState
   }
 
   if (eventType === 'round_metrics') {
-    const metrics = (event.metrics as Record<string, unknown> | undefined)
-      ?? (event as Record<string, unknown>)
-    return {
-      ...state,
-      transcript: {
-        ...state.transcript,
-        lastRoundMetrics: metrics,
-      },
+    const payload = Object.keys(asRecord(event.metrics)).length > 0
+      ? asRecord(event.metrics)
+      : Object.fromEntries(Object.entries(event).filter(([key]) => !['type', 'round'].includes(key)))
+    const round = Number(event.round || state.runtime.currentRound || state.transcript.liveRoundCard?.metadata?.round || 0) || 0
+    return applyRoundMetrics(state, round, payload)
+  }
+
+  if (eventType === 'runtime_snapshot') {
+    const body = formatRuntimeSnapshot(event.snapshot)
+    const existing = (state.transcript.committedCards || state.transcript.cards || [])
+      .find(card => card.kind === 'runtime' && card.metadata?.runtime_snapshot)
+    if (existing) {
+      return updateCommittedCard(state, existing.id, card => ({
+        ...card,
+        body,
+        status: state.runtime.currentRound ? 'live' : undefined,
+      }))
     }
+    return appendCard(state, 'runtime', 'Runtime Snapshot', body, state.runtime.currentRound ? 'live' : undefined, {
+      runtime_snapshot: true,
+    })
+  }
+
+  if (eventType === 'checkpoint') {
+    return applyCheckpoint(state, checkpointAnnotation(asRecord(event.checkpoint)))
   }
 
   if (eventType === 'final') {
-    let nextState = commitLiveTranscript(state, { finalContent: String(event.content || '') })
+    const round = roundNumberForState(state)
+    const roundCard = findRoundCard(state, round)
+    const metrics = mergeMetrics(metricsFromRoundCard(roundCard), state.transcript.lastRoundMetrics)
+    const startedAt = numberValue(roundCard?.metadata?.started_at)
+    const finishedAt = nowSeconds()
+    let nextState = commitLiveTranscript(state, {
+      finalContent: String(event.content || ''),
+      roundBody: startedAt > 0 ? formatCompletedRoundBody(startedAt, finishedAt, metrics, 'completed') : undefined,
+      roundOutcome: 'completed',
+    })
     nextState = maybeAppendSummaryCards(nextState)
     return nextState
   }
@@ -777,6 +1311,7 @@ export function consumeBridgeEvent(state: AppState, event: S4BridgeEvent): AppSt
     const pausedState = commitLiveTranscript(state, {
       roundBody: 'Paused.',
       roundStatus: 'waiting',
+      roundOutcome: 'pending',
     })
     const formatted = formatInterruptionBody(event)
     return appendCard(
@@ -811,7 +1346,15 @@ export function consumeBridgeEvent(state: AppState, event: S4BridgeEvent): AppSt
   }
 
   if (eventType === 'error' || eventType === 'cancelled') {
-    const flushedState = commitLiveTranscript(state)
+    const outcome = eventType === 'cancelled' ? 'interrupted' : 'error'
+    const round = roundNumberForState(state)
+    const roundCard = findRoundCard(state, round)
+    const metrics = mergeMetrics(metricsFromRoundCard(roundCard), state.transcript.lastRoundMetrics)
+    const startedAt = numberValue(roundCard?.metadata?.started_at)
+    const flushedState = commitLiveTranscript(state, {
+      roundBody: startedAt > 0 ? formatCompletedRoundBody(startedAt, nowSeconds(), metrics, outcome) : undefined,
+      roundOutcome: outcome,
+    })
     return appendCard(
       flushedState,
       'error',

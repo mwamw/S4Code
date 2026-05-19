@@ -886,7 +886,7 @@ export class QueryEngine {
 
   private normalizeTranscriptKind(kind: unknown): TranscriptCardKind {
     const normalized = String(kind || 'system')
-    if (['system', 'user', 'assistant', 'thinking', 'tool', 'round', 'separator', 'warning', 'error'].includes(normalized)) {
+    if (['system', 'user', 'assistant', 'thinking', 'tool', 'round', 'runtime', 'separator', 'warning', 'error'].includes(normalized)) {
       return normalized as TranscriptCardKind
     }
     return 'system'

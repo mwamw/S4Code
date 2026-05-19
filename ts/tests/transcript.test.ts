@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { getDefaultAppState } from '../src/state/AppStateStore'
-import { appendStreamDelta, consumeBridgeEvent, getVisibleTranscriptCards } from '../src/state/transcript'
+import { appendStreamDelta, consumeBridgeEvent, getVisibleTranscriptCards, refreshActiveRoundElapsed } from '../src/state/transcript'
 
 describe('transcript state', () => {
   test('live assistant text commits once on final', () => {
@@ -208,5 +208,112 @@ describe('transcript state', () => {
     const resultCards = Object.values(state.transcript.liveToolCards)
     expect(resultCards).toHaveLength(3)
     expect(resultCards.some(card => card.title === 'Tool · Search')).toBe(true)
+  })
+
+  test('round metrics update round body and assistant footer', () => {
+    let state = getDefaultAppState()
+
+    state = consumeBridgeEvent(state, { type: 'round_start', round: 1 })
+    state = appendStreamDelta(state, { thinking: 'inspect', assistant: 'answer' })
+    state = consumeBridgeEvent(state, {
+      type: 'round_metrics',
+      round: 1,
+      metrics: {
+        tool_calls: 1,
+        tools_used: ['Bash'],
+        files_changed: ['src/app.ts'],
+        input_tokens: 210,
+        output_tokens: 111,
+        total_tokens: 321,
+        context_used_tokens: 500,
+        context_max_tokens: 1000,
+        estimated_cost_usd: 0.0123,
+      },
+    })
+
+    expect(state.transcript.liveThinkingCard?.metadata?.round).toBe(1)
+    expect(state.transcript.liveAssistantCard?.metadata?.round).toBe(1)
+    expect(state.transcript.liveRoundCard?.body).toContain('Tools 1')
+    expect(state.transcript.liveRoundCard?.body).toContain('Used: Bash')
+    expect(state.transcript.liveRoundCard?.body).toContain('Changed: src/app.ts')
+    expect(state.transcript.liveAssistantCard?.metadata?.footer_left).toContain('Ctx 500/1,000')
+    expect(state.transcript.liveAssistantCard?.metadata?.footer_left).toContain('In 210')
+    expect(state.transcript.liveAssistantCard?.metadata?.footer_left).toContain('Cost $0.0123')
+
+    state = consumeBridgeEvent(state, { type: 'final', content: 'answer' })
+    const roundCard = state.transcript.committedCards.find(card => card.kind === 'round')
+    const assistantCard = state.transcript.committedCards.find(card => card.kind === 'assistant')
+    expect(roundCard?.body).toContain('Completed in')
+    expect(roundCard?.metadata?.outcome).toBe('completed')
+    expect(assistantCard?.metadata?.footer_left).toContain('Total 321')
+  })
+
+  test('active round elapsed refreshes while running', () => {
+    let state = getDefaultAppState()
+
+    state = consumeBridgeEvent(state, { type: 'round_start', round: 1 })
+    const startedAt = Number(state.transcript.liveRoundCard?.metadata?.started_at)
+
+    state = refreshActiveRoundElapsed(state, startedAt + 1.4)
+
+    expect(state.transcript.liveRoundCard?.body).toContain('Elapsed: 1.4s')
+    expect(state.transcript.liveRoundCard?.status).toBe('running')
+  })
+
+  test('runtime snapshots update one card in place', () => {
+    let state = getDefaultAppState()
+
+    state = consumeBridgeEvent(state, {
+      type: 'runtime_snapshot',
+      snapshot: {
+        generated_at: '2026-05-19T10:00:00',
+        session: { session_id: 's4-test', checkpoints: 2 },
+        worktree: { active: { branch: 'main', path: '/repo' } },
+        agents: [{ agent_id: 'agent-1', status: 'running', name: 'worker' }],
+        tasks: [],
+        background_tasks: [],
+        context: { used_tokens: 10, max_tokens: 100, remaining_tokens: 90, usage_percent: '10%' },
+      },
+    })
+    state = consumeBridgeEvent(state, {
+      type: 'runtime_snapshot',
+      snapshot: {
+        generated_at: '2026-05-19T10:00:01',
+        session: { session_id: 's4-test', checkpoints: 3 },
+      },
+    })
+
+    const runtimeCards = state.transcript.committedCards.filter(card => card.kind === 'runtime')
+    expect(runtimeCards).toHaveLength(1)
+    expect(runtimeCards[0].body).toContain('2026-05-19T10:00:01')
+    expect(runtimeCards[0].body).toContain('checkpoints=3')
+  })
+
+  test('checkpoint events annotate the latest eligible card', () => {
+    let state = getDefaultAppState()
+
+    state = consumeBridgeEvent(state, { type: 'round_start', round: 1 })
+    state = appendStreamDelta(state, { assistant: 'done' })
+    state = consumeBridgeEvent(state, { type: 'final', content: 'done' })
+    state = consumeBridgeEvent(state, {
+      type: 'checkpoint',
+      checkpoint: {
+        checkpoint_id: 'cp-1',
+        label: 'after response',
+        reason: 'after_prompt',
+        history_messages: 5,
+      },
+    })
+
+    const assistantCard = state.transcript.committedCards.find(card => card.kind === 'assistant')
+    expect(assistantCard?.metadata?.checkpoints).toEqual([
+      {
+        checkpoint_id: 'cp-1',
+        label: 'after response',
+        reason: 'after_prompt',
+        history_messages: 5,
+        created_at: '',
+      },
+    ])
   })
 })

@@ -952,7 +952,24 @@ class S4QueryEngine:
         record = self.session_manager.get_record(session_id)
         if record is None:
             raise ValueError(f"Session not found: {session_id}")
+        self._validate_session_project(record, session_id=session_id)
         return record
+
+    def _validate_session_project(self, record: dict[str, Any], *, session_id: str) -> None:
+        metadata = dict(record.get("metadata") or {})
+        raw_project_root = str(metadata.get("project_root") or "").strip()
+        if not raw_project_root:
+            raise ValueError(
+                f"Session {session_id} is not associated with a project root and cannot be resumed from "
+                f"`{self.project.project_root}`."
+            )
+        session_project_root = Path(raw_project_root).expanduser().resolve()
+        current_project_root = Path(self.project.project_root).expanduser().resolve()
+        if session_project_root != current_project_root:
+            raise ValueError(
+                f"Session {session_id} belongs to `{session_project_root}`, "
+                f"but current project is `{current_project_root}`."
+            )
 
     def _close_bundle(
         self,
@@ -1947,7 +1964,7 @@ class S4QueryEngine:
 
     def get_session_choices(self, *, limit: int = 20) -> list[dict[str, Any]]:
         choices: list[dict[str, Any]] = []
-        for item in self.session_manager.list_sessions(limit=limit):
+        for item in self.session_manager.list_sessions(limit=limit, project_root=self.project.project_root):
             choices.append(
                 {
                     "session_id": item.session_id,
@@ -2263,9 +2280,9 @@ class S4QueryEngine:
         return result.to_display_string()
 
     def format_sessions(self, *, limit: int = 20) -> str:
-        sessions = self.session_manager.list_sessions(limit=limit)
+        sessions = self.session_manager.list_sessions(limit=limit, project_root=self.project.project_root)
         if not sessions:
-            return "No S4Code sessions found."
+            return f"No S4Code sessions found for project `{self.project.project_root}`."
         lines = []
         for item in sessions:
             marker = "*" if item.session_id == self.session_id else "-"

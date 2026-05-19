@@ -4,6 +4,8 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import s4code.query_engine as query_engine
 from s4code.config import LLMSettings, MCPServerSettings, S4Settings
 from s4code.paths import S4Paths
@@ -215,7 +217,7 @@ class _FakeSessionManager:
             "settings_payload": settings_payload,
         }
 
-    def list_sessions(self, *, limit: int = 30) -> list[object]:
+    def list_sessions(self, *, limit: int = 30, project_root: str | Path | None = None) -> list[object]:
         return []
 
 
@@ -389,7 +391,7 @@ def test_query_engine_constructor_uses_session_metadata_for_resume(tmp_path: Pat
 
     session_record = {
         "metadata": {
-            "project_root": str(restored_root),
+            "project_root": str(fallback_root),
             "title": "Restored Bug Hunt",
             "session_overrides": {"product": {"permission_mode": "bypass"}},
             "forked_from_session_id": "sess-parent",
@@ -447,13 +449,13 @@ def test_query_engine_constructor_uses_session_metadata_for_resume(tmp_path: Pat
     )
 
     assert engine.was_restored is True
-    assert engine.project.project_root == restored_root.resolve()
+    assert engine.project.project_root == fallback_root.resolve()
     assert engine.title == "Restored Bug Hunt"
     assert engine.forked_from_session_id == "sess-parent"
     assert engine.sidebar_visible is True
-    assert build_calls[0]["project"].project_root == restored_root.resolve()
+    assert build_calls[0]["project"].project_root == fallback_root.resolve()
     assert build_calls[0]["restore_session_id"] == "sess-123"
-    assert resolve_calls[0]["project_root"] == restored_root.resolve()
+    assert resolve_calls[0]["project_root"] == fallback_root.resolve()
     assert engine.session_overrides == {
         "product": {"permission_mode": "bypass"},
         "llm": {"model": "override-model"},
@@ -938,7 +940,7 @@ def test_query_engine_resume_closes_previous_bundle_and_close_is_idempotent(tmp_
 
     session_record = {
         "metadata": {
-            "project_root": str(restored_root),
+            "project_root": str(current_root),
             "title": "Restored Session",
             "session_overrides": {},
         }
@@ -996,7 +998,7 @@ def test_query_engine_resume_closes_previous_bundle_and_close_is_idempotent(tmp_
     assert "Resumed session sess-restored" in message
     assert agent_first.close_calls == 1
     assert engine.was_restored is True
-    assert engine.project.project_root == restored_root.resolve()
+    assert engine.project.project_root == current_root.resolve()
     assert engine._closed is False
 
     report = engine.close()
@@ -1004,6 +1006,57 @@ def test_query_engine_resume_closes_previous_bundle_and_close_is_idempotent(tmp_
     assert agent_second.close_calls == 1
     assert engine.close() == report
     assert agent_second.close_calls == 1
+
+
+def test_query_engine_rejects_cross_project_session_resume(tmp_path: Path, monkeypatch) -> None:
+    paths = _paths(tmp_path)
+    current_root = tmp_path / "current"
+    other_root = tmp_path / "other"
+    current_root.mkdir()
+    other_root.mkdir()
+
+    session_manager = _FakeSessionManager(
+        record={
+            "metadata": {
+                "project_root": str(other_root),
+                "title": "Other Project",
+                "session_overrides": {},
+            }
+        }
+    )
+
+    monkeypatch.setattr(query_engine, "get_s4_paths", lambda: paths)
+    monkeypatch.setattr(query_engine, "S4SessionManager", lambda raw_paths: session_manager)
+    monkeypatch.setattr(
+        query_engine.ProjectContext,
+        "detect",
+        classmethod(lambda cls, cwd=None, git_binary="git": _make_project(Path(cwd or current_root))),
+    )
+    monkeypatch.setattr(query_engine, "resolve_settings", lambda *args, **kwargs: _settings())
+    monkeypatch.setattr(
+        query_engine,
+        "build_agent_bundle",
+        lambda **kwargs: SimpleNamespace(
+            agent=_LifecycleAgent(),
+            registry=SimpleNamespace(
+                get_tool_names=lambda: [],
+                list_tool_specs=lambda: [],
+                list_runtime_surfaces=lambda surface: {},
+            ),
+            task_service=SimpleNamespace(list_tasks=lambda limit=20: []),
+            context_manager=None,
+            runtime_notice_hook=None,
+            startup_issues=[],
+            restore_report=None,
+            skill_registry=_FakeSkillRegistry([], {}),
+            skill_sources=(),
+        ),
+    )
+
+    engine = query_engine.S4QueryEngine(cwd=current_root)
+
+    with pytest.raises(ValueError, match="belongs to"):
+        engine.resume_session("sess-other")
 
 
 def test_query_engine_checkpoints_persist_and_rewind_history(tmp_path: Path, monkeypatch) -> None:

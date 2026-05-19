@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -15,6 +16,15 @@ from db import SessionStore
 
 from .paths import S4Paths
 from .project import ProjectContext
+
+
+def _normalize_project_root(value: str | Path | None) -> Optional[str]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    return str(Path(raw).expanduser().resolve())
 
 
 @dataclass(slots=True)
@@ -65,12 +75,17 @@ class S4SessionManager:
             "forked_from_session_id": forked_from_session_id,
         }
 
-    def list_sessions(self, *, limit: int = 30) -> list[S4SessionSummary]:
-        items = self.store.list_sessions(limit=limit)
+    def list_sessions(self, *, limit: int = 30, project_root: str | Path | None = None) -> list[S4SessionSummary]:
+        target_project_root = _normalize_project_root(project_root)
+        query_limit = max(limit * 10, 200) if target_project_root is not None else limit
+        items = self.store.list_sessions(limit=query_limit)
         result: list[S4SessionSummary] = []
         for item in items:
             metadata = dict(item.get("metadata") or {})
             if metadata.get("product") != "s4code":
+                continue
+            item_project_root = _normalize_project_root(metadata.get("project_root"))
+            if target_project_root is not None and item_project_root != target_project_root:
                 continue
             result.append(
                 S4SessionSummary(
@@ -80,12 +95,14 @@ class S4SessionManager:
                     updated_at=item.get("updated_at"),
                     model=metadata.get("model"),
                     provider=metadata.get("provider"),
-                    project_root=metadata.get("project_root"),
+                    project_root=item_project_root,
                     permission_mode=metadata.get("permission_mode"),
                     branch=metadata.get("branch"),
                     forked_from_session_id=metadata.get("forked_from_session_id"),
                 )
             )
+            if len(result) >= limit:
+                break
         return result
 
     def get_record(self, session_id: str) -> Optional[dict[str, Any]]:
