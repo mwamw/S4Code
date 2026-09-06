@@ -1,5 +1,5 @@
 import type { Command, CommandInvocation, LocalCommand, PromptCommand } from '../types/command'
-import type { QueryEngine } from '../query/QueryEngine'
+import type { InkController } from '../controller/InkController'
 import type { AppState } from '../state/AppStateStore'
 
 function viewCommand(
@@ -34,7 +34,7 @@ function slashCommand(
     argumentHint,
     ...extra,
     run: async (args, engine) => {
-      return engine.executeSlashCommand(`/${name}${args.trim() ? ` ${args.trim()}` : ''}`)
+      return engine.executeLocalCommand(`/${name}${args.trim() ? ` ${args.trim()}` : ''}`)
     },
   }
 }
@@ -80,17 +80,22 @@ export function getCommands(): Command[] {
     slashCommand('config', 'Show the resolved S4Code config.', undefined, { category: 'runtime', priority: 45 }),
     slashCommand('theme', 'List or switch the active theme.', '[list|theme-name]', { category: 'runtime', priority: 45 }),
     slashCommand('themes', 'List or switch the active theme.', '[list|theme-name]', { category: 'runtime', aliases: ['theme'], priority: 45 }),
-    slashCommand('plan', 'Enter or exit plan mode.', '[on|off]', { category: 'approval', priority: 61 }),
-    slashCommand('copy', 'Copy transcript or latest card.', '[transcript|last]', { category: 'runtime', priority: 30 }),
-    slashCommand('sidebar', 'Show or hide the sidebar.', '[show|hide]', { category: 'runtime', priority: 30 }),
+    slashCommand('plan', 'Enter or exit plan mode.', '[on|off]', { category: 'approval', priority: 61,
+      argumentChoices: [{ value: 'on', description: 'Enter plan mode.' }, { value: 'off', description: 'Exit plan mode.' }] }),
+    slashCommand('copy', 'Copy transcript or latest card.', '[transcript|last]', { category: 'runtime', priority: 30,
+      argumentChoices: [{ value: 'transcript', description: 'Copy the conversation.' }, { value: 'last', description: 'Copy the latest card.' }] }),
+    slashCommand('sidebar', 'Show or hide the sidebar.', '[show|hide]', { category: 'runtime', priority: 30,
+      argumentChoices: [{ value: 'show', description: 'Show the sidebar.' }, { value: 'hide', description: 'Hide the sidebar.' }] }),
     slashCommand('files', 'List project files.', '[path]', { category: 'workspace', priority: 60 }),
     slashCommand('hooks', 'List installed hooks and guardrails.', undefined, { category: 'debug', priority: 15 }),
     viewCommand('skills', 'Show active and queued skills.', 'skills', undefined, { category: 'runtime', priority: 75 }),
+    viewCommand('skills show', 'Show available skills.', 'skills', undefined, { category: 'runtime', priority: 77 }),
     {
       type: 'local',
       name: 'skills queue',
       description: 'Queue a skill for the next turn.',
       argumentHint: '<skill-name>',
+      argumentSource: 'skills',
       category: 'runtime',
       priority: 76,
       run: async (args, engine) => {
@@ -108,6 +113,7 @@ export function getCommands(): Command[] {
       },
     },
     viewCommand('worktree', 'Show current worktree state.', 'worktree', undefined, { category: 'workspace', priority: 75 }),
+    viewCommand('worktree show', 'Show current worktree state.', 'worktree', undefined, { category: 'workspace', priority: 75 }),
     {
       type: 'local',
       name: 'worktree enter',
@@ -137,6 +143,7 @@ export function getCommands(): Command[] {
     viewCommand('pending', 'Show pending approval or question state.', 'pending', undefined, { category: 'approval', priority: 100 }),
     viewCommand('tasks', 'Show structured and background tasks.', 'tasks', undefined, { category: 'runtime', priority: 80 }),
     viewCommand('mcp', 'Show MCP server status.', 'mcp', undefined, { category: 'runtime', priority: 35 }),
+    viewCommand('mcp show', 'Show MCP server status.', 'mcp', undefined, { category: 'runtime', priority: 36 }),
     viewCommand('mcp server', 'Show one MCP server detail.', 'mcp_server', '<server-name>', { category: 'runtime', priority: 35 }),
     viewCommand('mcp tools', 'Show tools for one MCP server.', 'mcp_tools', '<server-name>', { category: 'runtime', priority: 35 }),
     viewCommand('mcp resources', 'Show resources for one MCP server.', 'mcp_resources', '<server-name>', { category: 'runtime', priority: 35 }),
@@ -175,6 +182,7 @@ export function getCommands(): Command[] {
     },
     viewCommand('agents', 'Show active subagents.', 'agents', undefined, { category: 'runtime', priority: 64 }),
     viewCommand('agent', 'Show one subagent by id.', 'agent_detail', '<agent-id>', { category: 'runtime', priority: 63 }),
+    viewCommand('task show', 'Show one task by id.', 'task_detail', '<task-id>', { category: 'runtime', priority: 86 }),
     {
       type: 'local',
       name: 'task',
@@ -225,7 +233,7 @@ export function getCommands(): Command[] {
     viewCommand('session checkpoints', 'List restorable checkpoints.', 'session_checkpoints', undefined, { category: 'session', priority: 71 }),
     viewCommand('session timeline', 'Show checkpoint and trace timeline.', 'session_timeline', undefined, { category: 'session', priority: 71 }),
     viewCommand('session tree', 'Show session fork and restore tree.', 'session_tree', undefined, { category: 'session', priority: 71 }),
-    slashCommand('resume', 'Resume a saved session or list sessions.', '[session-id]', { category: 'session', priority: 70 }),
+    slashCommand('resume', 'Resume a saved session or list sessions.', '[session-id]', { category: 'session', priority: 70, argumentSource: 'sessions' }),
     viewCommand('timeline', 'Show checkpoint and trace timeline.', 'session_timeline', undefined, { category: 'session', priority: 71 }),
     {
       type: 'local',
@@ -236,7 +244,7 @@ export function getCommands(): Command[] {
       priority: 72,
       immediate: true,
       run: async (args, engine) => {
-        await engine.executeSlashCommand(`/checkpoint ${args}`.trim())
+        await engine.executeLocalCommand(`/checkpoint ${args}`.trim())
       },
     },
     {
@@ -255,6 +263,7 @@ export function getCommands(): Command[] {
       name: 'rewind',
       description: 'Rewind conversation history to a checkpoint.',
       argumentHint: '<checkpoint-id|index|last>',
+      argumentSource: 'checkpoints',
       category: 'session',
       priority: 70,
       immediate: true,
@@ -268,6 +277,7 @@ export function getCommands(): Command[] {
       name: 'session load',
       description: 'Load a saved session.',
       argumentHint: '<session-id>',
+      argumentSource: 'sessions',
       category: 'session',
       aliases: ['resume'],
       priority: 70,
@@ -281,6 +291,7 @@ export function getCommands(): Command[] {
       name: 'session restore',
       description: 'Restore a saved session.',
       argumentHint: '<session-id>',
+      argumentSource: 'sessions',
       category: 'session',
       aliases: ['restore-session'],
       priority: 70,
@@ -294,6 +305,7 @@ export function getCommands(): Command[] {
       name: 'session rewind',
       description: 'Rewind to a checkpoint.',
       argumentHint: '<checkpoint-id|index|last>',
+      argumentSource: 'checkpoints',
       category: 'session',
       priority: 69,
       immediate: true,
@@ -366,8 +378,9 @@ export function getCommands(): Command[] {
       name: 'model',
       description: 'Switch the active model profile or literal model.',
       argumentHint: '<profile-or-model>',
+      argumentSource: 'models',
       category: 'runtime',
-      priority: 40,
+      priority: 42,
       run: async (args, engine) => {
         await engine.setModel(args)
       },
@@ -525,7 +538,7 @@ export function matchCommands(commands: Command[], text: string, recent: string[
   const hasTrailingSpace = /\S\s+$/.test(withoutSlash)
   const rootExists = commands.some(command => command.name === rootToken && !isNestedCommand(command))
   const rootHasNestedCommands = rootExists && hasNestedCommands(commands, rootToken)
-  const secondLevelMode = Boolean(rootToken && rootExists && (hasTrailingSpace || raw.includes(' ') || (raw === rootToken && rootHasNestedCommands)))
+  const secondLevelMode = Boolean(rootToken && rootHasNestedCommands && (hasTrailingSpace || raw.includes(' ')))
   const filtered = (() => {
     if (secondLevelMode) {
       const prefix = `${rootToken} `
@@ -544,6 +557,16 @@ export function matchCommands(commands: Command[], text: string, recent: string[
   })()
 
   return [...filtered].sort((left, right) => {
+    const isExact = (command: Command) => [command.name, ...(command.aliases || [])].some(name => name.toLowerCase() === raw)
+    if (isExact(left) !== isExact(right)) {
+      return isExact(left) ? -1 : 1
+    }
+    // Name completion must outrank incidental words in descriptions (e.g.
+    // /mo should complete /model, not /plan because its help mentions "mode").
+    const isNamePrefix = (command: Command) => [command.name, ...(command.aliases || [])].some(name => name.toLowerCase().startsWith(raw))
+    if (isNamePrefix(left) !== isNamePrefix(right)) {
+      return isNamePrefix(left) ? -1 : 1
+    }
     const pendingActive = Boolean(state?.permissions.pending?.active)
     if (pendingActive && left.category !== right.category) {
       if (left.category === 'approval') {
@@ -614,7 +637,13 @@ export function resolvePaletteSelection(
     }
   }
 
-  if (selectedCommand.argumentHint?.startsWith('<') && selectedNameLower === commandPrefix) {
+  const invocation = parseCommand(commands, input)
+  if (invocation?.command === selectedCommand && invocation.args) {
+    return { action: 'submit', text: input }
+  }
+
+  if (selectedCommand.argumentHint && (!selectedCommand.immediate || selectedCommand.argumentHint.startsWith('<')
+    || selectedCommand.argumentSource || selectedCommand.argumentChoices)) {
     return {
       action: 'insert',
       text: `/${selectedName} `,
@@ -622,12 +651,6 @@ export function resolvePaletteSelection(
   }
 
   if (selectedName !== commandBody && selectedNameLower.startsWith(commandPrefix)) {
-    if (selectedCommand.argumentHint?.startsWith('<')) {
-      return {
-        action: 'insert',
-        text: `/${selectedName} `,
-      }
-    }
     return {
       action: 'submit',
       text: `/${selectedName}`,
@@ -640,7 +663,7 @@ export function resolvePaletteSelection(
   }
 }
 
-export async function runCommand(invocation: CommandInvocation, engine: QueryEngine): Promise<void | 'quit'> {
+export async function runCommand(invocation: CommandInvocation, engine: InkController): Promise<void | 'quit'> {
   if (invocation.command.type === 'prompt') {
     const prompt = await (invocation.command as PromptCommand).getPrompt(invocation.args, engine)
     await engine.submitPrompt(prompt)

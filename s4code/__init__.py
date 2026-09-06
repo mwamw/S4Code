@@ -1,5 +1,7 @@
 """S4Code package."""
 
-from .version import __version__
+from s4code.version import __version__
 
-__all__ = ["__version__"]
+__all__ = [
+    "__version__",
+]

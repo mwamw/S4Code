@@ -10,14 +10,15 @@ from rich.markdown import Markdown
 from rich.text import Text
 from textual.containers import VerticalScroll
 
-from s4code.query_engine import S4QueryEngine
-from s4code.transcript_state import TranscriptCard
-from s4code.tui import S4TextualApp
+from s4code.interfaces.terminal.controller import TerminalController
+from s4code.interfaces.terminal.transcript import TranscriptCard
+from s4code.interfaces.textual.app import S4TextualApp
+from s4code.interfaces.textual.diff_renderer import DiffRenderer
 
 
 def test_tui_keeps_final_response_top_visible_after_invoke(tmp_path) -> None:
     async def _run() -> None:
-        engine = S4QueryEngine(cwd=str(tmp_path))
+        engine = TerminalController(cwd=str(tmp_path))
         app = S4TextualApp(engine)
         try:
             async with app.run_test() as pilot:
@@ -53,7 +54,7 @@ def test_tui_keeps_final_response_top_visible_after_invoke(tmp_path) -> None:
 
 def test_tui_shows_welcome_card_with_project_context(tmp_path) -> None:
     async def _run() -> None:
-        engine = S4QueryEngine(cwd=str(tmp_path))
+        engine = TerminalController(cwd=str(tmp_path))
         app = S4TextualApp(engine)
         try:
             async with app.run_test() as pilot:
@@ -71,17 +72,17 @@ def test_tui_shows_welcome_card_with_project_context(tmp_path) -> None:
 
 def test_tui_skips_sidebar_refresh_when_sidebar_hidden(tmp_path) -> None:
     async def _run() -> None:
-        engine = S4QueryEngine(cwd=str(tmp_path))
+        engine = TerminalController(cwd=str(tmp_path))
         engine.sidebar_visible = False
         app = S4TextualApp(engine)
         calls = {"count": 0}
-        original = engine.get_sidebar_payload
+        original = engine.status.get_sidebar_payload
 
         def _wrapped(*, force: bool = False):
             calls["count"] += 1
             return original(force=force)
 
-        engine.get_sidebar_payload = _wrapped  # type: ignore[method-assign]
+        engine.status.get_sidebar_payload = _wrapped  # type: ignore[method-assign]
         try:
             async with app.run_test() as pilot:
                 await pilot.pause(0.2)
@@ -102,7 +103,7 @@ def test_tui_skips_sidebar_refresh_when_sidebar_hidden(tmp_path) -> None:
 
 def test_tui_compacts_older_cards_for_long_transcripts(tmp_path) -> None:
     async def _run() -> None:
-        engine = S4QueryEngine(cwd=str(tmp_path))
+        engine = TerminalController(cwd=str(tmp_path))
         app = S4TextualApp(engine)
         try:
             async with app.run_test() as pilot:
@@ -128,7 +129,7 @@ def test_tui_compacts_older_cards_for_long_transcripts(tmp_path) -> None:
 
 
 def test_tui_renders_streaming_assistant_as_markdown(tmp_path) -> None:
-    engine = S4QueryEngine(cwd=str(tmp_path))
+    engine = TerminalController(cwd=str(tmp_path))
     app = S4TextualApp(engine)
     try:
         card = TranscriptCard(
@@ -145,7 +146,7 @@ def test_tui_renders_streaming_assistant_as_markdown(tmp_path) -> None:
 
 
 def test_tui_renders_plain_streaming_assistant_as_text(tmp_path) -> None:
-    engine = S4QueryEngine(cwd=str(tmp_path))
+    engine = TerminalController(cwd=str(tmp_path))
     app = S4TextualApp(engine)
     try:
         card = TranscriptCard(
@@ -162,7 +163,7 @@ def test_tui_renders_plain_streaming_assistant_as_text(tmp_path) -> None:
 
 
 def test_tui_renders_assistant_metrics_in_panel_footer(tmp_path) -> None:
-    engine = S4QueryEngine(cwd=str(tmp_path))
+    engine = TerminalController(cwd=str(tmp_path))
     app = S4TextualApp(engine)
     try:
         card = TranscriptCard(
@@ -184,7 +185,7 @@ def test_tui_renders_assistant_metrics_in_panel_footer(tmp_path) -> None:
 
 def test_tui_handles_card_removal_without_duplicate_widget_ids(tmp_path) -> None:
     async def _run() -> None:
-        engine = S4QueryEngine(cwd=str(tmp_path))
+        engine = TerminalController(cwd=str(tmp_path))
         app = S4TextualApp(engine)
         try:
             async with app.run_test() as pilot:
@@ -218,8 +219,8 @@ def test_tui_handles_card_removal_without_duplicate_widget_ids(tmp_path) -> None
 
 
 def test_tui_builds_second_level_mcp_palette_entries(tmp_path) -> None:
-    engine = S4QueryEngine(cwd=str(tmp_path))
-    engine.get_mcp_status_payload = lambda **kwargs: [  # type: ignore[method-assign]
+    engine = TerminalController(cwd=str(tmp_path))
+    engine.mcp.get_mcp_status_payload = lambda **kwargs: [  # type: ignore[method-assign]
         {
             "server_name": "github",
             "status": "connected",
@@ -247,7 +248,7 @@ def test_tui_builds_second_level_mcp_palette_entries(tmp_path) -> None:
 
 
 def test_tui_builds_secondary_palette_entries_for_finite_option_commands(tmp_path) -> None:
-    engine = S4QueryEngine(cwd=str(tmp_path))
+    engine = TerminalController(cwd=str(tmp_path))
     app = S4TextualApp(engine)
     try:
         entries, _ = app._build_palette_entries("/plan ")
@@ -269,8 +270,8 @@ def test_tui_builds_secondary_palette_entries_for_finite_option_commands(tmp_pat
 
 
 def test_tui_builds_mcp_all_entries_for_global_actions(tmp_path) -> None:
-    engine = S4QueryEngine(cwd=str(tmp_path))
-    engine.get_mcp_status_payload = lambda **kwargs: [  # type: ignore[method-assign]
+    engine = TerminalController(cwd=str(tmp_path))
+    engine.mcp.get_mcp_status_payload = lambda **kwargs: [  # type: ignore[method-assign]
         {
             "server_name": "github",
             "status": "connected",
@@ -290,7 +291,7 @@ def test_tui_builds_mcp_all_entries_for_global_actions(tmp_path) -> None:
 
 def test_tui_command_output_scrolls_to_bottom(tmp_path) -> None:
     async def _run() -> None:
-        engine = S4QueryEngine(cwd=str(tmp_path))
+        engine = TerminalController(cwd=str(tmp_path))
         app = S4TextualApp(engine)
         try:
             async with app.run_test() as pilot:
@@ -316,7 +317,7 @@ def test_tui_command_output_scrolls_to_bottom(tmp_path) -> None:
 
 def test_tui_copy_command_scrolls_to_bottom(tmp_path) -> None:
     async def _run() -> None:
-        engine = S4QueryEngine(cwd=str(tmp_path))
+        engine = TerminalController(cwd=str(tmp_path))
         app = S4TextualApp(engine)
         try:
             async with app.run_test() as pilot:
@@ -342,7 +343,7 @@ def test_tui_copy_command_scrolls_to_bottom(tmp_path) -> None:
 
 def test_tui_streaming_render_respects_user_scroll_after_snapshot(tmp_path) -> None:
     async def _run() -> None:
-        engine = S4QueryEngine(cwd=str(tmp_path))
+        engine = TerminalController(cwd=str(tmp_path))
         app = S4TextualApp(engine)
         try:
             async with app.run_test() as pilot:
@@ -386,3 +387,36 @@ def test_tui_streaming_render_respects_user_scroll_after_snapshot(tmp_path) -> N
             engine.close()
 
     asyncio.run(_run())
+
+
+def test_tui_obsolete_scroll_callback_does_not_touch_new_layout() -> None:
+    from types import SimpleNamespace
+
+    def unexpected_query(*args):
+        raise AssertionError("An obsolete callback must not inspect the new layout")
+
+    app = SimpleNamespace(_transcript_render_revision=2, query_one=unexpected_query)
+    S4TextualApp._restore_transcript_scroll(app, True, True, 0, revision=1)
+
+
+def test_tui_waits_for_refresh_after_mount_before_reading_layout() -> None:
+    from types import SimpleNamespace
+
+    queued, restored = [], []
+    app = SimpleNamespace(
+        call_after_refresh=lambda callback, *args: queued.append((callback, args)),
+        _restore_transcript_scroll=lambda *args: restored.append(args),
+    )
+
+    async def check():
+        await S4TextualApp._restore_transcript_scroll_after_mount(
+            app, asyncio.sleep(0), should_follow=True, forced_follow=False,
+            previous_scroll_y=0, target_card_id="final", target_card_top=True, revision=2,
+        )
+        assert not restored
+        assert len(queued) == 1
+        callback, args = queued.pop()
+        callback(*args)
+        assert restored == [(True, False, 0, "final", True, 2)]
+
+    asyncio.run(check())

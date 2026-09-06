@@ -1,28 +1,32 @@
-import { BridgeClient } from './runtime/bridgeClient'
-import { BridgeProcess } from './runtime/bridgeProcess'
+import { BridgeClient, BridgeProcess } from '../packages/bridge-client/src/index'
+import { InkCoreClient } from './controller/InkCoreClient'
 import { getDefaultAppState, type AppState } from './state/AppStateStore'
 import { createStore, type Store } from './state/store'
-import { QueryEngine } from './query/QueryEngine'
+import { InkController } from './controller/InkController'
 
 export async function setup(options: { cwd: string; sessionId?: string | null; transientSession?: boolean }): Promise<{
-  bridge: BridgeClient
+  bridge: InkCoreClient
   store: Store<AppState>
-  engine: QueryEngine
+  engine: InkController
 }> {
-  const process = new BridgeProcess(options.cwd, options.sessionId, {
+  const process = new BridgeProcess({ cwd: options.cwd, sessionId: options.sessionId,
     transientSession: Boolean(options.transientSession),
-    ignoreSessionModelOverrides: Boolean(options.sessionId),
   })
-  const bridge = new BridgeClient(process)
+  const bridge = new InkCoreClient(new BridgeClient(process))
   const store = createStore(getDefaultAppState())
-  const engine = new QueryEngine({
+  const engine = new InkController({
     bridge,
     getAppState: store.getState,
     setAppState: store.setState,
   })
 
-  const init = await bridge.init()
-  store.setState(() => engine.buildStateFromInit(init))
+  try {
+    const init = await bridge.init()
+    store.setState(() => engine.buildStateFromInit(init))
+  } catch (error) {
+    bridge.terminate()
+    throw error
+  }
 
   return {
     bridge,

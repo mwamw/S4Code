@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { getCommands, matchCommands, parseCommand, resolvePaletteSelection } from '../src/commands'
 import { getDefaultAppState } from '../src/state/AppStateStore'
+import { CommandMenu } from '../src/commands/CommandMenu'
 
 describe('commands', () => {
   test('parseCommand chooses the longest matching command name', () => {
@@ -21,6 +22,10 @@ describe('commands', () => {
 
     expect(matches.slice(0, 3).map(command => command.name)).toContain('confirm')
     expect(matches.slice(0, 3).map(command => command.name)).toContain('deny')
+  })
+
+  test('command name prefixes outrank matches in descriptions', () => {
+    expect(matchCommands(getCommands(), '/mo', ['plan'])[0]?.name).toBe('model')
   })
 
   test('registry includes high-frequency parity commands', () => {
@@ -74,15 +79,11 @@ describe('commands', () => {
   test('matchCommands shows nested choices after selecting a command group', () => {
     const state = getDefaultAppState()
 
-    expect(matchCommands(getCommands(), '/session', [], state).map(command => command.name)).toEqual(
-      expect.arrayContaining(['session list', 'session load', 'session checkpoints']),
-    )
+    expect(matchCommands(getCommands(), '/session', [], state)[0]?.name).toBe('session')
     expect(matchCommands(getCommands(), '/session ', [], state).map(command => command.name)).toEqual(
       expect.arrayContaining(['session list', 'session load', 'session checkpoints']),
     )
-    expect(matchCommands(getCommands(), '/mcp', [], state).map(command => command.name)).toEqual(
-      expect.arrayContaining(['mcp server', 'mcp tools', 'mcp resources', 'mcp refresh']),
-    )
+    expect(matchCommands(getCommands(), '/mcp', [], state)[0]?.name).toBe('mcp')
     expect(matchCommands(getCommands(), '/skills ', [], state).map(command => command.name)).toEqual(
       expect.arrayContaining(['skills queue', 'skills clear']),
     )
@@ -110,5 +111,33 @@ describe('commands', () => {
       action: 'submit',
       text: '/session list',
     })
+  })
+
+  test('menu navigation is explicit and editing a confirmed prefix returns to its parent', () => {
+    const menu = new CommandMenu(getCommands())
+    const state = getDefaultAppState()
+    expect(menu.describe('/model ', state).source).toBeUndefined()
+    menu.open('/model ')
+    expect(menu.describe('/model ', state).source).toBe('models')
+    expect(menu.describe('/model fa', state).query).toBe('fa')
+    expect(menu.describe('/model', state).source).toBeUndefined()
+    expect(menu.describe('/model ', state).source).toBeUndefined()
+    menu.open('/session load ')
+    expect(menu.describe('/session load ', state).source).toBe('sessions')
+    expect(menu.describe('/session load', state).title).toBe('/session')
+    expect(menu.describe('/session load ', state).source).toBeUndefined()
+    menu.open('')
+    expect(menu.describe('/session ', state).title).toBe('Commands')
+  })
+
+  test('argument syntax stays in help, not in menu labels, descriptions or hints', () => {
+    const menu = new CommandMenu(getCommands())
+    const state = getDefaultAppState()
+    for (const input of ['/', '/session ', '/session rename ', '/model ', '/permissions ']) {
+      menu.open(input)
+      const page = menu.describe(input, state)
+      const visibleText = [page.title, page.hint, ...page.entries.map(entry => `${entry.label} ${entry.description}`)].join('\n')
+      expect(visibleText).not.toMatch(/[<>\[\]|]/)
+    }
   })
 })

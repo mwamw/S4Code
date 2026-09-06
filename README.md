@@ -4,6 +4,16 @@ S4Code 是一个本地优先的代码智能体终端产品。它面向真实代�
 
 S4Code 构建在 EasyAgent 之上。EasyAgent 负责 Agent、Tool、MCP、Skill、记忆和运行时能力；S4Code 在它之上提供面向代码仓库的产品层，包括配置、系统提示词、权限、会话、TUI、命令体系、检查点、worktree 和用户体验。
 
+## Core 与对外接口
+
+产品主体是 S4Code Core，`S4CodeAgent(BasicAgent)` 只是其中的 Agent 组件。Core 还包括产品运行入口、会话、配置、权限和结构化事件。CLI、Textual、Python SDK 是平级入口，分别调用 Core；Ink 与 TypeScript SDK 共用独立 Bridge Client，通过无界面的 Bridge Server 调用 Core。没有 Agent Bundle、`easyagent_adapter` 或 `QueryEngine`。Checkpoint/rewind 的策略属于各 TUI，只回溯会话上下文，不撤销磁盘文件或外部操作。
+
+- [重构后的代码结构、职责与扩展规则](docs/architecture.md)
+- [Python SDK、CLI、TUI 和 bridge 使用指南](docs/usage.md)
+- [可运行的 Python SDK 示例](example/sdk_usage.py)
+
+仅使用 SDK 不需要安装 Textual，也不会导入终端层。
+
 ## 适合什么场景
 
 S4Code 适合在本地代码仓库中完成多步骤软件工程任务：
@@ -21,7 +31,7 @@ S4Code 适合在本地代码仓库中完成多步骤软件工程任务：
 
 ## 当前前端
 
-S4Code 现在提供两个终端前端，它们共享同一套 Python 后端、配置、会话和命令注册表。
+S4Code 提供两个终端前端，它们共享 Core 的配置、会话与运行能力，各自维护命令注册表和展示逻辑。
 
 | 前端 | 命令 | 说明 |
 | --- | --- | --- |
@@ -73,7 +83,7 @@ pip install -e /path/to/EasyAgent
 
 ```bash
 cd /path/to/S4Code
-pip install -e .
+pip install -e '.[tui]'
 ```
 
 安装后会得到两个等价命令：
@@ -223,7 +233,7 @@ model_profiles:
     temperature: 0.2
     max_tokens: null
     timeout: 120
-    reasoning_effort: null
+    reasoning_effort: medium
     reasoning_summary: null
 ```
 
@@ -241,7 +251,7 @@ model_profiles:
     temperature: 0.5
     max_tokens: null
     timeout: 120
-    reasoning_effort: null
+    reasoning_effort: medium
     reasoning_summary: null
 ```
 
@@ -259,7 +269,7 @@ model_profiles:
     temperature: 0.2
     max_tokens: null
     timeout: 120
-    reasoning_effort: null
+    reasoning_effort: medium
     reasoning_summary: null
 
   strong:
@@ -270,7 +280,7 @@ model_profiles:
     temperature: 0.2
     max_tokens: null
     timeout: 180
-    reasoning_effort: null
+    reasoning_effort: medium
     reasoning_summary: null
 ```
 
@@ -816,7 +826,7 @@ s4 --cwd /path/to/project
 
 ## TS 前端说明
 
-TS 前端使用 Bun + React + Ink 渲染，后端通过 `python -m s4code.bridge` 调用 Python S4Code。
+TS 前端使用 Bun + React + Ink 渲染，后端通过 `python -m s4code.interfaces.bridge.server` 调用 Python S4Code。
 
 常用命令：
 
@@ -834,10 +844,11 @@ s4ts commit
 
 TS bridge 查找 Python 的顺序：
 
-1. `S4CODE_PYTHON`
-2. S4Code 仓库根目录 `.venv/bin/python`
-3. S4Code 仓库根目录 `venv/bin/python`
-4. `python`
+1. 程序显式传入的 `python` 选项（SDK / Bridge Client）
+2. `S4CODE_PYTHON`
+3. 当前 `PATH` 中的 `python`（激活 conda/virtualenv 后即使用该环境）
+
+不再推断仓库根目录或自动搜索仓库中的虚拟环境。
 
 如果你在新机器或其它目录运行 `s4ts` 出现 `ModuleNotFoundError: No module named 's4code'`，通常说明 TS bridge 使用的 Python 环境没有安装 S4Code。解决方式：
 
@@ -1188,14 +1199,16 @@ bun run smoke
 常用真实冒烟：
 
 ```bash
-s4code --prompt "/status"
-s4code --prompt "/context"
-s4code --prompt "/help"
+s4code doctor
+s4code config
+s4code --help
 s4ts --prompt "/status"
 s4ts --prompt "/session list"
 ```
 
 ## 推荐使用方式
+
+Python CLI 的 `--prompt` 是发送给 Agent 的自然语言输入，不解析 TUI 的 slash command。`/status`、`/context`、`/help` 请在 Textual 或 Ink 内使用；CLI 对应使用 `doctor`、`config`、`--help`。
 
 新用户建议从这个顺序开始：
 

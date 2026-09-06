@@ -817,19 +817,21 @@ export function appendStreamDelta(
 ): AppState {
   const thinking = deltas.thinking || ''
   const assistant = deltas.assistant || ''
-  if (!thinking && !assistant) {
+  const appendThinking = Boolean(thinking && (state.transcript.liveThinkingCard || thinking.trim()))
+  const appendAssistant = Boolean(assistant && (state.transcript.liveAssistantCard || assistant.trim()))
+  if (!appendThinking && !appendAssistant) {
     return state
   }
   const roundMetadata = state.runtime.currentRound ? { round: state.runtime.currentRound } : undefined
 
-  const liveThinkingCard = thinking
+  const liveThinkingCard = appendThinking
     ? {
         ...(state.transcript.liveThinkingCard || newCard('thinking', 'Model Thinking', '', 'streaming', roundMetadata)),
         body: `${state.transcript.liveThinkingCard?.body || ''}${thinking}`,
         status: 'streaming',
       }
     : state.transcript.liveThinkingCard
-  const liveAssistantCard = assistant
+  const liveAssistantCard = appendAssistant
     ? {
         ...(state.transcript.liveAssistantCard || newCard('assistant', 'Model Response', '', 'streaming', roundMetadata)),
         body: `${state.transcript.liveAssistantCard?.body || ''}${assistant}`,

@@ -1,6 +1,5 @@
-from .cli import app
+from s4code.interfaces.cli.app import app
 
 
 if __name__ == "__main__":
     app()
-

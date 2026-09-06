@@ -1,17 +1,22 @@
-import sys
+"""Inspect discovered skills using the public SDK; no model call."""
+
 from pathlib import Path
-from s4code.query_engine import S4QueryEngine
+from s4code.core.agent import S4CodeAgent
+from s4code.core.configuration import S4ConfigLoader
+
 
 def main():
-    engine = S4QueryEngine(cwd=Path("/home/wxd/LLM/S4Code"))
-    agent = engine.bundle.agent
-    manager = agent.skill_manager
-    print("ALL MANIFESTS:")
-    for m in manager._collect_skill_manifests():
-        print(f"- {m.name}: {m.exposure_mode}")
-    print("\nON DEMAND MANIFESTS:")
-    for m in manager.get_on_demand_skill_manifests():
-        print(f"- {m.name}")
+    workspace = Path.cwd()
+    settings = S4ConfigLoader().load_agent_settings(workspace)
+    with S4CodeAgent.create(workspace=workspace, settings=settings) as agent:
+        manager = agent.skill_manager
+        if manager is None:
+            print("No skills discovered.")
+            return
+        for name in manager.skill_names:
+            manifest = manager.get_skill(name)
+            print(f"{manifest.name}: {manifest.description}")
+
 
 if __name__ == "__main__":
     main()

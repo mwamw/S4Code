@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from s4code.theme import list_bundled_themes, load_tui_theme
+from s4code.interfaces.terminal.theme import list_bundled_themes, load_tui_theme
 
 
 def test_loads_bundled_themes_with_default_fallbacks() -> None:

@@ -5,17 +5,21 @@ import { ComposerPane } from '../components/ComposerPane'
 import { FooterPane } from '../components/FooterPane'
 import { SidebarPane } from '../components/SidebarPane'
 import { TranscriptPane } from '../components/TranscriptPane'
-import { useAppState } from '../state/AppState'
-import type { QueryEngine } from '../query/QueryEngine'
+import { useAppState, useSetAppState } from '../state/AppState'
+import { refreshActiveRoundElapsed } from '../state/transcript'
+import type { InkController } from '../controller/InkController'
 
-export function REPL(props: { engine: QueryEngine }) {
+export function REPL(props: { engine: InkController }) {
   const { exit } = useApp()
   const busy = useAppState(state => state.runtime.busy)
+  const setState = useSetAppState()
 
   useEffect(() => {
     const timer = setInterval(() => {
       if (!busy) {
         void props.engine.pollRuntime().catch(() => undefined)
+      } else {
+        setState(state => refreshActiveRoundElapsed(state))
       }
     }, 1000)
     const unsubscribeQuit = props.engine.onQuit(exit)
@@ -23,11 +27,11 @@ export function REPL(props: { engine: QueryEngine }) {
       clearInterval(timer)
       unsubscribeQuit()
     }
-  }, [props.engine, busy, exit])
+  }, [props.engine, busy, exit, setState])
 
   useInput((value, key) => {
     if (key.ctrl && value === 'c') {
-      void props.engine.quit()
+      void props.engine.quit().catch(exit)
     }
   })
 

@@ -1,20 +1,23 @@
 from pathlib import Path
+from dataclasses import replace
+import re
 from types import SimpleNamespace
+import pytest
 
-from s4code._easyagent_bootstrap import ensure_easyagent_environment
 
-ensure_easyagent_environment()
 
+from easyagent.config import Config
 from core.request_compiler import compile_prompt_blocks
 from core.request_input import ReplayRequestInput
-from s4code.paths import S4Paths
-from s4code.project import ProjectContext
-from s4code.system_prompt import (
+from easyagent.runtime import ExecutionContext
+from s4code.core.paths import S4Paths
+from s4code.core.project import ProjectContext
+from s4code.core.prompting import (
     S4PromptComposer,
-    build_s4_runtime_reminder_sources,
     build_s4_system_prompt,
     discover_s4_prompt_sources,
 )
+from easyagent.prompting import PromptBuildContext
 
 
 def _paths(tmp_path: Path) -> S4Paths:
@@ -41,18 +44,37 @@ def _project(root: Path) -> ProjectContext:
     )
 
 
+def _context(*, root: Path, system_prompt: str, skill_listing: str = "") -> PromptBuildContext:
+    return PromptBuildContext(
+        agent_name="S4Code",
+        description="test",
+        system_prompt=system_prompt,
+        query="hello",
+        config=Config(workspace_root=str(root), allowed_roots=[str(root)]),
+        execution_context=ExecutionContext(workspace_root=str(root), allowed_roots=(str(root),)),
+        tool_registry=None,
+        skill_manager=(
+            SimpleNamespace(build_skill_listing_prompt=lambda: skill_listing)
+            if skill_listing
+            else None
+        ),
+    )
+
+
 def test_build_s4_system_prompt_contains_code_agent_rules(tmp_path) -> None:
     project_root = tmp_path / "repo"
     (project_root / "src").mkdir(parents=True)
-    paths = _paths(tmp_path)
-    prompt = build_s4_system_prompt(paths=paths, project=_project(project_root))
+    prompt = build_s4_system_prompt(paths=_paths(tmp_path), project=_project(project_root))
 
-    assert "你是 S4Code，一个交互式本地代码智能体" in prompt
-    assert "当前运行环境可能带有权限模式、审批、hook、运行时控制和中断机制" in prompt
-    assert "如果用户要求 review，先给出 findings" in prompt
-    assert "除非某个 URL 明显来自用户输入、仓库内容、工具结果" in prompt
-    assert "# 当前环境" not in prompt
-    assert "# S4.md 持久指令" not in prompt
+    assert prompt.startswith("You are S4Code, an interactive agent")
+    for section in ("System", "Doing tasks", "Executing actions with care", "Using your tools", "Tone and style", "Output efficiency"):
+        assert f"# {section}" in prompt
+    assert "You can call multiple tools in a single response." in prompt
+    assert "You must NEVER generate or guess URLs" in prompt
+    assert "<system-reminder>" in prompt
+    assert "FileRead instead of cat" in prompt
+    assert "Respond in Chinese by default" in prompt
+    assert not re.search(r"[\u4e00-\u9fff]", prompt)
 
 
 def test_discover_s4_prompt_sources_loads_global_and_project_files(tmp_path) -> None:
@@ -73,121 +95,93 @@ def test_discover_s4_prompt_sources_loads_global_and_project_files(tmp_path) -> 
         root_prompt.resolve(),
         local_prompt.resolve(),
     ]
-    assert [source.content for source in sources] == [
-        "# Global\nUse terse answers.",
-        "# Project\nPrefer pytest.",
-        "# Local\nDo not edit generated files.",
-    ]
 
 
-def test_runtime_reminder_sources_include_s4_md_environment_skills_and_deferred_tools(tmp_path) -> None:
-    project_root = tmp_path / "repo"
-    (project_root / ".s4code").mkdir(parents=True)
-    paths = _paths(tmp_path)
-    (project_root / "S4.md").write_text("# Project\nPrefer focused diffs.\n", encoding="utf-8")
-    (project_root / ".s4code" / "S4.md").write_text("# Local\nKeep generated files untouched.\n", encoding="utf-8")
-    project = _project(project_root)
-    sources = build_s4_runtime_reminder_sources(paths=paths, project=project)
-    fake_agent = SimpleNamespace(
-        tool_registry=SimpleNamespace(
-            list_tool_specs=lambda stable=True: [
-                SimpleNamespace(name="Bash", expose_in_deferred=True, metadata={}),
-                SimpleNamespace(name="WebFetch", expose_in_deferred=False, metadata={}),
-            ]
-        ),
-        config=SimpleNamespace(tool_schema_mode="deferred"),
-        skill_manager=SimpleNamespace(
-            build_resident_skills_prompt=lambda exclude_names=None: "## 动态技能管理工具\n直接调用 `skill_tool`。",
-            build_skill_policy_prompt=lambda: "## Skill 使用规则\n直接用 `skill_tool`。",
-            build_skill_listing_prompt=lambda: "## 可用 Skills\n- `review_skill`",
-        ),
+def test_s4_prompt_composer_uses_context_identity(tmp_path) -> None:
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    composer = S4PromptComposer(paths=_paths(tmp_path), project=_project(root))
+
+    prompt = composer.get_enhanced_prompt(_context(root=root, system_prompt="custom s4 prompt"))
+
+    assert prompt == "custom s4 prompt"
+
+
+@pytest.mark.parametrize("provider", ["anthropic_native", "openai", "openai_responses"])
+def test_s4_request_context_uses_system_reminder_messages(tmp_path, provider) -> None:
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "S4.md").write_text("Prefer focused diffs.\n", encoding="utf-8")
+    composer = S4PromptComposer(paths=_paths(tmp_path), project=_project(root))
+    blocks = composer.compose(
+        _context(
+            root=root,
+            system_prompt="custom s4 prompt",
+            skill_listing="<available_skills>\n- `review`\n</available_skills>",
+        )
     )
-
-    rendered = "\n\n".join(
-        reminder.render()
-        for source in sources
-        for reminder in source.build_runtime_reminders(fake_agent)
-    )
-
-    assert "Prefer focused diffs." in rendered
-    assert "Keep generated files untouched." in rendered
-    assert f"- 项目根目录: `{project_root}`" in rendered
-    assert "Today's date is" in rendered
-    assert "WebFetch" in rendered
-    assert "tool_schema_tool" in rendered
-    assert "## 动态技能管理工具" in rendered
-    assert "## Skill 使用规则" in rendered
-    assert "## 可用 Skills" in rendered
-
-
-class _FakeSkillManager:
-    def build_resident_skills_prompt(self, exclude_names=None) -> str:
-        return "## 动态技能管理工具\n直接调用 `skill_tool`。"
-
-    def build_skill_policy_prompt(self) -> str:
-        return "## Skill 使用规则\n直接调用 `skill_tool`。"
-
-    def build_skill_listing_prompt(self) -> str:
-        return "## 可用 Skills\n- `crypto_skill`"
-
-
-class _FakeAgent:
-    def __init__(self, system_prompt: str) -> None:
-        self.enable_tool = True
-        self.tool_registry = object()
-        self.system_prompt = system_prompt
-        self.skill_manager = _FakeSkillManager()
-
-    def _should_include_tool_inventory_block(self) -> bool:
-        return False
-
-    def _build_memory_prompt(self) -> str:
-        return ""
-
-    def _build_mailbox_prompt(self) -> str:
-        return ""
-
-    def get_system_prompt_blocks(self):
-        return self.prompt_composer.get_system_prompt_blocks(self)  # pragma: no cover
-
-    def build_runtime_reminder_prompt_blocks(self, start_order: int):
-        from prompt import PromptBlock
-
-        return [
-            PromptBlock(
-                name="skills",
-                content="## 可用 Skills\n- `crypto_skill`",
-                order=start_order,
-                metadata={"request_layer": "reminder"},
-            )
-        ]
-
-
-def test_s4_prompt_composer_uses_system_prompt_as_identity_block() -> None:
-    composer = S4PromptComposer()
-    prompt = composer.get_enhanced_prompt(_FakeAgent("custom s4 prompt"))
-    assert "custom s4 prompt" in prompt
-    assert "## 可用 Skills" not in prompt
-
-
-def test_s4_runtime_reminders_are_prepended_as_system_reminder_tags() -> None:
-    agent = _FakeAgent("custom s4 prompt")
-    composer = S4PromptComposer()
-    compiled = compile_prompt_blocks(composer.get_system_prompt_blocks(agent))
-
+    compiled = compile_prompt_blocks(blocks)
     request = ReplayRequestInput(
-        provider_name="anthropic_native",
+        provider_name=provider,
         replay_history=[{"role": "user", "content": "hello"}],
         persistent_replay_history=[{"role": "user", "content": "hello"}],
         system_prompt=compiled.system_prompt,
         system_prompt_blocks=compiled.system_prompt_blocks,
-        runtime_reminder_blocks=compiled.runtime_reminder_blocks,
+        system_reminder_blocks=compiled.system_reminder_blocks,
         dynamic_tail_blocks=compiled.dynamic_tail_blocks,
         on_demand_expansion_blocks=compiled.on_demand_expansion_blocks,
         cache_policy=compiled.cache_policy,
     )
+
     request.apply_runtime_layers()
 
-    assert request.runtime_reminder_blocks
+    assert {block.name for block in compiled.system_reminder_blocks} >= {
+        "skill_listing",
+        "s4_md",
+        "s4_environment",
+        "current_date",
+    }
     assert request.replay_history[0]["role"] == "user"
     assert "<system-reminder" in str(request.replay_history[0]["content"])
+    assert compiled.system_prompt == "custom s4 prompt"
+    assert {block.name for block in blocks}.isdisjoint({
+        "visibility", "task_execution", "safety", "tool_policy", "tone_style", "output_efficiency",
+    })
+
+
+def test_legacy_snapshot_cannot_reenable_framework_defaults(tmp_path):
+    composer = S4PromptComposer()
+    composer.restore_state({"includeDefaults": True, "blocks": []})
+    assert composer.include_defaults is False
+    context = _context(root=tmp_path, system_prompt="product prompt")
+    assert composer.get_enhanced_prompt(context) == "product prompt"
+
+
+def test_product_capability_reminders_survive_full_prompt_override(tmp_path):
+    composer = S4PromptComposer()
+    context = replace(
+        _context(root=tmp_path, system_prompt="product prompt", skill_listing="技能正文保持原样"),
+        memory=SimpleNamespace(memory_types={"working": object()}),
+        plan=SimpleNamespace(mode="plan"),
+        context_manager=object(),
+    )
+    blocks = {block.name: block for block in composer.compose(context)}
+    assert blocks["identity"].content == "product prompt"
+    assert blocks["skill_listing"].content == "技能正文保持原样"
+    for name in ("memory_policy", "plan_mode", "compaction", "current_date"):
+        assert blocks[name].placement == "system_reminder"
+        assert not re.search(r"[\u4e00-\u9fff]", blocks[name].content)
+    assert "`working`" in blocks["memory_policy"].content
+    assert "unlimited context" not in blocks["compaction"].content
+    inactive = replace(context, plan=SimpleNamespace(mode="execute"), context_manager=None)
+    inactive_names = {block.name for block in composer.compose(inactive)}
+    assert "plan_mode" not in inactive_names
+    assert "compaction" not in inactive_names
+
+
+def test_project_instructions_preserve_user_language(tmp_path):
+    (tmp_path / "S4.md").write_text("请保留项目已有约定。", encoding="utf-8")
+    composer = S4PromptComposer(paths=_paths(tmp_path), project=_project(tmp_path))
+    blocks = {block.name: block for block in composer.compose(_context(root=tmp_path, system_prompt=""))}
+    assert "请保留项目已有约定。" in blocks["s4_md"].content
+    assert "persistent instructions" in blocks["s4_md"].content

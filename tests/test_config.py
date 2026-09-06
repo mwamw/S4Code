@@ -1,6 +1,9 @@
 from pathlib import Path
+from types import SimpleNamespace
+from s4code.core.configuration import S4ConfigLoader
+from s4code.core.project import ProjectContext
 
-from s4code.config import (
+from s4code.interfaces.terminal.settings import (
     LLMSettings,
     ProductSettings,
     S4Settings,
@@ -8,7 +11,7 @@ from s4code.config import (
     resolve_settings,
     save_settings,
 )
-from s4code.paths import S4Paths
+from s4code.core.paths import S4Paths
 
 
 def _paths(tmp_path: Path) -> S4Paths:
@@ -47,7 +50,26 @@ def _settings() -> S4Settings:
     )
 
 
-def test_resolve_settings_merges_yaml_global_project_and_session_with_profiles(tmp_path: Path) -> None:
+def test_core_loader_uses_detected_repository_root(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    nested = root / "src"
+    nested.mkdir(parents=True)
+    config = root / ".s4code" / "config.yaml"
+    config.parent.mkdir()
+    config.write_text(
+        "llm:\n  provider: openai\n  model: repository-model\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        ProjectContext, "detect", lambda workspace: SimpleNamespace(project_root=root)
+    )
+    result = S4ConfigLoader(_paths(tmp_path)).load_agent_settings(nested)
+    assert result.llm.model == "repository-model"
+    assert not hasattr(result, "ui")
+
+
+def test_resolve_settings_merges_yaml_global_project_and_session_with_profiles(
+    tmp_path: Path,
+) -> None:
     paths = _paths(tmp_path)
     project_root = tmp_path / "repo"
     project_root.mkdir()
@@ -93,7 +115,9 @@ def test_resolve_settings_merges_yaml_global_project_and_session_with_profiles(t
     assert resolved.ui.theme == "project-theme"
 
 
-def test_resolve_settings_supports_legacy_llm_payload_without_profiles(tmp_path: Path) -> None:
+def test_resolve_settings_supports_legacy_llm_payload_without_profiles(
+    tmp_path: Path,
+) -> None:
     paths = _paths(tmp_path)
     paths.global_config_path.write_text(
         "\n".join(
@@ -112,6 +136,29 @@ def test_resolve_settings_supports_legacy_llm_payload_without_profiles(tmp_path:
     assert "default" in resolved.model_profiles
     assert resolved.llm.provider == "google_native"
     assert resolved.llm.model == "gemini-2.5-pro"
+    assert resolved.llm.reasoning_effort == "medium"
+    assert resolved.ui.show_thinking is True
+
+
+def test_resolve_settings_allows_disabling_default_reasoning(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    paths.global_config_path.write_text(
+        "\n".join(
+            [
+                "model_profiles:",
+                "  default:",
+                "    provider: openai",
+                "    model: gpt-4.1",
+                "    reasoning_effort: null",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    resolved = resolve_settings(paths)
+
+    assert resolved.llm.reasoning_effort is None
 
 
 def test_resolve_settings_supports_split_config_files(tmp_path: Path) -> None:
@@ -237,7 +284,9 @@ def test_split_config_files_override_same_scope_config_yaml(tmp_path: Path) -> N
     assert resolved.ui.theme == "split-theme"
 
 
-def test_resolve_settings_merges_global_and_project_mcp_json_by_server_name(tmp_path: Path) -> None:
+def test_resolve_settings_merges_global_and_project_mcp_json_by_server_name(
+    tmp_path: Path,
+) -> None:
     paths = _paths(tmp_path)
     project_root = tmp_path / "repo"
     project_root.mkdir()
@@ -290,7 +339,9 @@ def test_resolve_settings_merges_global_and_project_mcp_json_by_server_name(tmp_
     assert graph.enabled is False
 
 
-def test_resolve_settings_accepts_extra_metadata_in_mcp_catalog_entries(tmp_path: Path) -> None:
+def test_resolve_settings_accepts_extra_metadata_in_mcp_catalog_entries(
+    tmp_path: Path,
+) -> None:
     paths = _paths(tmp_path)
     save_settings(paths.global_config_path, _settings())
     paths.global_mcp_config_path.write_text(
@@ -336,4 +387,6 @@ def test_resolve_settings_requires_llm_configuration(tmp_path: Path) -> None:
     except ValueError as exc:
         assert "LLM 配置缺失" in str(exc)
     else:
-        raise AssertionError("resolve_settings should require explicit LLM configuration")
+        raise AssertionError(
+            "resolve_settings should require explicit LLM configuration"
+        )

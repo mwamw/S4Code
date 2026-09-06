@@ -8,6 +8,7 @@
     "bun": ">=1.1.0"
   },
   "scripts": {
+    "build:sdk": "bun build packages/sdk/src/index.ts --target node --outdir packages/sdk/dist && bun build packages/bridge-client/src/index.ts --target node --outdir packages/bridge-client/dist && tsc -p tsconfig.packages.json && tsc -p tsconfig.packages.json --outDir packages/bridge-client/dist/types",
     "dev": "bun run src/main.tsx --cwd ..",
     "start": "bun run src/main.tsx --cwd ..",
     "typecheck": "tsc --noEmit",
@@ -19,7 +20,8 @@
     "ink": "^5.1.0",
     "ink-spinner": "^5.0.0",
     "ink-text-input": "^6.0.0",
-    "react": "^18.3.1"
+    "react": "^18.3.1",
+    "string-width": "^7.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.1",

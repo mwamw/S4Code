@@ -1,29 +1,16 @@
-import sys
+"""Inspect the product prompt using the public SDK; no model call."""
+
 from pathlib import Path
-from s4code.query_engine import S4QueryEngine
-from memory import MemoryManage,WorkingMemory,MemoryConfig
-from core.request_compiler import compile_prompt_blocks
+from s4code.core.agent import S4CodeAgent
+from s4code.core.configuration import S4ConfigLoader
 
 
 def main():
-    engine = S4QueryEngine(cwd=Path("/home/wxd/LLM/S4Code"))
-    agent = engine.bundle.agent
-    mm=MemoryManage(config=MemoryConfig(),working_memory=WorkingMemory(MemoryConfig()))
-    agent.with_memory(mm)
-    composer = agent.prompt_composer
-    blocks = composer.get_system_prompt_blocks(agent)
-    compiled = compile_prompt_blocks(blocks)
-    prompt = composer.get_enhanced_prompt(agent)
-    print("="*40 + " SYSTEM PROMPT " + "="*40)
-    print(prompt)
-    if compiled.runtime_reminder_blocks:
-        print("="*39 + " RUNTIME REMINDERS " + "="*39)
-        for block in compiled.runtime_reminder_blocks:
-            print(f"<system-reminder name=\"{block.name}\">")
-            print(block.content)
-            print("</system-reminder>")
-            print()
-    print("="*95)
+    workspace = Path.cwd()
+    settings = S4ConfigLoader().load_agent_settings(workspace)
+    with S4CodeAgent.create(workspace=workspace, settings=settings) as agent:
+        print(agent.get_enhanced_prompt())
+
 
 if __name__ == "__main__":
     main()

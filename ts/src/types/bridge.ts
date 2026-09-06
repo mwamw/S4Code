@@ -130,20 +130,6 @@ export type PendingPayload = {
   remember_supported?: boolean
 }
 
-export type CommandPaletteEntryPayload = {
-  label: string
-  description: string
-  insert_text: string
-  execute_text: string
-  mode: 'insert' | 'execute'
-  aliases?: string[]
-}
-
-export type CommandPalettePayload = {
-  state_key: string
-  entries: CommandPaletteEntryPayload[]
-}
-
 export type ExecuteCommandPayload = {
   handled: boolean
   command_name?: string | null

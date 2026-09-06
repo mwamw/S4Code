@@ -3,6 +3,22 @@ import { getDefaultAppState } from '../src/state/AppStateStore'
 import { appendStreamDelta, consumeBridgeEvent, getVisibleTranscriptCards, refreshActiveRoundElapsed } from '../src/state/transcript'
 
 describe('transcript state', () => {
+  test('ignores whitespace-only deltas until visible content starts', () => {
+    let state = getDefaultAppState()
+
+    state = consumeBridgeEvent(state, { type: 'round_start', round: 1 })
+    state = appendStreamDelta(state, { thinking: '\n\n', assistant: '\n\n' })
+
+    expect(state.transcript.liveThinkingCard).toBeUndefined()
+    expect(state.transcript.liveAssistantCard).toBeUndefined()
+
+    state = appendStreamDelta(state, { assistant: 'Answer' })
+    state = appendStreamDelta(state, { assistant: '\n\n' })
+    state = appendStreamDelta(state, { assistant: 'Details' })
+
+    expect(state.transcript.liveAssistantCard?.body).toBe('Answer\n\nDetails')
+  })
+
   test('live assistant text commits once on final', () => {
     let state = getDefaultAppState()
 

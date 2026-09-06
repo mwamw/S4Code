@@ -1,0 +1,9 @@
+{
+  "name": "@s4code/bridge-client",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "UI-free client for the local S4Code Core bridge",
+  "exports": { ".": { "types": "./dist/types/bridge-client/src/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist"],
+  "engines": { "node": ">=18" }
+}

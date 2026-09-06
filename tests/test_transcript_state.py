@@ -1,4 +1,4 @@
-from s4code.transcript_state import S4TranscriptState
+from s4code.interfaces.terminal.transcript import S4TranscriptState
 
 
 def _find_card(state: S4TranscriptState, kind: str, title: str | None = None):
@@ -476,3 +476,65 @@ def test_transcript_state_merges_round_metrics_while_running_and_after_completio
     assert "Tool 0.5s" in round_card.body
     assert "Changed: src/app.py" in round_card.body
     assert assistant_card.metadata["footer_left"].endswith("Cost $0.0123")
+
+
+def test_transcript_state_formats_structured_provider_error() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "round_start", "round": 1})
+    state.consume_event(
+        {
+            "type": "error",
+            "error": "Your request was blocked.",
+            "error_type": "PermissionDeniedError",
+            "status_code": 403,
+            "provider": "openai",
+            "model": "deepseek-v4-flash-0731",
+            "endpoint": "https://example.com/v1",
+            "edge_trace_id": "edge-456",
+        }
+    )
+
+    card = _find_card(state, "error", "Error · PermissionDeniedError")
+    assert card.status == "error"
+    assert "Your request was blocked." in card.body
+    assert "HTTP status: 403" in card.body
+    assert "Provider: openai" in card.body
+    assert "Model: deepseek-v4-flash-0731" in card.body
+    assert "Endpoint: https://example.com/v1" in card.body
+    assert "Edge trace: edge-456" in card.body
+    assert card.metadata["status_code"] == 403
+
+
+def test_transcript_state_does_not_create_cards_for_whitespace_only_deltas() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "round_start", "round": 1})
+
+    state.consume_event({"type": "thinking_delta", "delta": "\n\n"})
+    state.consume_event({"type": "text_delta", "delta": "\n\n"})
+    state.consume_event(
+        {"type": "tool_call", "tool_name": "List", "tool_id": "tool-1", "tool_args": {"path": "."}}
+    )
+
+    assert [card.kind for card in state.cards] == ["round", "tool"]
+
+
+def test_transcript_state_keeps_whitespace_after_visible_text_starts() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "round_start", "round": 1})
+
+    state.consume_event({"type": "text_delta", "delta": "Answer"})
+    state.consume_event({"type": "text_delta", "delta": "\n\n"})
+    state.consume_event({"type": "text_delta", "delta": "Details"})
+
+    assistant = _find_card(state, "assistant", "Model Response")
+    assert assistant.body == "Answer\n\nDetails"
+
+
+def test_transcript_state_empty_final_still_finishes_round() -> None:
+    state = S4TranscriptState()
+    state.consume_event({"type": "round_start", "round": 1})
+
+    state.consume_event({"type": "final", "content": "\n\n"})
+
+    assert state.has_live_round() is False
+    assert [card.kind for card in state.cards] == ["round"]

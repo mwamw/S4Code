@@ -84,11 +84,17 @@ async function runRepl(): Promise<void> {
     throw new Error('Interactive REPL requires a TTY. Run S4Code in a real terminal, or use --prompt for one-shot execution.')
   }
   const runtime = await buildRuntime()
-  render(
-    <App initialState={runtime.store.getState()} store={runtime.store}>
-      <REPL engine={runtime.engine} />
-    </App>,
-  )
+  try {
+    const app = render(
+      <App initialState={runtime.store.getState()} store={runtime.store}>
+        <REPL engine={runtime.engine} />
+      </App>,
+      { exitOnCtrlC: false },
+    )
+    await app.waitUntilExit()
+  } finally {
+    await runtime.engine.close()
+  }
 }
 
 async function main(): Promise<void> {

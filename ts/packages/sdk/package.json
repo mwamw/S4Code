@@ -1,0 +1,9 @@
+{
+  "name": "@s4code/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "S4Code TypeScript SDK; requires an installed Python S4Code runtime",
+  "exports": { ".": { "types": "./dist/types/sdk/src/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist"],
+  "engines": { "node": ">=18" }
+}

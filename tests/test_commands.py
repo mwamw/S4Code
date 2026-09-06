@@ -1,12 +1,86 @@
-from s4code.command_registry import S4CommandRegistry
-from s4code.command_types import CommandKind, CommandResult, S4Command, parse_command
-from s4code.commands import register_builtin_commands
+from types import SimpleNamespace
+from s4code.interfaces.terminal.commands.registry import S4CommandRegistry
+from s4code.interfaces.terminal.commands.types import (
+    CommandKind,
+    CommandResult,
+    S4Command,
+    parse_command,
+)
+from s4code.interfaces.terminal.commands import register_builtin_commands
 
 
 class _DummyEngine:
     def __init__(self) -> None:
         self.queued_skills: list[str] = []
-        self.checkpoints: list[str] = []
+        self._checkpoint_labels: list[str] = []
+        self.status = SimpleNamespace(
+            format_context=self.format_context,
+            format_current_session=self.format_current_session,
+            format_doctor=self.format_doctor,
+            format_help=self.format_help,
+            format_hooks=self.format_hooks,
+            format_models=self.format_models,
+            format_restore_report=self.format_restore_report,
+            format_session_tree=self.format_session_tree,
+            format_sessions=self.format_sessions,
+            format_status_overview=self.format_status_overview,
+            format_tools=self.format_tools,
+            format_trace=self.format_trace,
+        )
+        self.usage = SimpleNamespace(
+            format_context=self.format_context, format_trace=self.format_trace
+        )
+        self.session_view = SimpleNamespace(
+            format_current_session=self.format_current_session,
+            format_restore_report=self.format_restore_report,
+            format_session_tree=self.format_session_tree,
+            format_sessions=self.format_sessions,
+        )
+        self.runtime = SimpleNamespace(
+            enter_worktree=self.enter_worktree,
+            exit_worktree=self.exit_worktree,
+            format_agent_detail=self.format_agent_detail,
+            format_agents=self.format_agents,
+            format_runtime_panel=self.format_runtime_panel,
+            format_task_detail=self.format_task_detail,
+            format_task_output=self.format_task_output,
+            format_tasks=self.format_tasks,
+            format_worktree_status=self.format_worktree_status,
+            stop_agent=self.stop_agent,
+            stop_task=self.stop_task,
+            wait_for_agent=self.wait_for_agent,
+        )
+        self.mcp = SimpleNamespace(
+            connect_mcp=self.connect_mcp,
+            disconnect_mcp=self.disconnect_mcp,
+            format_mcp=self.format_mcp,
+            format_mcp_resources=self.format_mcp_resources,
+            format_mcp_server_detail=self.format_mcp_server_detail,
+            format_mcp_tools=self.format_mcp_tools,
+            refresh_mcp=self.refresh_mcp,
+        )
+        self.permissions = SimpleNamespace(
+            add_permission_rule_from_tokens=self.add_permission_rule_from_tokens,
+            clear_permission_rules=self.clear_permission_rules,
+            format_pending_interaction=self.format_pending_interaction,
+            format_permission_history=self.format_permission_history,
+            format_permissions=self.format_permissions,
+            update_permission_mode=self.update_permission_mode,
+        )
+        self.skills = SimpleNamespace(
+            clear_turn_skills=self.clear_turn_skills,
+            format_skills=self.format_skills,
+            queue_turn_skill=self.queue_turn_skill,
+        )
+        self.theme = SimpleNamespace(
+            format_themes=self.format_themes, update_theme=self.update_theme
+        )
+        self.checkpoints = SimpleNamespace(
+            create_checkpoint=self.create_checkpoint,
+            format_checkpoints=self.format_checkpoints,
+            format_timeline=self.format_timeline,
+            rewind_to_checkpoint=self.rewind_to_checkpoint,
+        )
 
     def format_doctor(self) -> str:
         return "doctor"
@@ -46,7 +120,9 @@ class _DummyEngine:
     def update_permission_mode(self, mode: str) -> str:
         return f"permission-mode:{mode}"
 
-    def add_permission_rule_from_tokens(self, *, behavior: str, tool_name: str, tokens: list[str]) -> str:
+    def add_permission_rule_from_tokens(
+        self, *, behavior: str, tool_name: str, tokens: list[str]
+    ) -> str:
         return f"permission-rule:{behavior}:{tool_name}:{','.join(tokens)}"
 
     def clear_permission_rules(self, *, source: str | None = "session") -> str:
@@ -70,12 +146,14 @@ class _DummyEngine:
     def format_session_tree(self) -> str:
         return "session-tree"
 
-    def create_checkpoint(self, label: str | None = None, *, reason: str = "manual") -> dict[str, object]:
-        checkpoint_id = f"cp-{len(self.checkpoints) + 1:03d}"
-        self.checkpoints.append(label or "")
+    def create_checkpoint(
+        self, label: str | None = None, *, reason: str = "manual"
+    ) -> dict[str, object]:
+        checkpoint_id = f"cp-{len(self._checkpoint_labels) + 1:03d}"
+        self._checkpoint_labels.append(label or "")
         return {
             "checkpoint_id": checkpoint_id,
-            "label": label or f"checkpoint {len(self.checkpoints)}",
+            "label": label or f"checkpoint {len(self._checkpoint_labels)}",
             "history_messages": 3,
         }
 
@@ -100,7 +178,9 @@ class _DummyEngine:
     def format_mcp(self) -> str:
         return "mcp"
 
-    def format_mcp_server_detail(self, server_name: str, *, refresh: bool = False) -> str:
+    def format_mcp_server_detail(
+        self, server_name: str, *, refresh: bool = False
+    ) -> str:
         return f"mcp-status:{server_name}:{refresh}"
 
     def format_mcp_tools(self, server_name: str) -> str:
@@ -135,7 +215,9 @@ class _DummyEngine:
     def enter_worktree(self, name: str | None = None) -> str:
         return f"worktree-enter:{name or 'auto'}"
 
-    def exit_worktree(self, *, action: str = "keep", discard_changes: bool = False) -> str:
+    def exit_worktree(
+        self, *, action: str = "keep", discard_changes: bool = False
+    ) -> str:
         return f"worktree-exit:{action}:{discard_changes}"
 
     def format_agents(self) -> str:
@@ -147,7 +229,14 @@ class _DummyEngine:
     def wait_for_agent(self, agent_id: str, *, timeout_ms: int | None = None) -> str:
         return f"agent-wait:{agent_id}:{timeout_ms}"
 
-    def stop_agent(self, agent_id: str, *, reason: str = "", wait: bool = False, timeout_ms: int | None = None) -> str:
+    def stop_agent(
+        self,
+        agent_id: str,
+        *,
+        reason: str = "",
+        wait: bool = False,
+        timeout_ms: int | None = None,
+    ) -> str:
         return f"agent-stop:{agent_id}:{reason}:{wait}:{timeout_ms}"
 
     def format_tasks(self) -> str:
@@ -156,7 +245,9 @@ class _DummyEngine:
     def format_task_detail(self, task_id: str) -> str:
         return f"task:{task_id}"
 
-    def format_task_output(self, task_id: str, *, block: bool = False, timeout_ms: int | None = None) -> str:
+    def format_task_output(
+        self, task_id: str, *, block: bool = False, timeout_ms: int | None = None
+    ) -> str:
         return f"task-output:{task_id}:{block}:{timeout_ms}"
 
     def stop_task(self, task_id: str) -> str:
@@ -206,7 +297,9 @@ def test_registry_match_commands() -> None:
     def _handler(engine, invocation):
         return CommandResult.info("ok")
 
-    registry.register(S4Command("help", CommandKind.LOCAL, "help", _handler, aliases=("h",)))
+    registry.register(
+        S4Command("help", CommandKind.LOCAL, "help", _handler, aliases=("h",))
+    )
     registry.register(S4Command("hooks", CommandKind.LOCAL, "hooks", _handler))
     registry.register(S4Command("review", CommandKind.WORKFLOW, "review", _handler))
 
@@ -220,7 +313,18 @@ def test_registry_match_commands_keeps_full_result_set() -> None:
     def _handler(engine, invocation):
         return CommandResult.info("ok")
 
-    for name in ("help", "hooks", "history", "home", "hosts", "hover", "hold", "howto", "hotfix", "hostsfile"):
+    for name in (
+        "help",
+        "hooks",
+        "history",
+        "home",
+        "hosts",
+        "hover",
+        "hold",
+        "howto",
+        "hotfix",
+        "hostsfile",
+    ):
         registry.register(S4Command(name, CommandKind.LOCAL, name, _handler))
 
     matches = registry.match_commands("ho")
@@ -289,7 +393,9 @@ def test_builtin_help_and_status_commands_use_user_facing_output() -> None:
     assert result is not None
     assert result.message == "permission-mode:dont_ask"
 
-    result = registry.execute(engine, "/permissions allow FileEdit path=src source=session")
+    result = registry.execute(
+        engine, "/permissions allow FileEdit path=src source=session"
+    )
     assert result is not None
     assert result.message == "permission-rule:allow:FileEdit:path=src,source=session"
 

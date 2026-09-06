@@ -106,6 +106,10 @@ export type AppState = {
     stateKey: string
     loading: boolean
     sourceText: string
+    title: string
+    hint: string
+    parentInput: string
+    canSubmit: boolean
   }
   ui: {
     sidebarVisible: boolean
@@ -179,6 +183,10 @@ export function getDefaultAppState(): AppState {
       stateKey: '',
       loading: false,
       sourceText: '',
+      title: 'Commands',
+      hint: '',
+      parentInput: '',
+      canSubmit: true,
     },
     ui: {
       sidebarVisible: false,
