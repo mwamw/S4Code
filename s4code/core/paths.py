@@ -57,7 +57,7 @@ def get_s4_paths() -> S4Paths:
         data_dir=data_home,
         cache_dir=cache_home,
         global_config_path=config_home / "config.yaml",
-        session_db_path=data_home / "sessions.db",
+        session_db_path=data_home / "sessions-v4.db",
         task_db_path=data_home / "tasks.db",
         agent_storage_dir=data_home / "agents",
         logs_dir=data_home / "logs",

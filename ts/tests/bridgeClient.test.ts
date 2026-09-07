@@ -31,6 +31,20 @@ test('bridge returns data, Ink formats model result locally', async () => {
   bridge.terminate()
 })
 
+test('context panel uses Core API-calibrated tokens and preserves their source', async () => {
+  const transport = new FakeTransport()
+  const bridge = new BridgeClient(transport)
+  const ink = new InkCoreClient(bridge)
+  const pending = ink.getContextPanel()
+  transport.respond({ estimatedRequestTokens: 110, localEstimatedRequestTokens: 9000,
+    maxTokens: 1000, request_estimate_source: 'provider_usage_plus_delta_estimate' })
+  const context = await pending
+  expect(context.used_tokens).toBe(110)
+  expect(context.remaining_tokens).toBe(890)
+  expect(context.request_estimate_source).toBe('provider_usage_plus_delta_estimate')
+  bridge.terminate()
+})
+
 test('closing rejects unfinished requests instead of reporting success', async () => {
   const transport = new FakeTransport()
   const bridge = new BridgeClient(transport)

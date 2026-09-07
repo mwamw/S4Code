@@ -4,7 +4,7 @@ import type { ContextPayload, ExecuteCommandPayload, InitPayload, PendingPayload
 import type { CommandChoice, CommandChoiceSource } from '../types/command'
 import { Checkpoints } from './Checkpoints'
 
-type CoreContext = { estimatedRequestTokens?: number; maxTokens?: number | null }
+type CoreContext = { estimatedRequestTokens?: number; maxTokens?: number | null; request_estimate_source?: string }
 type State = SessionInfo & { project_name: string; branch: string; permission_mode: string; context: CoreContext; pending: InteractionRequest | null; startup_issues: string[];
   profile?: string; permission_rules?: number; skills?: { active: string[] }; deferred_tools?: SidebarPayload['deferred_tools'];
   processes?: Array<{ task_id: string; status: string; return_code?: number | null }>;
@@ -55,6 +55,7 @@ export class InkCoreClient {
     const ratio = used != null && max != null && max > 0 ? used / max : null
     const filled = ratio == null ? 0 : Math.max(0, Math.min(20, Math.round(ratio * 20)))
     return { used_tokens: used, estimated_request_tokens: used, max_tokens: max,
+      request_estimate_source: context.request_estimate_source,
       remaining_tokens: used != null && max != null ? Math.max(0, max - used) : null,
       usage_ratio: ratio, usage_percent: ratio == null ? null : `${(ratio * 100).toFixed(1)}%`,
       usage_bar: `[${'#'.repeat(filled)}${'-'.repeat(20 - filled)}]` }

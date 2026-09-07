@@ -104,6 +104,7 @@ export type SidebarPayload = {
 }
 
 export type ContextPayload = {
+  request_estimate_source?: string
   used_tokens?: number | null
   max_tokens?: number | null
   remaining_tokens?: number | null

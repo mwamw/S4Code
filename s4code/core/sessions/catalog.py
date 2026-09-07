@@ -9,7 +9,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 
-from easyagent.session import SessionStore
+from easyagent.session import SQLiteSessionStore
 
 from s4code.core.paths import S4Paths
 from s4code.core.project import ProjectContext
@@ -44,7 +44,7 @@ class SessionCatalog:
         self.store = (
             store
             if store is not None
-            else SessionStore(str(self.paths.session_db_path))
+            else SQLiteSessionStore(str(self.paths.session_db_path))
         )
 
     def new_session_id(self, project: ProjectContext) -> str:
@@ -80,8 +80,10 @@ class SessionCatalog:
         self, *, limit: int = 30, project_root: str | Path | None = None
     ) -> list[S4SessionSummary]:
         target_project_root = _normalize_project_root(project_root)
-        query_limit = max(limit * 10, 200) if target_project_root is not None else limit
-        items = self.store.list_sessions(limit=query_limit)
+        filters = {"product": "s4code"}
+        if target_project_root is not None:
+            filters["project_root"] = target_project_root
+        items = self.store.list_sessions(limit=limit, metadata_filter=filters)
         result: list[S4SessionSummary] = []
         for item in items:
             metadata = dict(item.get("metadata") or {})

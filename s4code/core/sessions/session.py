@@ -18,6 +18,7 @@ class CoreSession:
         self._pending_key = None
         self._pending_id = None
         self._context_cache = None
+        self._context_cache_revision = None
         self.runs = RunService(self)
         self.inspector = SessionInspector(self)
         self.snapshots = ConversationSnapshotStore(agent.paths.data_dir / "conversation-snapshots.db")
@@ -46,12 +47,14 @@ class CoreSession:
 
     def context_usage(self):
         self._ensure_open()
-        if self._context_cache is None:
+        revision = self._agent.context_usage_revision
+        if self._context_cache is None or self._context_cache_revision != revision:
             self._context_cache = {
                 **self._agent.get_context_usage(),
                 "maxTokens": self._agent.context_manager.budget.max_tokens
                 if self._agent.context_manager else None,
             }
+            self._context_cache_revision = revision
         return deepcopy(self._context_cache)
 
     def info(self):

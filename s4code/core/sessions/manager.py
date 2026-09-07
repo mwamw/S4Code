@@ -3,6 +3,7 @@
 from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
+from shlex import quote
 from .catalog import SessionCatalog
 
 
@@ -11,12 +12,28 @@ class S4SessionManager:
         self.catalog = SessionCatalog(paths, store=store)
         self.store = self.catalog.store
         self.agent = agent
-        self.session_id = self.catalog.new_session_id(agent.project)
+        self.agent.with_session(self.store, session_id=self.catalog.new_session_id(agent.project))
         self.title = f"{agent.project.project_name} session"
         self.forked_from_session_id = None
         self.overrides: dict = {}
         self.extensions: dict = {}
         self.dirty = False
+        legacy = Path(paths.data_dir) / "sessions.db"
+        if (legacy.exists() and Path(paths.session_db_path).name == "sessions-v4.db"
+                and not self.store.list_sessions(limit=1, include_expired=True)):
+            agent.startup_issues.append(
+                "Legacy sessions are available. Preview migration with: "
+                f"python -m easyagent.migrate session --source {quote(str(legacy))} "
+                f"--target {quote(str(paths.session_db_path))} (add --apply to migrate into the empty V4 database)."
+            )
+
+    @property
+    def session_id(self):
+        return self.agent.session_id
+
+    @session_id.setter
+    def session_id(self, value):
+        self.agent.session_id = value
 
     def metadata(self):
         data = self.catalog.build_metadata(
@@ -74,6 +91,8 @@ class S4SessionManager:
             ):
                 raise ValueError("Cannot resume a session belonging to another project")
             self.agent.restore_session(session_id, store=self.store)
+            # Product prompt ownership is independent of persisted framework state.
+            self.agent.prompt_composer.include_defaults = False
             self.agent._apply_reasoning()
             self.session_id = session_id
             self.title = metadata.get("title") or session_id

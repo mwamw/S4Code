@@ -53,6 +53,23 @@ def test_core_is_product_agent(core_agent):
     assert not hasattr(core_agent, "bundle")
 
 
+def test_context_cache_refreshes_from_provider_usage(core_agent, monkeypatch):
+    from types import SimpleNamespace
+    from s4code.core.sessions.session import CoreSession
+    session = CoreSession(core_agent)
+    before = session.context_usage()
+    assert before["request_estimate_source"] == "local_request_estimate"
+    monkeypatch.setattr(core_agent.llm._provider, "invoke_raw", lambda request: SimpleNamespace(
+        content="answer", tool_calls=[], reasoning_content=None,
+        usage=SimpleNamespace(prompt_tokens=2500, completion_tokens=10, total_tokens=2510),
+    ))
+    core_agent.invoke("question")
+    after = session.context_usage()
+    assert after["request_estimate_source"] == "provider_usage_plus_delta_estimate"
+    assert after["estimatedRequestTokens"] == 2510
+    assert after["requestEstimate"]["metadata"]["usage"]["inputTokens"] == 2500
+
+
 def test_product_prompt_and_builtin_schemas_are_english(core_agent):
     import json
     import re
@@ -265,7 +282,7 @@ def test_fork_omits_active_runtime_handles_and_terminal_state(core_agent):
     branch = core_agent.session.fork()
     snapshot = branch["snapshot"]
     assert snapshot["currentTaskId"] is None
-    assert snapshot["modules"]["executionContext"]["currentTaskId"] is None
+    assert "executionContext" not in snapshot["modules"]
     for module in ("multiAgent", "runtimeEvents", "worktree", "interruptions"):
         assert module not in snapshot["modules"]
     assert branch["metadata"]["extensions"] == {}

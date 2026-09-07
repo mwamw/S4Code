@@ -158,20 +158,21 @@ def test_legacy_snapshot_cannot_reenable_framework_defaults(tmp_path):
 
 
 def test_product_capability_reminders_survive_full_prompt_override(tmp_path):
+    from easyagent.memory import LayeredMemory
     composer = S4PromptComposer()
     context = replace(
         _context(root=tmp_path, system_prompt="product prompt", skill_listing="技能正文保持原样"),
-        memory=SimpleNamespace(memory_types={"working": object()}),
+        memory=LayeredMemory(),
         plan=SimpleNamespace(mode="plan"),
         context_manager=object(),
     )
     blocks = {block.name: block for block in composer.compose(context)}
     assert blocks["identity"].content == "product prompt"
     assert blocks["skill_listing"].content == "技能正文保持原样"
-    for name in ("memory_policy", "plan_mode", "compaction", "current_date"):
+    for name in ("memory.layered.rules", "plan_mode", "compaction", "current_date"):
         assert blocks[name].placement == "system_reminder"
         assert not re.search(r"[\u4e00-\u9fff]", blocks[name].content)
-    assert "`working`" in blocks["memory_policy"].content
+    assert "`working`" in blocks["memory.layered.rules"].content
     assert "unlimited context" not in blocks["compaction"].content
     inactive = replace(context, plan=SimpleNamespace(mode="execute"), context_manager=None)
     inactive_names = {block.name for block in composer.compose(inactive)}
